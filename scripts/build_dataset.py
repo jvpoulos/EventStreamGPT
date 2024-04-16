@@ -305,22 +305,14 @@ def main(cfg: DictConfig):
                     input_schema_kwargs[schema][col] = dt
 
         must_have = source_schema.get("must_have", None)
-        match must_have:
-            case None:
-                pass
-            case list():
+        if must_have is not None:
+            if isinstance(must_have, (list, tuple)):
                 input_schema_kwargs["must_have"] = must_have
-            case dict() as must_have_dict:
-                must_have = []
-                for k, v in must_have_dict.items():
-                    match v:
-                        case True:
-                            must_have.append(k)
-                        case list():
-                            must_have.append((k, v))
-                        case _:
-                            raise ValueError(f"{v} invalid for `must_have`")
-                input_schema_kwargs["must_have"] = must_have
+            else:
+                input_schema_kwargs["must_have"] = [
+                    (k, v) if isinstance(v, list) else k
+                    for k, v in must_have.items()
+                ]
 
         return InputDFSchema(**input_schema_kwargs, **extra_kwargs)
 

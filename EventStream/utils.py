@@ -213,6 +213,12 @@ class StrEnum(str, enum.Enum):
 JSONABLE_INSTANCE_T = TypeVar("JSONABLE_INSTANCE_T", bound="JSONableMixin")
 
 
+class DataFrameEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, pl.DataFrame):
+            return obj.to_pandas().to_dict(orient="records")
+        return super().default(obj)
+
 class JSONableMixin:
     """A simple mixin to enable saving/loading of data container classes to json files.
 
@@ -323,7 +329,7 @@ class JSONableMixin:
         if (not do_overwrite) and fp.exists():
             raise FileExistsError(f"{fp} exists and do_overwrite = {do_overwrite}")
         with open(fp, mode="w") as f:
-            json.dump(self.to_dict(), f)
+            json.dump(self.to_dict(), f, cls=DataFrameEncoder)
 
     @classmethod
     def from_json_file(cls: type[JSONABLE_INSTANCE_T], fp: Path) -> JSONABLE_INSTANCE_T:

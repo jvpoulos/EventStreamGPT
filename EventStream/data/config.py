@@ -14,6 +14,7 @@ from typing import Any, Union
 
 import omegaconf
 import pandas as pd
+import polars as pl
 
 from ..utils import (
     COUNT_OR_PROPORTION,
@@ -111,7 +112,7 @@ class DatasetSchema(JSONableMixin):
         if self.static is None:
             raise ValueError("Must specify a static schema!")
 
-        if type(self.static) is dict:
+        if isinstance(self.static, dict):
             self.static = InputDFSchema(**self.static)
             if not self.static.is_static:
                 raise ValueError("Must pass a static schema config for static.")
@@ -119,8 +120,10 @@ class DatasetSchema(JSONableMixin):
         if self.dynamic is not None:
             new_dynamic = []
             for v in self.dynamic:
-                if type(v) is dict:
+                if isinstance(v, dict):
                     v = InputDFSchema(**v)
+                if isinstance(v.input_df, pl.DataFrame):
+                    v.input_df = v.input_df.to_pandas()
                 v.subject_id_col = self.static.subject_id_col
 
                 new_dynamic.append(v)
@@ -131,9 +134,27 @@ class DatasetSchema(JSONableMixin):
 
         self.dynamic_by_df = defaultdict(list)
         for v in self.dynamic:
-            self.dynamic_by_df[v.input_df].append(v)
+            # Convert polars DataFrame to pandas DataFrame
+            if isinstance(v.input_df, pl.DataFrame):
+                v.input_df = v.input_df.to_pandas()
+            # Generate a unique identifier for the DataFrame
+            df_id = str(hash(pd.util.hash_pandas_object(v.input_df).sum()))
+            self.dynamic_by_df[df_id].append(v)
         self.dynamic_by_df = {k: v for k, v in self.dynamic_by_df.items()}
 
+    def to_dict(self) -> dict:
+        """Represents this configuration object as a plain dictionary."""
+        as_dict = dataclasses.asdict(self)
+        as_dict["static"] = self.static.to_dict()
+        as_dict["dynamic"] = [schema.to_dict() for schema in self.dynamic]
+        return as_dict
+
+    @classmethod
+    def from_dict(cls, as_dict: dict) -> DatasetSchema:
+        """Build a configuration object from a plain dictionary representation."""
+        as_dict["static"] = InputDFSchema.from_dict(as_dict["static"])
+        as_dict["dynamic"] = [InputDFSchema.from_dict(schema) for schema in as_dict["dynamic"]]
+        return cls(**as_dict)
 
 @dataclasses.dataclass
 class InputDFSchema(JSONableMixin):
@@ -691,6 +712,26 @@ class InputDFSchema(JSONableMixin):
 
         return unified_schema
 
+    def to_dict(self) -> dict:
+        """Represents this configuration object as a plain dictionary."""
+        as_dict = dataclasses.asdict(self)
+
+        # Convert input_df to a JSON-serializable format
+        if isinstance(self.input_df, pl.DataFrame):
+            as_dict["input_df"] = self.input_df.to_pandas().to_dict(orient="records")
+        elif isinstance(self.input_df, pd.DataFrame):
+            as_dict["input_df"] = self.input_df.to_dict(orient="records")
+
+        return as_dict
+
+    @classmethod
+    def from_dict(cls, as_dict: dict) -> InputDFSchema:
+        """Build a configuration object from a plain dictionary representation."""
+        # Convert input_df back to the original format
+        if "input_df" in as_dict and isinstance(as_dict["input_df"], list):
+            as_dict["input_df"] = pd.DataFrame(as_dict["input_df"])
+
+        return cls(**as_dict)
 
 @dataclasses.dataclass
 class VocabularyConfig(JSONableMixin):
@@ -919,7 +960,6 @@ class PytorchDatasetConfig(JSONableMixin):
         """Creates a new instance of this class from a plain dictionary."""
         as_dict["save_dir"] = Path(as_dict["save_dir"])
         return cls(**as_dict)
-
 
 @dataclasses.dataclass
 class MeasurementConfig(JSONableMixin):

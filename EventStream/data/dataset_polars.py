@@ -162,7 +162,6 @@ class Dataset(DatasetBase[DF_T, INPUT_DF_T]):
         filter_on: dict[str, bool | list[Any]] | None = None,
         subject_id_source_col: str | None = None,
     ) -> DF_T | tuple[DF_T, str]:
-        """Loads an input dataframe into the format expected by the processing library."""
         if subject_id_col is None:
             if subject_ids_map is not None:
                 raise ValueError("Must not set subject_ids_map if subject_id_col is not set")
@@ -227,7 +226,8 @@ class Dataset(DatasetBase[DF_T, INPUT_DF_T]):
                     **partition_kwargs,
                 ).lazy()
             case _:
-                raise TypeError(f"Input dataframe `df` is of invalid type {type(df)}!")
+                # If df is not a file path, DataFrame, or Query, assume it's a unique identifier
+                df = pl.DataFrame(columns=[subject_id_col] + [col for col, _ in columns])
 
         col_exprs = []
 
