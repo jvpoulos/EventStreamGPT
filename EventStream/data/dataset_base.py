@@ -18,6 +18,7 @@ from typing import Any, Generic, TypeVar
 import humanize
 import numpy as np
 import pandas as pd
+import polars as pl
 from mixins import SaveableMixin, SeedableMixin, TimeableMixin, TQDMableMixin
 from plotly.graph_objs._figure import Figure
 from tqdm.auto import tqdm
@@ -664,7 +665,9 @@ class DatasetBase(
             ValueError: if `split_fracs` contains anything outside the range of (0, 1], sums to something > 1,
                 or is not of the same length as `split_names`.
         """
+        print("Input split_fracs:", split_fracs)
         split_fracs = list(split_fracs)
+        print("After converting to list:", split_fracs)
 
         if min(split_fracs) <= 0 or max(split_fracs) > 1 or sum(split_fracs) > 1:
             raise ValueError(
@@ -672,8 +675,10 @@ class DatasetBase(
                 f"{repr(split_fracs)}"
             )
 
-        if sum(split_fracs) < 1:
+        print("Before appending:", split_fracs)
+        if abs(sum(split_fracs) - 1) > 1e-8:  # Check for floating-point equality with tolerance
             split_fracs.append(1 - sum(split_fracs))
+        print("After appending:", split_fracs)
 
         if split_names is None:
             if len(split_fracs) == 2:
@@ -696,10 +701,16 @@ class DatasetBase(
         split_fracs = [split_fracs[i] for i in split_names_idx]
 
         subjects = np.random.permutation(list(self.subject_ids))
+        print("Shuffled subjects:", subjects)
         split_lens = (np.array(split_fracs[:-1]) * len(subjects)).round().astype(int)
         split_lens = np.append(split_lens, len(subjects) - split_lens.sum())
+        print("Split lengths:", split_lens)
 
         subjects_per_split = np.split(subjects, split_lens.cumsum())
+        print("Subjects per split:", subjects_per_split)
+
+        print("Split names:", split_names)
+        print("Subjects per split:", subjects_per_split)
 
         self.split_subjects = {k: set(v) for k, v in zip(split_names, subjects_per_split)}
 

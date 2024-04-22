@@ -227,7 +227,8 @@ class Dataset(DatasetBase[DF_T, INPUT_DF_T]):
                 ).lazy()
             case _:
                 # If df is not a file path, DataFrame, or Query, assume it's a unique identifier
-                df = pl.DataFrame(columns=[subject_id_col] + [col for col, _ in columns])
+                df = pl.DataFrame({subject_id_col: [], **{col[0]: [] for col in columns}})
+
 
         col_exprs = []
 
@@ -651,14 +652,15 @@ class Dataset(DatasetBase[DF_T, INPUT_DF_T]):
     @TimeableMixin.TimeAs
     def _sort_events(self):
         self.events_df = self.events_df.sort("subject_id", "timestamp", descending=False)
-
+        
     @TimeableMixin.TimeAs
     def _agg_by_time(self):
         event_id_dt = self.events_df["event_id"].dtype
 
         if self.config.agg_by_time_scale is None:
-            grouped = self.events_df.groupby(["subject_id", "timestamp"], maintain_order=True)
+            grouped = self.events_df.filter(pl.col("timestamp").is_not_null()).groupby(["subject_id", "timestamp"], maintain_order=True)
         else:
+            self.events_df = self.events_df.filter(pl.col("timestamp").is_not_null())
             grouped = self.events_df.sort(["subject_id", "timestamp"], descending=False).groupby_dynamic(
                 "timestamp",
                 every=self.config.agg_by_time_scale,
@@ -705,7 +707,8 @@ class Dataset(DatasetBase[DF_T, INPUT_DF_T]):
             )
 
             n_events_pd = self.events_df.get_column("subject_id").value_counts(sort=False).to_pandas()
-            self.n_events_per_subject = n_events_pd.set_index("subject_id")["counts"].to_dict()
+            n_events_pd.columns = ['subject_id', 'counts']  # Rename the columns
+            self.n_events_per_subject = dict(zip(n_events_pd['subject_id'], n_events_pd['counts']))
             self.subject_ids = set(self.n_events_per_subject.keys())
 
         if self.subjects_df is not None:
@@ -1104,8 +1107,12 @@ class Dataset(DatasetBase[DF_T, INPUT_DF_T]):
         if config.vocabulary is None:
             try:
                 value_counts = observations.value_counts()
-                vocab_elements = value_counts.get_column(measure).to_list()
-                el_counts = value_counts.get_column("counts")
+                print("value_counts DataFrame:")
+                print(value_counts)
+                print("Column names in value_counts DataFrame:", value_counts.columns)
+
+                vocab_elements = value_counts[measure].to_list()
+                el_counts = value_counts["count"].to_list()  # Changed from "counts" to "count"
                 return Vocabulary(vocabulary=vocab_elements, obs_frequencies=el_counts)
             except AssertionError as e:
                 raise AssertionError(f"Failed to build vocabulary for {measure}") from e

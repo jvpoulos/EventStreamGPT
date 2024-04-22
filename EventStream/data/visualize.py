@@ -132,11 +132,14 @@ class Visualizer(JSONableMixin):
         if covariate is None:
             return df
 
+        # Convert the column to the 'category' data type
+        df[covariate] = df[covariate].astype('category')
+
         if df[covariate].isna().any():
             if "UNK" not in df[covariate].cat.categories:
                 df[covariate] = df[covariate].cat.add_categories("UNK")
-
             df[covariate] = df[covariate].fillna("UNK")
+
         df[covariate] = df[covariate].cat.remove_unused_categories()
 
         return df
