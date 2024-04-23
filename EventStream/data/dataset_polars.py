@@ -1303,6 +1303,11 @@ class Dataset(DatasetBase[DF_T, INPUT_DF_T]):
             )
 
         measurements_idx_dt = self.get_smallest_valid_uint_type(len(self.unified_measurements_idxmap))
+
+        if not struct_exprs:
+            # If there are no struct expressions, return an empty DataFrame with the specified columns
+            return pl.DataFrame({col: [] for col in id_cols + ["measurement_index", "index", "value"]})
+
         return (
             source_df.select(*id_cols, *struct_exprs)
             .melt(

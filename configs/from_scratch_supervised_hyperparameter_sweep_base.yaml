@@ -2,6 +2,20 @@ defaults:
   - parameters: from_scratch_supervised
   - _self_
 
+parameters:
+  model.transformer_kwargs.n_encoder_layers:
+    values: [2, 4, 6]
+  model.transformer_kwargs.n_decoder_layers:
+    values: [2, 4, 6]
+  model.transformer_kwargs.d_model:
+    values: [128, 256, 512]
+  model.transformer_kwargs.n_head:
+    values: [4, 8, 16]
+  optimizer.lr:
+    distribution: log_uniform_values
+    min: 0.00001
+    max: 0.1
+
 entity: null
 project: null
 program: finetune.py

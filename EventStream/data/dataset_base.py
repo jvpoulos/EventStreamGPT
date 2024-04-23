@@ -515,45 +515,12 @@ class DatasetBase(
         subjects_df: DF_T | None = None,
         events_df: DF_T | None = None,
         dynamic_measurements_df: DF_T | None = None,
-        input_schema: DatasetSchema | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
 
         if "do_overwrite" in kwargs:
             self.do_overwrite = kwargs["do_overwrite"]
-
-        if (
-            subjects_df is None or events_df is None or dynamic_measurements_df is None
-        ) and input_schema is None:
-            raise ValueError(
-                "Must set input_schema if subjects_df, events_df, or dynamic_measurements_df are None!"
-            )
-
-        if input_schema is None:
-            if subjects_df is None:
-                raise ValueError("Must set subjects_df if input_schema is None!")
-            if events_df is None:
-                raise ValueError("Must set events_df if input_schema is None!")
-            if dynamic_measurements_df is None:
-                raise ValueError("Must set dynamic_measurements_df if input_schema is None!")
-        else:
-            if subjects_df is not None:
-                raise ValueError("Can't set subjects_df if input_schema is not None!")
-            if events_df is not None:
-                raise ValueError("Can't set events_df if input_schema is not None!")
-            if dynamic_measurements_df is not None:
-                raise ValueError("Can't set dynamic_measurements_df if input_schema is not None!")
-
-            subjects_df, ID_map = self.build_subjects_dfs(input_schema.static)
-            subject_id_dtype = subjects_df["subject_id"].dtype
-
-            events_df, dynamic_measurements_df = self.build_event_and_measurement_dfs(
-                ID_map,
-                input_schema.static.subject_id_col,
-                subject_id_dtype,
-                input_schema.dynamic_by_df,
-            )
 
         self.config = config
         self._is_fit = False
@@ -665,9 +632,7 @@ class DatasetBase(
             ValueError: if `split_fracs` contains anything outside the range of (0, 1], sums to something > 1,
                 or is not of the same length as `split_names`.
         """
-        print("Input split_fracs:", split_fracs)
         split_fracs = list(split_fracs)
-        print("After converting to list:", split_fracs)
 
         if min(split_fracs) <= 0 or max(split_fracs) > 1 or sum(split_fracs) > 1:
             raise ValueError(
@@ -675,10 +640,8 @@ class DatasetBase(
                 f"{repr(split_fracs)}"
             )
 
-        print("Before appending:", split_fracs)
         if abs(sum(split_fracs) - 1) > 1e-8:  # Check for floating-point equality with tolerance
             split_fracs.append(1 - sum(split_fracs))
-        print("After appending:", split_fracs)
 
         if split_names is None:
             if len(split_fracs) == 2:
@@ -701,16 +664,11 @@ class DatasetBase(
         split_fracs = [split_fracs[i] for i in split_names_idx]
 
         subjects = np.random.permutation(list(self.subject_ids))
-        print("Shuffled subjects:", subjects)
         split_lens = (np.array(split_fracs[:-1]) * len(subjects)).round().astype(int)
         split_lens = np.append(split_lens, len(subjects) - split_lens.sum())
         print("Split lengths:", split_lens)
 
         subjects_per_split = np.split(subjects, split_lens.cumsum())
-        print("Subjects per split:", subjects_per_split)
-
-        print("Split names:", split_names)
-        print("Subjects per split:", subjects_per_split)
 
         self.split_subjects = {k: set(v) for k, v in zip(split_names, subjects_per_split)}
 
