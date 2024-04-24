@@ -41,6 +41,9 @@ from ..model_output import GenerativeSequenceModelOutput
 from ..nested_attention_model import NAPPTForGenerativeSequenceModeling
 from ..utils import expand_indexed_regression, str_summary
 
+from dataclasses import dataclass
+from omegaconf import MISSING
+
 
 class ESTForGenerativeSequenceModelingLM(L.LightningModule):
     """A PyTorch Lightning Module for a `ESTForGenerativeSequenceModeling`."""
@@ -496,10 +499,11 @@ class ESTForGenerativeSequenceModelingLM(L.LightningModule):
 SKIP_CFG_PARAMS = {"seq_attention_layers", "dep_graph_attention_layers", "hidden_size"}
 
 
-@hydra_dataclass
+@dataclass
 class PretrainConfig:
+    from EventStream.data.config import PytorchDatasetConfig
     do_overwrite: bool = False
-    seed: int = 1
+    seed: int = 42
 
     config: dict[str, Any] = dataclasses.field(
         default_factory=lambda: {
@@ -532,9 +536,8 @@ class PretrainConfig:
         }
     )
 
-    experiment_dir: str = omegaconf.MISSING
-    save_dir: str = "${experiment_dir}/pretrain/${now:%Y-%m-%d_%H-%M-%S}"
-
+    experiment_dir: str = MISSING
+    save_dir: str = MISSING
     wandb_logger_kwargs: dict[str, Any] = dataclasses.field(
         default_factory=lambda: {
             "name": "generative_event_stream_transformer",
@@ -544,13 +547,11 @@ class PretrainConfig:
             "do_log_graph": True,
         }
     )
-
     wandb_experiment_config_kwargs: dict[str, Any] = dataclasses.field(
         default_factory=lambda: {
             "save_dir": "${save_dir}",
         }
     )
-
     do_final_validation_on_metrics: bool = True
     do_use_filesystem_sharing: bool = True
 
@@ -566,7 +567,7 @@ class PretrainConfig:
 
 
 @task_wrapper
-def train(cfg: PretrainConfig):
+def train(cfg: PretrainConfig, train_pyd: PytorchDataset, tuning_pyd: PytorchDataset):
     """Runs the end to end training procedure for the pre-training model.
 
     Args:

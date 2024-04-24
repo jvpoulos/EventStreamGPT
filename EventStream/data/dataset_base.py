@@ -24,16 +24,14 @@ from plotly.graph_objs._figure import Figure
 from tqdm.auto import tqdm
 
 from ..utils import lt_count_or_proportion
-from .config import (
-    DatasetConfig,
-    DatasetSchema,
-    InputDFSchema,
-    MeasurementConfig,
-    VocabularyConfig,
-)
+
 from .types import DataModality, InputDataType, InputDFType, TemporalityType
 from .visualize import Visualizer
 from .vocabulary import Vocabulary
+from .dataset_config import DatasetConfig
+from .dataset_schema import DatasetSchema
+from .input_df_schema import InputDFSchema
+from .measurement_config import MeasurementConfig
 
 INPUT_DF_T = TypeVar("INPUT_DF_T")
 
@@ -434,7 +432,7 @@ class DatasetBase(
         Raises:
             FileNotFoundError: If either the attributes file or config file do not exist.
         """
-
+        from EventStream.data.dataset_base import DatasetBase
         attrs_fp = load_dir / "E.pkl"
 
         reloaded_config = DatasetConfig.from_json_file(load_dir / "config.json")
@@ -1401,6 +1399,7 @@ class DatasetBase(
         This property collates vocabulary information across all measurements into a format that is concise,
         but complete for downstream DL applications.
         """
+        from .config import VocabularyConfig
         measurements_per_generative_mode = defaultdict(list)
         measurements_per_generative_mode[DataModality.SINGLE_LABEL_CLASSIFICATION].append("event_type")
         for m, cfg in self.measurement_configs.items():
