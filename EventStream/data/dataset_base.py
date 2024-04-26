@@ -28,6 +28,7 @@ from ..utils import lt_count_or_proportion
 from .types import DataModality, InputDataType, InputDFType, TemporalityType
 from .visualize import Visualizer
 from .vocabulary import Vocabulary
+from .config import VocabularyConfig
 from .dataset_config import DatasetConfig
 from .dataset_schema import DatasetSchema
 from .input_df_schema import InputDFSchema
@@ -1399,7 +1400,6 @@ class DatasetBase(
         This property collates vocabulary information across all measurements into a format that is concise,
         but complete for downstream DL applications.
         """
-        from .config import VocabularyConfig
         measurements_per_generative_mode = defaultdict(list)
         measurements_per_generative_mode[DataModality.SINGLE_LABEL_CLASSIFICATION].append("event_type")
         for m, cfg in self.measurement_configs.items():

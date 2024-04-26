@@ -32,10 +32,12 @@ import dataclasses
 from omegaconf import MISSING
 
 from EventStream.utils import hydra_dataclass
-from EventStream.data.dataset_utils import get_dataset_class
+
+def get_dataset_class():
+    from .dataset_utils import get_dataset_class
+    return get_dataset_class()
 
 Dataset = get_dataset_class()
-from .dataset_config import DatasetConfig
 
 @dataclasses.dataclass
 class DatasetSchema(JSONableMixin):

@@ -516,7 +516,8 @@ class PretrainConfig:
         }
     )
     optimization_config: OptimizationConfig = dataclasses.field(default_factory=lambda: OptimizationConfig())
-    data_config: PytorchDatasetConfig = dataclasses.field(default_factory=lambda: PytorchDatasetConfig())
+    dataset_path: Path = MISSING  # Remove this line
+    data_config: PytorchDatasetConfig = dataclasses.field(default_factory=PytorchDatasetConfig)
     pretraining_metrics_config: MetricsConfig = dataclasses.field(
         default_factory=lambda: MetricsConfig(
             include_metrics={Split.TRAIN: {MetricCategories.LOSS_PARTS: True}},
@@ -558,8 +559,6 @@ class PretrainConfig:
     # compile: bool = True
 
     def __post_init__(self):
-        if type(self.save_dir) is str and self.save_dir != omegaconf.MISSING:
-            self.save_dir = Path(self.save_dir)
         if "max_epochs" in self.trainer_config:
             raise ValueError("Max epochs is set in the optimization_config, not the trainer config!")
         if "callbacks" in self.trainer_config:
@@ -577,9 +576,6 @@ def train(cfg: PretrainConfig, train_pyd: PytorchDataset, tuning_pyd: PytorchDat
     L.seed_everything(cfg.seed)
     if cfg.do_use_filesystem_sharing:
         torch.multiprocessing.set_sharing_strategy("file_system")
-
-    train_pyd = PytorchDataset(cfg.data_config, split="train")
-    tuning_pyd = PytorchDataset(cfg.data_config, split="tuning")
 
     config = cfg.config
     optimization_config = cfg.optimization_config

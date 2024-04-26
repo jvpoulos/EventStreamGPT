@@ -34,9 +34,10 @@ from omegaconf import MISSING
 from EventStream.utils import hydra_dataclass
 from EventStream.data.dataset_polars import Dataset
 from .dataset_config import DatasetConfig
-from .dataset_schema import DatasetSchema
+from .dataset_common import DatasetSchema
 from .input_df_schema import InputDFSchema
 from .measurement_config import MeasurementConfig
+from .custom_resolvers import load_dataset
 
 # Represents the type for a column name in a dataframe.
 DF_COL = Union[str, Sequence[str]]
@@ -185,7 +186,8 @@ class PytorchDatasetConfig(DataConfig):
     """
 
     save_dir: Path = MISSING
-    dataset: Dataset = MISSING  # Add this line
+    dataset = MISSING 
+    dataset_path: Path = MISSING
 
     max_seq_len: int = 256
     min_seq_len: int = 2
@@ -215,6 +217,9 @@ class PytorchDatasetConfig(DataConfig):
         if type(self.save_dir) is str and self.save_dir != omegaconf.MISSING:
             self.save_dir = Path(self.save_dir)
 
+        if self.dataset_path != omegaconf.MISSING:
+            self.dataset = OmegaConf.structured(OmegaConf.load_dataset(self.dataset_path))
+            
         match self.train_subset_size:
             case int() as n if n < 0:
                 raise ValueError(f"If integral, train_subset_size must be positive! Got {n}")

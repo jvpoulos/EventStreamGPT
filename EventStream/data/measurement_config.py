@@ -32,13 +32,12 @@ import dataclasses
 from omegaconf import MISSING
 
 from EventStream.utils import hydra_dataclass
-
-def get_dataset():
-    from EventStream.data.dataset_polars import Dataset
-    return Dataset
-
 @dataclasses.dataclass
 class MeasurementConfig(JSONableMixin):
+    @staticmethod
+    def get_smallest_valid_uint_type(num: int | float | pl.Expr) -> pl.DataType:
+        from .dataset_utils import get_dataset
+        Dataset = get_dataset()
     """The Configuration class for a measurement in the Dataset.
 
     A measurement is any observation in the dataset; be it static or dynamic, categorical or continuous. This

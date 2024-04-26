@@ -38,6 +38,8 @@ from .measurement_config import MeasurementConfig
 
 @dataclasses.dataclass
 class DatasetConfig(JSONableMixin):
+    def __post_init__(self):
+        from EventStream.data.dataset_polars import Dataset
     """Configuration options for a Dataset class.
 
     This is the core configuration object for Dataset objects. Contains configuration options for
@@ -184,8 +186,6 @@ class DatasetConfig(JSONableMixin):
             ...
         ValueError: Measurement config meas1 invalid!
     """
-
-    from EventStream.data.dataset_polars import Dataset
     
     measurement_configs: dict[str, MeasurementConfig] = dataclasses.field(default_factory=lambda: {})
 
@@ -205,7 +205,6 @@ class DatasetConfig(JSONableMixin):
 
     def __post_init__(self):
         """Validates that parameters take on valid values."""
-        from EventStream.data.dataset_polars import Dataset
         for name, cfg in self.measurement_configs.items():
             if cfg.name is None:
                 cfg.name = name

@@ -31,12 +31,65 @@ from .types import (
 )
 from .vocabulary import Vocabulary
 from .measurement_config import MeasurementConfig
+from .dataset_base import DatasetBase
 
 # We need to do this so that categorical columns can be reliably used via category names.
 pl.enable_string_cache(True)
 
-from .dataset_base import DatasetBase
-class Dataset(DatasetBase[DF_T, INPUT_DF_T]):
+# Represents the type for a column name in a dataframe.
+DF_COL = Union[str, Sequence[str]]
+
+# Represents the type of an input column during pre-processing.
+INPUT_COL_T = Union[InputDataType, tuple[InputDataType, str]]
+
+# A unified type for a schema of an input dataframe.
+DF_SCHEMA = Union[
+    # For cases where you specify a list of columns of a constant type.
+    tuple[list[DF_COL], INPUT_COL_T],
+    # For specifying a single column and type.
+    tuple[DF_COL, INPUT_COL_T],
+    # For specifying a dictionary of columns to types.
+    dict[DF_COL, INPUT_COL_T],
+    # For specifying a dictionary of column in names to column out names and types.
+    dict[DF_COL, tuple[str, INPUT_COL_T]],
+    # For specifying a dictionary of column in names to out names, all of a constant type.
+    tuple[dict[DF_COL, str], INPUT_COL_T],
+]
+
+DF_T = Union[pl.LazyFrame, pl.DataFrame, pl.Expr, pl.Series]
+
+@dataclasses.dataclass(frozen=True)
+class Query:
+    """A structure for database query based input dataframes.
+
+    Args:
+        connection_uri: The connection URI for the database. This is in the `connectorx`_ format.
+        query: The query to be run over the database. It can be specified either as a direct string, a path to
+            a file on disk containing the query in txt format, or a list of said options.
+        partition_on: If the query should be partitioned, on what column should it be partitioned? See the
+            `polars documentation`_ for more details.
+        partition_num: If the query should be partitioned, into how many partitions should it be divided? See
+            the `polars documentation`_ for more details.
+        protocol: The `connectorx`_ backend protocol.
+
+    .. connectorx_: https://github.com/sfu-db/connector-x
+    .. polars documentation_: https://pola-rs.github.io/polars/py-polars/html/reference/api/polars.read_database.html
+    """  # noqa E501
+
+    connection_uri: str
+    query: str | Path | list[str | Path]
+    partition_on: str | None = None
+    partition_num: int | None = None
+    protocol: str = "binary"
+
+    def __str__(self):
+        return f'Query("{self.query}")'
+
+INPUT_DF_T = Union[Path, pd.DataFrame, pl.DataFrame, Query]
+
+class Dataset(DatasetBase):
+    def __init__(self, *args, **kwargs):
+        super(DatasetBase, self).__init__(*args, **kwargs)
     """The polars specific implementation of the dataset.
 
     Args:
@@ -1844,34 +1897,3 @@ class Dataset(DatasetBase[DF_T, INPUT_DF_T]):
         return events_df.with_columns(
             ((pl.col(col) * normalizer_params["std_"]) + normalizer_params["mean_"]).alias(col)
         )
-
-@dataclasses.dataclass(frozen=True)
-class Query:
-    """A structure for database query based input dataframes.
-
-    Args:
-        connection_uri: The connection URI for the database. This is in the `connectorx`_ format.
-        query: The query to be run over the database. It can be specified either as a direct string, a path to
-            a file on disk containing the query in txt format, or a list of said options.
-        partition_on: If the query should be partitioned, on what column should it be partitioned? See the
-            `polars documentation`_ for more details.
-        partition_num: If the query should be partitioned, into how many partitions should it be divided? See
-            the `polars documentation`_ for more details.
-        protocol: The `connectorx`_ backend protocol.
-
-    .. connectorx_: https://github.com/sfu-db/connector-x
-    .. polars documentation_: https://pola-rs.github.io/polars/py-polars/html/reference/api/polars.read_database.html
-    """  # noqa E501
-
-    connection_uri: str
-    query: str | Path | list[str | Path]
-    partition_on: str | None = None
-    partition_num: int | None = None
-    protocol: str = "binary"
-
-    def __str__(self):
-        return f'Query("{self.query}")'
-
-
-DF_T = Union[pl.LazyFrame, pl.DataFrame, pl.Expr, pl.Series]
-INPUT_DF_T = Union[Path, pd.DataFrame, pl.DataFrame, Query]
