@@ -27,17 +27,17 @@ from ..utils import lt_count_or_proportion
 
 from .types import DataModality, InputDataType, InputDFType, TemporalityType
 from .visualize import Visualizer
-from .vocabulary import Vocabulary
-from .config import VocabularyConfig
-from .dataset_config import DatasetConfig
-from .dataset_schema import DatasetSchema
-from .input_df_schema import InputDFSchema
+from .vocabulary import Vocabulary, VocabularyConfig
 from .measurement_config import MeasurementConfig
+from typing import TYPE_CHECKING
 
 INPUT_DF_T = TypeVar("INPUT_DF_T")
 
 DF_T = TypeVar("DF_T")
 
+def get_dataset_config():
+    from .dataset_config import DatasetConfig
+    return DatasetConfig
 
 class DatasetBase(
     abc.ABC, Generic[DF_T, INPUT_DF_T], SeedableMixin, SaveableMixin, TimeableMixin, TQDMableMixin
@@ -178,7 +178,7 @@ class DatasetBase(
         raise NotImplementedError("Must be implemented by subclass.")
 
     @classmethod
-    def build_subjects_dfs(cls, schema: InputDFSchema) -> tuple[DF_T, dict[Hashable, int]]:
+    def build_subjects_dfs(cls, schema: 'InputDFSchema') -> tuple[DF_T, dict[Hashable, int]]:
         """Builds and returns the subjects dataframe from `schema`.
 
         Args:
@@ -189,6 +189,8 @@ class DatasetBase(
             Both the built `subjects_df` as well as a dictionary from the raw subject ID column values to the
             inferred numeric subject IDs.
         """
+        from .dataset_schema import DatasetSchema
+        from .input_df_schema import InputDFSchema
         subjects_df, ID_map = cls._load_input_df(
             schema.input_df,
             [(schema.subject_id_col, InputDataType.CATEGORICAL)] + schema.columns_to_load,
@@ -206,7 +208,7 @@ class DatasetBase(
         subject_ids_map: dict[Any, int],
         subject_id_col: str,
         subject_id_dtype: Any,
-        schemas_by_df: dict[INPUT_DF_T, list[InputDFSchema]],
+        schemas_by_df: dict[INPUT_DF_T, list['InputDFSchema']],
     ) -> tuple[DF_T, DF_T]:
         """Builds and returns events and measurements dataframes from the input schema map.
 
@@ -220,6 +222,8 @@ class DatasetBase(
         Returns:
             Both the built `events_df` and `dynamic_measurements_df`.
         """
+        from .dataset_schema import DatasetSchema
+        from .input_df_schema import InputDFSchema
         all_events_and_measurements = []
         event_types = []
 
@@ -433,9 +437,9 @@ class DatasetBase(
         Raises:
             FileNotFoundError: If either the attributes file or config file do not exist.
         """
-        from EventStream.data.dataset_base import DatasetBase
         attrs_fp = load_dir / "E.pkl"
 
+        DatasetConfig = get_dataset_config()
         reloaded_config = DatasetConfig.from_json_file(load_dir / "config.json")
         if reloaded_config.save_dir != load_dir:
             print(f"Updating config.save_dir from {reloaded_config.save_dir} to {load_dir}")
@@ -510,7 +514,7 @@ class DatasetBase(
 
     def __init__(
         self,
-        config: DatasetConfig,
+        config: 'DatasetConfig',
         subjects_df: DF_T | None = None,
         events_df: DF_T | None = None,
         dynamic_measurements_df: DF_T | None = None,
@@ -525,7 +529,7 @@ class DatasetBase(
         self._is_fit = False
 
         # After pre-processing, we may infer new types or otherwise change measurement configuration, so
-        # we store a separage configuration object for post-processing. It is initialized as empty as we have
+        # we store a separate configuration object for post-processing. It is initialized as empty as we have
         # not yet pre-processed anything.
         self.inferred_measurement_configs = {}
 

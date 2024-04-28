@@ -26,15 +26,13 @@ from ..utils import (
 )
 from .time_dependent_functor import AgeFunctor, TimeDependentFunctor, TimeOfDayFunctor
 from .types import DataModality, InputDataType, InputDFType, TemporalityType
-from .vocabulary import Vocabulary
+from .vocabulary import Vocabulary, VocabularyConfig
 
 import dataclasses
 from omegaconf import MISSING
 
 from EventStream.utils import hydra_dataclass
-from EventStream.data.dataset_polars import Dataset
 from .dataset_config import DatasetConfig
-from .dataset_common import DatasetSchema
 from .input_df_schema import InputDFSchema
 from .measurement_config import MeasurementConfig
 from .custom_resolvers import load_dataset
@@ -245,52 +243,3 @@ class PytorchDatasetConfig(DataConfig):
         """Creates a new instance of this class from a plain dictionary."""
         as_dict["save_dir"] = Path(as_dict["save_dir"])
         return cls(**as_dict)
-
-@dataclasses.dataclass
-class VocabularyConfig(JSONableMixin):
-    """Dataclass that describes the vocabulary of a dataset, for initializing model parameters.
-
-    This does not configure a vocabulary, but rather describes the vocabulary learned during dataset
-    pre-processing for an entire dataset. This description includes the sizes of all per-measurement
-    vocabularies (where measurements without a vocabulary, such as univariate regression measurements) are
-    omitted as their vocabularies have size 1, vocabulary offsets per measurement, which detail how the
-    various vocabularies are stuck together to form a unified vocabulary, the indices of each global
-    measurement type, the generative modes used by each measurement, and the event type indices.
-
-    Attributes:
-        vocab_sizes_by_measurement: A dictionary mapping measurements to their respective vocabulary sizes.
-        vocab_offsets_by_measurement: A dictionary mapping measurements to their respective vocabulary
-            offsets.
-        measurements_idxmap: A dictionary mapping measurements to their integer indices.
-        measurements_per_generative_mode: A dictionary mapping data modality to a list of measurements.
-        event_types_idxmap: A dictionary mapping event types to their respective indices.
-    """
-
-    vocab_sizes_by_measurement: dict[str, int] | None = None
-    vocab_offsets_by_measurement: dict[str, int] | None = None
-    measurements_idxmap: dict[str, dict[Hashable, int]] | None = None
-    measurements_per_generative_mode: dict[DataModality, list[str]] | None = None
-    event_types_idxmap: dict[str, int] | None = None
-
-    @property
-    def total_vocab_size(self) -> int:
-        """Returns the total vocab size of the vocabulary described here.
-
-        The total vocabulary size is the sum of (1) all the individual measurement vocabularies' sizes, (2)
-        any offset the global vocabulary has from 0, to account for padding indices, and (3) any measurements
-        who have length-1 vocabularies (which are not included in `vocab_sizes_by_measurement`) as is
-        reflected by elements in the vocab offsets dictionary that aren't in the vocab sizes dictionary.
-
-        Examples:
-            >>> config = VocabularyConfig(
-            ...     vocab_sizes_by_measurement={"measurement1": 10, "measurement2": 3},
-            ...     vocab_offsets_by_measurement={"measurement1": 5, "measurement2": 15, "measurement3": 18}
-            ... )
-            >>> config.total_vocab_size
-            19
-        """
-        return (
-            sum(self.vocab_sizes_by_measurement.values())
-            + min(self.vocab_offsets_by_measurement.values())
-            + (len(self.vocab_offsets_by_measurement) - len(self.vocab_sizes_by_measurement))
-        )

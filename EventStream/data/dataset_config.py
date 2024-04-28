@@ -35,11 +35,10 @@ from EventStream.utils import hydra_dataclass
 from .dataset_schema import DatasetSchema
 from .input_df_schema import InputDFSchema
 from .measurement_config import MeasurementConfig
-
+from typing import TYPE_CHECKING
+    
 @dataclasses.dataclass
 class DatasetConfig(JSONableMixin):
-    def __post_init__(self):
-        from EventStream.data.dataset_polars import Dataset
     """Configuration options for a Dataset class.
 
     This is the core configuration object for Dataset objects. Contains configuration options for

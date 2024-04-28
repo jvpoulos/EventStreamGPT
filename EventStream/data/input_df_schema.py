@@ -32,7 +32,6 @@ import dataclasses
 from omegaconf import MISSING
 
 from EventStream.utils import hydra_dataclass
-from EventStream.data.dataset_polars import Dataset
 
 
 @dataclasses.dataclass

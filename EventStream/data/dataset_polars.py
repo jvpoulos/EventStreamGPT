@@ -7,6 +7,12 @@ Attributes:
         series.
 """
 
+from .dataset_config import DatasetConfig
+from .dataset_base import DatasetBase
+def get_dataset_class():
+    from .dataset_base import get_dataset_class as _get_dataset_class
+    return _get_dataset_class
+
 import dataclasses
 import math
 import multiprocessing
@@ -21,7 +27,6 @@ import polars.selectors as cs
 from mixins import TimeableMixin
 
 from ..utils import lt_count_or_proportion
-
 from .preprocessing import Preprocessor, StandardScaler, StddevCutoffOutlierDetector
 from .types import (
     DataModality,
@@ -31,7 +36,6 @@ from .types import (
 )
 from .vocabulary import Vocabulary
 from .measurement_config import MeasurementConfig
-from .dataset_base import DatasetBase
 
 # We need to do this so that categorical columns can be reliably used via category names.
 pl.enable_string_cache(True)
@@ -88,8 +92,9 @@ class Query:
 INPUT_DF_T = Union[Path, pd.DataFrame, pl.DataFrame, Query]
 
 class Dataset(DatasetBase):
-    def __init__(self, *args, **kwargs):
-        super(DatasetBase, self).__init__(*args, **kwargs)
+    def __init__(self, config: DatasetConfig, **kwargs):
+        self.config = config
+        super().__init__(config, **kwargs)
     """The polars specific implementation of the dataset.
 
     Args:
