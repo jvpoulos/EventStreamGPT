@@ -24,6 +24,7 @@ from ..utils import (
     hydra_dataclass,
     num_initial_spaces,
 )
+from EventStream.data.preprocessing.standard_scaler import StandardScaler
 from .time_dependent_functor import AgeFunctor, TimeDependentFunctor, TimeOfDayFunctor
 from .types import DataModality, InputDataType, InputDFType, TemporalityType
 from .vocabulary import Vocabulary
@@ -270,6 +271,9 @@ class DatasetConfig(JSONableMixin):
             A plain dictionary representation of self (nested through measurement configs as well).
         """
         as_dict = dataclasses.asdict(self)
+        print("Serializing DatasetConfig attributes:")
+        for key, value in as_dict.items():
+            print(f"Key: {key}, Type: {type(value)}")
         if self.save_dir is not None:
             as_dict["save_dir"] = str(self.save_dir.absolute())
         as_dict["measurement_configs"] = {k: v.to_dict() for k, v in self.measurement_configs.items()}
@@ -289,6 +293,10 @@ class DatasetConfig(JSONableMixin):
         }
         if type(as_dict["save_dir"]) is str:
             as_dict["save_dir"] = Path(as_dict["save_dir"])
+            
+        if as_dict["normalizer_config"] is not None:
+            normalizer_cls = globals()[as_dict["normalizer_config"]["cls"]]
+            as_dict["normalizer_config"]["cls"] = normalizer_cls
 
         return cls(**as_dict)
 

@@ -292,7 +292,7 @@ class JSONableMixin:
             return dataclasses.asdict(self)
         raise NotImplementedError("This must be overwritten in non-dataclass derived classes!")
 
-    def to_json_file(self, fp: Path, do_overwrite: bool = False):
+    def to_json_file(self, fp: Path, do_overwrite: bool = False, cls=None):
         """Writes the object to a json file.
 
         Serializes the object as JSON and writes it to a file.
@@ -329,7 +329,7 @@ class JSONableMixin:
         if (not do_overwrite) and fp.exists():
             raise FileExistsError(f"{fp} exists and do_overwrite = {do_overwrite}")
         with open(fp, mode="w") as f:
-            json.dump(self.to_dict(), f, cls=DataFrameEncoder)
+            json.dump(self.to_dict(), f, cls=cls)
 
     @classmethod
     def from_json_file(cls: type[JSONABLE_INSTANCE_T], fp: Path) -> JSONABLE_INSTANCE_T:

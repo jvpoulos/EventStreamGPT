@@ -31,6 +31,17 @@ from .vocabulary import Vocabulary, VocabularyConfig
 from .measurement_config import MeasurementConfig
 from typing import TYPE_CHECKING
 
+import json
+from abc import ABCMeta
+import dill
+import pickle
+
+class CustomJSONEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, ABCMeta):
+            return obj.__name__  # Serialize ABCMeta objects as their class names
+        return super().default(obj)
+
 INPUT_DF_T = TypeVar("INPUT_DF_T")
 
 DF_T = TypeVar("DF_T")
@@ -483,7 +494,7 @@ class DatasetBase(
         do_overwrite = kwargs.get("do_overwrite", False)
 
         config_fp = self.config.save_dir / "config.json"
-        self.config.to_json_file(config_fp, do_overwrite=do_overwrite)
+        self.config.to_json_file(config_fp, do_overwrite=do_overwrite, cls=CustomJSONEncoder)
 
         if self._is_fit:
             self.config.save_dir / "inferred_measurement_metadata"
@@ -498,7 +509,9 @@ class DatasetBase(
             with open(inferred_measurement_configs_fp, mode="w") as f:
                 json.dump(inferred_measurement_configs, f)
 
-        super()._save(self.config.save_dir / "E.pkl", **kwargs)
+        attrs_to_save = {k: v for k, v in self.__dict__.items() if k not in self._DEL_BEFORE_SAVING_ATTRS}
+        with open(self.config.save_dir / "E.pkl", mode="wb") as f:
+            dill.dump(attrs_to_save, f, protocol=pickle.HIGHEST_PROTOCOL)
 
         vocab_config_fp = self.config.save_dir / "vocabulary_config.json"
 
