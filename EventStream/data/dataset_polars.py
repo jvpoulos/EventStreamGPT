@@ -10,8 +10,8 @@ Attributes:
 from .dataset_config import DatasetConfig
 from .dataset_base import DatasetBase
 def get_dataset_class():
-    from .dataset_base import get_dataset_class as _get_dataset_class
-    return _get_dataset_class
+    from EventStream.data.dataset_base import get_dataset_class
+    return get_dataset_class
 
 import dataclasses
 import math
@@ -539,8 +539,7 @@ class Dataset(DatasetBase):
             expr = expr.when(cond).then(val)
         return expr.otherwise(col)
 
-    @staticmethod
-    def _validate_id_col(id_col: pl.Series) -> tuple[pl.Series, pl.datatypes.DataTypeClass]:
+    def _validate_id_col(self, id_col: pl.Series) -> tuple[pl.Series, pl.datatypes.DataTypeClass]:
         """Validate the given ID column.
 
         This validates that the ID column is unique, integral, strictly positive, and returns it converted to
@@ -571,7 +570,6 @@ class Dataset(DatasetBase):
                 raise ValueError(f"ID column {id_col.name} is not a non-negative integer type!")
 
         max_val = id_col.max()
-        Dataset = get_dataset_class()
         dt = Dataset.get_smallest_valid_uint_type(max_val)
 
         id_col = id_col.cast(dt)

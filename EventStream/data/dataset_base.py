@@ -50,6 +50,10 @@ def get_dataset_config():
     from .dataset_config import DatasetConfig
     return DatasetConfig
 
+def get_dataset_class():
+    from EventStream.data.dataset_polars import Dataset
+    return Dataset
+
 class DatasetBase(
     abc.ABC, Generic[DF_T, INPUT_DF_T], SeedableMixin, SaveableMixin, TimeableMixin, TQDMableMixin
 ):
@@ -74,13 +78,6 @@ class DatasetBase(
     """Dictates via which pickler the `_save` and `_load` methods will save/load objects of this class, as
     defined in `SaveableMixin`."""
 
-    _DEL_BEFORE_SAVING_ATTRS: list[str] = [
-        "_subjects_df",
-        "_events_df",
-        "_dynamic_measurements_df",
-        "config",
-        "inferred_measurement_configs",
-    ]
     """Attributes that are saved via separate files, and will be deleted before pickling."""
 
     DF_SAVE_FORMAT: str = "parquet"
@@ -345,6 +342,10 @@ class DatasetBase(
                 ...
             KeyError: 'Invalid preprocessor model class invalid! DatasetBase options are mock'
         """
+        from EventStream.data.preprocessing.standard_scaler import StandardScaler
+        PREPROCESSORS: dict[str, Preprocessor] = {
+            "standard_scaler": StandardScaler,
+        }
         model_config = copy.deepcopy(model_config)
         if "cls" not in model_config:
             raise KeyError("Missing mandatory preprocessor class configuration parameter `'cls'`.")
@@ -426,7 +427,7 @@ class DatasetBase(
         self._dynamic_measurements_df = dynamic_measurements_df
 
     @classmethod
-    def load(cls, load_dir: Path) -> "DatasetBase":
+    def load(cls, load_dir: Path, do_pickle_config: bool = True) -> "DatasetBase":
         """Loads and returns a dataset from disk.
 
         This function re-loads an instance of the calling class from disk. This function assumes that files
@@ -444,27 +445,40 @@ class DatasetBase(
 
         Args:
             load_dir: The path to the directory on disk from which the dataset should be loaded.
+            do_pickle_config: If True, the configuration object will be loaded from the pickled attributes.
+                If False, the configuration object will be loaded from the 'config.json' file.
 
         Raises:
             FileNotFoundError: If either the attributes file or config file do not exist.
         """
         attrs_fp = load_dir / "E.pkl"
 
-        DatasetConfig = get_dataset_config()
-        reloaded_config = DatasetConfig.from_json_file(load_dir / "config.json")
-        if reloaded_config.save_dir != load_dir:
-            print(f"Updating config.save_dir from {reloaded_config.save_dir} to {load_dir}")
-            reloaded_config.save_dir = load_dir
+        if attrs_fp.stat().st_size == 0:
+            raise ValueError(f"The attributes file {attrs_fp} is empty.")
 
-        attrs_to_add = {"config": reloaded_config}
+        DatasetConfig = get_dataset_config()
+        reloaded_config = None
+        if do_pickle_config:
+            attrs_to_add = {"config": DatasetConfig.from_json_file(load_dir / "config.json")}
+        else:
+            reloaded_config = DatasetConfig.from_json_file(load_dir / "config.json")
+            if reloaded_config.save_dir != load_dir:
+                print(f"Updating config.save_dir from {reloaded_config.save_dir} to {load_dir}")
+                reloaded_config.save_dir = load_dir
+
         inferred_measurement_configs_fp = load_dir / "inferred_measurement_configs.json"
         if inferred_measurement_configs_fp.is_file():
             with open(inferred_measurement_configs_fp) as f:
-                attrs_to_add["inferred_measurement_configs"] = {
-                    k: MeasurementConfig.from_dict(v, base_dir=load_dir) for k, v in json.load(f).items()
+                attrs_to_add = {
+                    "inferred_measurement_configs": {
+                        k: MeasurementConfig.from_dict(v, base_dir=load_dir) for k, v in json.load(f).items()
+                    }
                 }
 
-        return super()._load(attrs_fp, **attrs_to_add)
+        if do_pickle_config:
+            return super()._load(attrs_fp, **attrs_to_add)
+        else:
+            return cls(config=reloaded_config, **attrs_to_add.get("inferred_measurement_configs", {}))
 
     def save(self, **kwargs):
         """Saves the calling object to disk, in the directory `self.config.save_dir`.
@@ -494,9 +508,12 @@ class DatasetBase(
         do_overwrite = kwargs.get("do_overwrite", False)
 
         config_fp = self.config.save_dir / "config.json"
+        print("Saving configuration...")
         self.config.to_json_file(config_fp, do_overwrite=do_overwrite, cls=CustomJSONEncoder)
+        print("Configuration saved.")
 
-        if self._is_fit:
+        if self._is_fit and self.inferred_measurement_configs:
+            print("Saving inferred measurement metadata...")
             self.config.save_dir / "inferred_measurement_metadata"
             for k, v in self.inferred_measurement_configs.items():
                 v.cache_measurement_metadata(self.config.save_dir, f"inferred_measurement_metadata/{k}.csv")
@@ -505,25 +522,31 @@ class DatasetBase(
             inferred_measurement_configs = {
                 k: v.to_dict() for k, v in self.inferred_measurement_configs.items()
             }
-
             with open(inferred_measurement_configs_fp, mode="w") as f:
                 json.dump(inferred_measurement_configs, f)
+            print("Inferred measurement metadata saved.")
 
-        attrs_to_save = {k: v for k, v in self.__dict__.items() if k not in self._DEL_BEFORE_SAVING_ATTRS}
+
+        attrs_to_save = self.__dict__  # Save the entire object
         with open(self.config.save_dir / "E.pkl", mode="wb") as f:
             dill.dump(attrs_to_save, f, protocol=pickle.HIGHEST_PROTOCOL)
+        print("Dataset attributes saved.")
 
         vocab_config_fp = self.config.save_dir / "vocabulary_config.json"
 
+        print("Saving vocabulary configuration...")
         self.vocabulary_config.to_json_file(vocab_config_fp, do_overwrite=do_overwrite)
+        print("Vocabulary configuration saved.")
 
         subjects_fp = self.subjects_fp(self.config.save_dir)
         events_fp = self.events_fp(self.config.save_dir)
         dynamic_measurements_fp = self.dynamic_measurements_fp(self.config.save_dir)
 
+        print("Saving dataframes...")
         self._write_df(self.subjects_df, subjects_fp, do_overwrite=do_overwrite)
         self._write_df(self.events_df, events_fp, do_overwrite=do_overwrite)
         self._write_df(self.dynamic_measurements_df, dynamic_measurements_fp, do_overwrite=do_overwrite)
+        print("Dataframes saved.")
 
     def __init__(
         self,
@@ -754,10 +777,16 @@ class DatasetBase(
         3. Next, fit all pre-processing parameters over the observed measurements.
         4. Finally, transform all data via the fit pre-processing parameters.
         """
+        print("Starting preprocessing...")
         self._filter_subjects()
+        print("Finished filtering subjects.")
         self._add_time_dependent_measurements()
+        print("Finished adding time-dependent measurements.")
         self.fit_measurements()
+        print("Finished fitting measurements.")
         self.transform_measurements()
+        print("Finished transforming measurements.")
+        print("Preprocessing completed successfully.")
 
     @TimeableMixin.TimeAs
     @abc.abstractmethod

@@ -160,9 +160,7 @@ class Vocabulary(Generic[VOCAB_ELEMENT]):
                 f"len(set(self.vocabulary)) = {len(vocab_set)}."
             )
 
-        self.element_types = {type(v) for v in self.vocabulary if v != "UNK"}
-        if int in self.element_types:
-            raise ValueError("Integer elements in the vocabulary are not supported.")
+        self.element_types = set(type(v) for v in self.vocabulary if v != "UNK")
 
         self.obs_frequencies = np.array(self.obs_frequencies)
         self.obs_frequencies = self.obs_frequencies / self.obs_frequencies.sum()
