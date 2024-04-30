@@ -794,13 +794,17 @@ class Dataset(DatasetBase):
                 key_col = "const_key"
                 val_col = measure
                 metadata_as_polars = pl.DataFrame(
-                    {key_col: [measure], **{c: [v] for c, v in metadata.items()}}
+                    {key_col: [measure], **{c: [v] for c, v in metadata.items() if c != 'Result'}}
                 )
                 source_df = source_df.with_columns(pl.lit(measure).cast(pl.Categorical).alias(key_col))
             case DataModality.MULTIVARIATE_REGRESSION:
                 key_col = measure
                 val_col = config.values_column
-                metadata_as_polars = pl.from_pandas(metadata, include_index=True)
+                if 'Result' in metadata.columns:
+                    metadata_as_polars = pl.from_pandas(metadata.drop('Result', axis=1), include_index=True)
+                else:
+                    metadata_as_polars = pl.from_pandas(metadata, include_index=True)
+                join_key = key_col  # Use measure column as join key
             case _:
                 raise ValueError(f"Called _pre_numerical_source on {config.modality} measure {measure}!")
 
@@ -811,10 +815,13 @@ class Dataset(DatasetBase):
 
         metadata_as_polars = metadata_as_polars.with_columns(
             pl.col(key_col).cast(pl.Categorical),
-            **{k: pl.col(k).cast(v) for k, v in metadata_schema.items()},
+            pl.col('Result').cast(source_df['Result'].dtype),  # Cast 'Result' column to match source_df
+            **{k: pl.col(k).cast(v) for k, v in metadata_schema.items() if k != 'Result'},
         )
 
-        source_df = source_df.join(metadata_as_polars, on=key_col, how="left")
+        join_key = key_col if config.modality == DataModality.UNIVARIATE_REGRESSION else join_key
+        source_df = source_df.join(metadata_as_polars, on=join_key, how="left")
+
         return source_df, key_col, val_col, f"{measure}_is_inlier", metadata_as_polars
 
     def _total_possible_and_observed(
@@ -943,18 +950,28 @@ class Dataset(DatasetBase):
     def _fit_measurement_metadata(
         self, measure: str, config: MeasurementConfig, source_df: DF_T
     ) -> pd.DataFrame:
+        orig_source_df = source_df.clone()
+
         source_df, vocab_keys_col, vals_col, _, measurement_metadata = self._prep_numerical_source(
             measure, config, source_df
         )
-        # 1. Determines which vocab elements should be dropped due to insufficient occurrences.
+
+        # Calculate total possible and observed instances before dropping the 'Result' column
         if self.config.min_valid_vocab_element_observations is not None:
             if config.temporality == TemporalityType.DYNAMIC:
-                num_possible = source_df.select(pl.col("event_id").n_unique()).item()
-                num_non_null = pl.col("event_id").filter(pl.col(vocab_keys_col).is_not_null()).n_unique()
+                num_possible = orig_source_df.select(pl.col("event_id").n_unique()).item()
+                num_non_null = orig_source_df.select(
+                    pl.col("event_id").filter(pl.col(vocab_keys_col).is_not_null()).n_unique()
+                ).item()
             else:
-                num_possible = len(source_df)
-                num_non_null = pl.col(vocab_keys_col).drop_nulls().len()
+                num_possible = len(orig_source_df)
+                num_non_null = orig_source_df.select(pl.col(vocab_keys_col).drop_nulls().len()).item()
 
+        # Drop the 'Result' column after calculating total possible and observed instances
+        source_df = source_df.drop_nulls([vocab_keys_col, vals_col]).filter(pl.col(vals_col).is_not_nan())
+
+        # 1. Determines which vocab elements should be dropped due to insufficient occurrences.
+        if self.config.min_valid_vocab_element_observations is not None:
             should_drop_expr = lt_count_or_proportion(
                 num_non_null, self.config.min_valid_vocab_element_observations, num_possible
             ).cast(pl.Boolean)
@@ -988,8 +1005,6 @@ class Dataset(DatasetBase):
                     return measurement_metadata.loc[measure]
                 else:
                     return measurement_metadata
-
-        source_df = source_df.drop_nulls([vocab_keys_col, vals_col]).filter(pl.col(vals_col).is_not_nan())
 
         # 2. Eliminates hard outliers and performs censoring via specified config.
         bound_cols = {}

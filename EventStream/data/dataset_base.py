@@ -428,29 +428,6 @@ class DatasetBase(
 
     @classmethod
     def load(cls, load_dir: Path, do_pickle_config: bool = True) -> "DatasetBase":
-        """Loads and returns a dataset from disk.
-
-        This function re-loads an instance of the calling class from disk. This function assumes that files
-        are stored on disk in the following, distributed format:
-
-        * The base configuration object is stored in the file ``'config.json'``, in JSON format.
-        * If the saved dataset has already been fit, then the pre-processed measurement configs with inferred
-          parameters are stroed in ``'inferred_measurement_configs.json'``, in JSON format. Note that these
-          configs may in turn store their own attributes in further files, such as their
-          `measurement_metadata` dataframes, which are stored on disk in separate files to facilitate lazy
-          loading.
-        * The raw or fully pre-processed subjects, events, and measurements dataframes are stored in their
-          respective filenames (`SUBJECTS_FN`, `EVENTS_FN`, `DYNAMIC_MEASUREMENTS_FN`).
-        * Remaining attributes are stored in pickle format at ``'E.pkl'``.
-
-        Args:
-            load_dir: The path to the directory on disk from which the dataset should be loaded.
-            do_pickle_config: If True, the configuration object will be loaded from the pickled attributes.
-                If False, the configuration object will be loaded from the 'config.json' file.
-
-        Raises:
-            FileNotFoundError: If either the attributes file or config file do not exist.
-        """
         attrs_fp = load_dir / "E.pkl"
 
         if attrs_fp.stat().st_size == 0:
@@ -458,27 +435,28 @@ class DatasetBase(
 
         DatasetConfig = get_dataset_config()
         reloaded_config = None
+        attrs_to_add = {}
+
         if do_pickle_config:
-            attrs_to_add = {"config": DatasetConfig.from_json_file(load_dir / "config.json")}
+            with open(load_dir / "config.json") as f:
+                attrs_to_add["config"] = DatasetConfig.from_dict(json.load(f))
         else:
             reloaded_config = DatasetConfig.from_json_file(load_dir / "config.json")
             if reloaded_config.save_dir != load_dir:
                 print(f"Updating config.save_dir from {reloaded_config.save_dir} to {load_dir}")
                 reloaded_config.save_dir = load_dir
+            attrs_to_add["config"] = reloaded_config
 
         inferred_measurement_configs_fp = load_dir / "inferred_measurement_configs.json"
         if inferred_measurement_configs_fp.is_file():
             with open(inferred_measurement_configs_fp) as f:
-                attrs_to_add = {
-                    "inferred_measurement_configs": {
-                        k: MeasurementConfig.from_dict(v, base_dir=load_dir) for k, v in json.load(f).items()
-                    }
+                attrs_to_add["inferred_measurement_configs"] = {
+                    k: MeasurementConfig.from_dict(v, base_dir=load_dir) for k, v in json.load(f).items()
                 }
-
-        if do_pickle_config:
-            return super()._load(attrs_fp, **attrs_to_add)
         else:
-            return cls(config=reloaded_config, **attrs_to_add.get("inferred_measurement_configs", {}))
+            attrs_to_add["inferred_measurement_configs"] = {}
+
+        return super()._load(attrs_fp, **attrs_to_add)
 
     def save(self, **kwargs):
         """Saves the calling object to disk, in the directory `self.config.save_dir`.
@@ -550,7 +528,7 @@ class DatasetBase(
 
     def __init__(
         self,
-        config: 'DatasetConfig',
+        config: 'DatasetConfig' = None,
         subjects_df: DF_T | None = None,
         events_df: DF_T | None = None,
         dynamic_measurements_df: DF_T | None = None,
@@ -560,6 +538,9 @@ class DatasetBase(
 
         if "do_overwrite" in kwargs:
             self.do_overwrite = kwargs["do_overwrite"]
+
+        if config is None:
+            config = get_dataset_config()
 
         self.config = config
         self._is_fit = False
