@@ -941,17 +941,20 @@ class DatasetBase(
             updated_cols = [measure]
 
             try:
-                if config.is_numeric:
-                    source_df = self._transform_numerical_measurement(measure, config, source_df)
+                if config.modality == DataModality.MULTI_LABEL_CLASSIFICATION:
+                    source_df = self._transform_multi_label_classification(measure, config, source_df)
+                else:
+                    if config.is_numeric:
+                        source_df = self._transform_numerical_measurement(measure, config, source_df)
 
-                    if config.modality == DataModality.MULTIVARIATE_REGRESSION:
-                        updated_cols.append(config.values_column)
+                        if config.modality == DataModality.MULTIVARIATE_REGRESSION:
+                            updated_cols.append(config.values_column)
 
-                    if self.config.outlier_detector_config is not None:
-                        updated_cols.append(f"{measure}_is_inlier")
+                        if self.config.outlier_detector_config is not None:
+                            updated_cols.append(f"{measure}_is_inlier")
 
-                if config.vocabulary is not None:
-                    source_df = self._transform_categorical_measurement(measure, config, source_df)
+                    if config.vocabulary is not None:
+                        source_df = self._transform_categorical_measurement(measure, config, source_df)
 
             except BaseException as e:
                 raise ValueError(f"Transforming measurement failed for measure {measure}!") from e

@@ -621,6 +621,10 @@ class Dataset(DatasetBase):
 
                 source_df = source_df.with_columns(pl.col(val_col).cast(pl.Float64))
 
+        # Special case for A1cGreaterThan7 column
+        if "A1cGreaterThan7" in source_df.columns and source_df["A1cGreaterThan7"].dtype != pl.Categorical:
+            source_df = source_df.with_columns(pl.col("A1cGreaterThan7").cast(pl.Utf8).cast(pl.Categorical))
+
         return source_df, id_col_dt
 
     def _validate_initial_dfs(
@@ -792,19 +796,15 @@ class Dataset(DatasetBase):
         match config.modality:
             case DataModality.UNIVARIATE_REGRESSION:
                 key_col = "const_key"
-                val_col = measure
+                val_col = config.values_column
                 metadata_as_polars = pl.DataFrame(
-                    {key_col: [measure], **{c: [v] for c, v in metadata.items() if c != 'Result'}}
+                    {key_col: [measure], **{c: [v] for c, v in metadata.items()}}
                 )
                 source_df = source_df.with_columns(pl.lit(measure).cast(pl.Categorical).alias(key_col))
             case DataModality.MULTIVARIATE_REGRESSION:
                 key_col = measure
                 val_col = config.values_column
-                if 'Result' in metadata.columns:
-                    metadata_as_polars = pl.from_pandas(metadata.drop('Result', axis=1), include_index=True)
-                else:
-                    metadata_as_polars = pl.from_pandas(metadata, include_index=True)
-                join_key = key_col  # Use measure column as join key
+                metadata_as_polars = pl.from_pandas(metadata, include_index=True)
             case _:
                 raise ValueError(f"Called _pre_numerical_source on {config.modality} measure {measure}!")
 
@@ -815,13 +815,11 @@ class Dataset(DatasetBase):
 
         metadata_as_polars = metadata_as_polars.with_columns(
             pl.col(key_col).cast(pl.Categorical),
-            pl.col('Result').cast(source_df['Result'].dtype),  # Cast 'Result' column to match source_df
-            **{k: pl.col(k).cast(v) for k, v in metadata_schema.items() if k != 'Result'},
+            pl.col(val_col).cast(pl.Float64).alias("value"),  # Rename the values column to 'value'
+            **{k: pl.col(k).cast(v) for k, v in metadata_schema.items()},
         )
 
-        join_key = key_col if config.modality == DataModality.UNIVARIATE_REGRESSION else join_key
-        source_df = source_df.join(metadata_as_polars, on=join_key, how="left")
-
+        source_df = source_df.join(metadata_as_polars, on=key_col, how="left")
         return source_df, key_col, val_col, f"{measure}_is_inlier", metadata_as_polars
 
     def _total_possible_and_observed(
@@ -1094,49 +1092,65 @@ class Dataset(DatasetBase):
 
     @TimeableMixin.TimeAs
     def _fit_vocabulary(self, measure: str, config: MeasurementConfig, source_df: DF_T) -> Vocabulary:
-        match config.modality:
-            case DataModality.MULTIVARIATE_REGRESSION:
-                val_types = pl.from_pandas(
-                    config.measurement_metadata[["value_type"]], include_index=True
-                ).with_columns(
-                    pl.col("value_type").cast(pl.Categorical), pl.col(measure).cast(pl.Categorical)
-                )
-                observations = (
-                    source_df.join(val_types, on=measure)
-                    .with_columns(
-                        pl.when(pl.col("value_type") == NumericDataModalitySubtype.CATEGORICAL_INTEGER)
-                        .then(
-                            pl.col(measure).cast(pl.Utf8)
-                            + "__EQ_"
-                            + pl.col(config.values_column).round(0).cast(int).cast(pl.Utf8)
-                        )
-                        .when(pl.col("value_type") == NumericDataModalitySubtype.CATEGORICAL_FLOAT)
-                        .then(
-                            pl.col(measure).cast(pl.Utf8)
-                            + "__EQ_"
-                            + pl.col(config.values_column).cast(pl.Utf8)
-                        )
-                        .otherwise(pl.col(measure))
-                        .alias(measure)
+        if config.modality == DataModality.MULTIVARIATE_REGRESSION:
+            val_types = pl.from_pandas(
+                config.measurement_metadata[["value_type"]], include_index=True
+            ).with_columns(
+                pl.col("value_type").cast(pl.Categorical), pl.col(measure).cast(pl.Categorical)
+            )
+            observations = (
+                source_df.join(val_types, on=measure)
+                .with_columns(
+                    pl.when(pl.col("value_type") == NumericDataModalitySubtype.CATEGORICAL_INTEGER)
+                    .then(
+                        pl.col(measure).cast(pl.Utf8)
+                        + "__EQ_"
+                        + pl.col(config.values_column).round(0).cast(int).cast(pl.Utf8)
                     )
-                    .get_column(measure)
+                    .when(pl.col("value_type") == NumericDataModalitySubtype.CATEGORICAL_FLOAT)
+                    .then(
+                        pl.col(measure).cast(pl.Utf8)
+                        + "__EQ_"
+                        + pl.col(config.values_column).cast(pl.Utf8)
+                    )
+                    .otherwise(pl.col(measure))
+                    .alias(measure)
                 )
-            case DataModality.UNIVARIATE_REGRESSION:
-                match config.measurement_metadata.value_type:
-                    case NumericDataModalitySubtype.CATEGORICAL_INTEGER:
-                        observations = source_df.with_columns(
-                            (f"{measure}__EQ_" + pl.col(measure).round(0).cast(int).cast(pl.Utf8)).alias(
-                                measure
-                            )
-                        ).get_column(measure)
-                    case NumericDataModalitySubtype.CATEGORICAL_FLOAT:
-                        observations = source_df.with_columns(
-                            (f"{measure}__EQ_" + pl.col(measure).cast(pl.Utf8)).alias(measure)
-                        ).get_column(measure)
-                    case _:
-                        return
-            case _:
-                observations = source_df.get_column(measure)
+                .get_column(measure)
+            )
+        elif config.modality == DataModality.UNIVARIATE_REGRESSION:
+            match config.measurement_metadata.value_type:
+                case NumericDataModalitySubtype.CATEGORICAL_INTEGER:
+                    observations = source_df.with_columns(
+                        (f"{measure}__EQ_" + pl.col(measure).round(0).cast(int).cast(pl.Utf8)).alias(
+                            measure
+                        )
+                    ).get_column(measure)
+                case NumericDataModalitySubtype.CATEGORICAL_FLOAT:
+                    observations = source_df.with_columns(
+                        (f"{measure}__EQ_" + pl.col(measure).cast(pl.Utf8)).alias(measure)
+                    ).get_column(measure)
+                case _:
+                    return
+        elif config.modality == DataModality.MULTI_LABEL_CLASSIFICATION:
+            # Handle multi-label classification measurements
+            observations = source_df.get_column(measure).cast(pl.Utf8)
+            observations = observations.apply(lambda s: s.split("|") if s is not None else [])
+            observations = observations.explode()
+            observations = observations.drop_nulls()
+            N = len(observations)
+            if N == 0:
+                return
+
+            try:
+                value_counts = observations.value_counts()
+                vocab_elements = value_counts[measure].to_list()
+                el_counts = value_counts["count"].to_list()
+                return Vocabulary(vocabulary=vocab_elements, obs_frequencies=el_counts)
+            except AssertionError as e:
+                raise AssertionError(f"Failed to build vocabulary for {measure}") from e
+        else:
+            observations = source_df.get_column(measure)
 
         # 1. Set the overall observation frequency for the column.
         observations = observations.drop_nulls()
@@ -1144,20 +1158,46 @@ class Dataset(DatasetBase):
         if N == 0:
             return
 
-        # 3. Fit metadata vocabularies on the training set.
+        # 2. Fit metadata vocabularies on the training set.
         if config.vocabulary is None:
             try:
                 value_counts = observations.value_counts()
-                print("value_counts DataFrame:")
-                print(value_counts)
-                print("Column names in value_counts DataFrame:", value_counts.columns)
-
                 vocab_elements = value_counts[measure].to_list()
-                el_counts = value_counts["count"].to_list()  # Changed from "counts" to "count"
+                el_counts = value_counts["count"].to_list()
                 return Vocabulary(vocabulary=vocab_elements, obs_frequencies=el_counts)
             except AssertionError as e:
                 raise AssertionError(f"Failed to build vocabulary for {measure}") from e
 
+    @TimeableMixin.TimeAs
+    def _transform_multi_label_classification(
+        self, measure: str, config: MeasurementConfig, source_df: DF_T
+    ) -> DF_T:
+        vocab_col = config.vocabulary.vocabulary
+
+        # Create a temporary DataFrame with the vocabulary list
+        vocab_df = pl.DataFrame({measure: vocab_col})
+        vocab_df = vocab_df.with_columns(pl.col(measure).cast(pl.Categorical))
+
+        # Explode the column values by the delimiter '|'
+        exploded_df = source_df.explode(measure, by="|")
+
+        # Replace unknown values with 'UNK' and cast to categorical
+        transformed_df = exploded_df.with_columns(
+            pl.when(pl.col(measure).is_null())
+            .then(pl.lit("UNK"))
+            .when(~pl.col(measure).is_in(vocab_df[measure]))
+            .then(pl.lit("UNK"))
+            .otherwise(pl.col(measure))
+            .cast(pl.Categorical)
+            .alias(measure)
+        )
+
+        # Gather the transformed values back into a list
+        transformed_col = transformed_df.groupby("__row_nr__").agg(pl.col(measure).list().alias(measure))
+
+        # Join the transformed column back to the original dataframe
+        return source_df.join(transformed_col, on="__row_nr__", how="left").drop("__row_nr__")
+        
     @TimeableMixin.TimeAs
     def _transform_numerical_measurement(
         self, measure: str, config: MeasurementConfig, source_df: DF_T
@@ -1261,33 +1301,66 @@ class Dataset(DatasetBase):
     def _transform_categorical_measurement(
         self, measure: str, config: MeasurementConfig, source_df: DF_T
     ) -> DF_T:
-        if (config.modality == DataModality.UNIVARIATE_REGRESSION) and (
-            config.measurement_metadata.value_type
-            not in (
+        if config.modality == DataModality.UNIVARIATE_REGRESSION:
+            if config.measurement_metadata.value_type in (
                 NumericDataModalitySubtype.CATEGORICAL_INTEGER,
                 NumericDataModalitySubtype.CATEGORICAL_FLOAT,
-            )
-        ):
-            return source_df
+            ):
+                # Handle categorical columns
+                transform_expr = []
+                vocab_el_col = pl.col("const_key")
+                vocab_lit = pl.lit(config.vocabulary.vocabulary).cast(pl.Categorical)
+                transform_expr.append(
+                    pl.when(vocab_el_col.is_null())
+                    .then(None)
+                    .when(~vocab_el_col.is_in(vocab_lit))
+                    .then(pl.lit("UNK"))
+                    .otherwise(vocab_el_col)
+                    .cast(pl.Categorical)
+                    .alias(measure)
+                )
+                return source_df.with_columns(transform_expr)
+            else:
+                # Handle numerical columns
+                return source_df
+        elif config.modality == DataModality.MULTI_LABEL_CLASSIFICATION:
+            # Handle multi-label classification measurements
+            vocab_col = config.vocabulary.vocabulary
+            vocab_lit = pl.Series(vocab_col).cast(pl.Categorical)
+            vocab_el_col = pl.col(measure)
 
+            if vocab_el_col.dtype != pl.Categorical:
+                vocab_el_col = vocab_el_col.cast(pl.Utf8).cast(pl.Categorical)
+
+            transform_expr = [
+                pl.when(vocab_el_col.is_null())
+                .then(None)
+                .when(~vocab_el_col.is_in(vocab_lit))
+                .then(pl.lit("UNK"))
+                .otherwise(vocab_el_col)
+                .alias(measure)
+            ]
+            return source_df.with_columns(transform_expr)
+
+        # Handle other modalities
         transform_expr = []
         if config.modality == DataModality.MULTIVARIATE_REGRESSION:
+            vocab_lit = pl.Series(config.vocabulary.vocabulary).cast(pl.Categorical)
             transform_expr.append(
-                pl.when(~pl.col(measure).is_in(config.vocabulary.vocabulary))
+                pl.when(~pl.col(measure).is_in(vocab_lit))
                 .then(np.NaN)
                 .otherwise(pl.col(config.values_column))
                 .alias(config.values_column)
             )
             vocab_el_col = pl.col(measure)
-        elif config.modality == DataModality.UNIVARIATE_REGRESSION:
-            vocab_el_col = pl.col("const_key")
         else:
             vocab_el_col = pl.col(measure)
+            vocab_lit = pl.Series(config.vocabulary.vocabulary).cast(pl.Categorical)
 
         transform_expr.append(
             pl.when(vocab_el_col.is_null())
             .then(None)
-            .when(~vocab_el_col.is_in(config.vocabulary.vocabulary))
+            .when(~vocab_el_col.is_in(vocab_lit))
             .then(pl.lit("UNK"))
             .otherwise(vocab_el_col)
             .cast(pl.Categorical)

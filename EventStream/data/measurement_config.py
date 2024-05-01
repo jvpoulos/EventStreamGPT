@@ -268,10 +268,10 @@ class MeasurementConfig(JSONableMixin):
                         f"functor should be None for {self.temporality} measurements! Got {self.functor}"
                     )
 
-                if self.is_numeric:
-                    raise NotImplementedError(
-                        f"Numeric data modalities like {self.modality} not yet supported on static measures."
-                    )
+                # if self.is_numeric:
+                #     raise NotImplementedError(
+                #         f"Numeric data modalities like {self.modality} not yet supported on static measures."
+                #     )
             case TemporalityType.DYNAMIC:
                 if self.functor is not None:
                     raise ValueError(
