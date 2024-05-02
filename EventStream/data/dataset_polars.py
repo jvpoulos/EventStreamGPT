@@ -1135,7 +1135,7 @@ class Dataset(DatasetBase):
         elif config.modality == DataModality.MULTI_LABEL_CLASSIFICATION:
             # Handle multi-label classification measurements
             observations = source_df.get_column(measure).cast(pl.Utf8)
-            observations = observations.apply(lambda s: s.split("|") if s is not None else [])
+            observations = observations.apply(lambda s: s.split("|") if s is not None else [], return_dtype=pl.List(pl.Utf8))
             observations = observations.explode()
             observations = observations.drop_nulls()
             N = len(observations)
@@ -1172,32 +1172,51 @@ class Dataset(DatasetBase):
     def _transform_multi_label_classification(
         self, measure: str, config: MeasurementConfig, source_df: DF_T
     ) -> DF_T:
+        print(f"Transforming measure: {measure}")
+        print(f"Source DataFrame schema: {source_df.schema}")
+
         vocab_col = config.vocabulary.vocabulary
+        vocab_set = set(vocab_col)
 
-        # Create a temporary DataFrame with the vocabulary list
-        vocab_df = pl.DataFrame({measure: vocab_col})
-        vocab_df = vocab_df.with_columns(pl.col(measure).cast(pl.Categorical))
+        print(f"vocab_col: {vocab_col}")
+        print(f"vocab_set: {vocab_set}")
 
-        # Explode the column values by the delimiter '|'
-        exploded_df = source_df.explode(measure, by="|")
+        print(f"source_df before transformation: {source_df.head()}")
 
-        # Replace unknown values with 'UNK' and cast to categorical
-        transformed_df = exploded_df.with_columns(
-            pl.when(pl.col(measure).is_null())
-            .then(pl.lit("UNK"))
-            .when(~pl.col(measure).is_in(vocab_df[measure]))
-            .then(pl.lit("UNK"))
-            .otherwise(pl.col(measure))
-            .cast(pl.Categorical)
-            .alias(measure)
+        # Check the data type of the measure column
+        print(f"Data type of {measure} column: {source_df[measure].dtype}")
+
+        # Convert the measure column to string if it's not already a string
+        if source_df[measure].dtype != pl.Utf8:
+            source_df = source_df.with_columns(pl.col(measure).cast(pl.Utf8))
+            print(f"Converted {measure} column to string")
+            print(f"source_df after conversion: {source_df.head()}")
+
+        # Split the measure column by '|' and convert to list
+        source_df = source_df.with_columns(
+            pl.col(measure).apply(lambda x: x.split("|") if x is not None else []).alias(f"{measure}_list")
         )
 
-        # Gather the transformed values back into a list
-        transformed_col = transformed_df.groupby("__row_nr__").agg(pl.col(measure).list().alias(measure))
+        print(f"source_df after splitting: {source_df.head()}")
 
-        # Join the transformed column back to the original dataframe
-        return source_df.join(transformed_col, on="__row_nr__", how="left").drop("__row_nr__")
-        
+        # Transform the values in the list
+        transformed_df = source_df.with_columns(
+            pl.col(f"{measure}_list").apply(lambda x: [elem if elem in vocab_set else "UNK" for elem in x])
+        )
+
+        print(f"transformed_df: {transformed_df.head()}")
+
+        # Drop the original measure column before renaming the exploded column
+        transformed_df = transformed_df.drop(measure)
+
+        # Explode the transformed list column and rename it to the original measure name
+        transformed_df = transformed_df.explode(f"{measure}_list").rename({f"{measure}_list": measure})
+
+        print(f"transformed_df after explode: {transformed_df.head()}")
+        print(f"Result DataFrame schema: {transformed_df.schema}")
+
+        return transformed_df
+     
     @TimeableMixin.TimeAs
     def _transform_numerical_measurement(
         self, measure: str, config: MeasurementConfig, source_df: DF_T
