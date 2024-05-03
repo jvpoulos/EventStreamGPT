@@ -799,11 +799,17 @@ class DatasetBase(
                     source_df = self.train_dynamic_measurements_df
                 else:
                     source_df = self.dynamic_measurements_df
-
             case TemporalityType.STATIC:
                 source_attr = "subjects_df"
                 source_id = "subject_id"
-                source_df = self.train_subjects_df if do_only_train else self.subjects_df
+                if do_only_train:
+                    source_df = self.train_subjects_df
+                else:
+                    source_df = self.subjects_df
+
+                # Add a check to ensure the 'Female' column is present in the source DataFrame
+                if config.name == 'Female' and 'Female' not in source_df.columns:
+                    raise ValueError(f"Column 'Female' not found in the source DataFrame for measure {config.name}")
 
             case TemporalityType.FUNCTIONAL_TIME_DEPENDENT:
                 source_attr = "events_df"
@@ -813,7 +819,7 @@ class DatasetBase(
             case _:
                 raise ValueError(f"Called get_source_df on temporality type {config.temporality}!")
         return source_attr, source_id, source_df
-
+        
     @TimeableMixin.TimeAs
     def fit_measurements(self):
         """Fits all preprocessing parameters over the training dataset, according to `self.config`.
@@ -854,6 +860,7 @@ class DatasetBase(
             if lt_count_or_proportion(
                 total_observed, self.config.min_valid_column_observations, total_possible
             ):
+                print(f"Dropping {measure} due to insufficient observations!")
                 config.drop()
                 continue
 
@@ -876,6 +883,7 @@ class DatasetBase(
 
                     # 5. If all observations were eliminated, drop the column.
                     if config.vocabulary.vocabulary == ["UNK"]:
+                        print(f"Dropping {measure} due to all observations being eliminated!")
                         config.drop()
 
         self._is_fit = True
@@ -942,10 +950,14 @@ class DatasetBase(
 
             try:
                 if config.modality == DataModality.MULTI_LABEL_CLASSIFICATION:
+                    print(f"Transforming multi-label classification measurement: {measure}")
                     source_df = self._transform_multi_label_classification(measure, config, source_df)
+                    print(f"Transformed multi-label classification measurement: {measure}")
                 else:
                     if config.is_numeric:
+                        print(f"Transforming numerical measurement: {measure}")
                         source_df = self._transform_numerical_measurement(measure, config, source_df)
+                        print(f"Transformed numerical measurement: {measure}")
 
                         if config.modality == DataModality.MULTIVARIATE_REGRESSION:
                             updated_cols.append(config.values_column)
@@ -954,10 +966,14 @@ class DatasetBase(
                             updated_cols.append(f"{measure}_is_inlier")
 
                     if config.vocabulary is not None:
+                        print(f"Transforming categorical measurement: {measure}")
                         source_df = self._transform_categorical_measurement(measure, config, source_df)
+                        print(f"Transformed categorical measurement: {measure}")
 
             except BaseException as e:
                 raise ValueError(f"Transforming measurement failed for measure {measure}!") from e
+
+            print(f"Transformation status for {measure}: {'Dropped' if config.is_dropped else 'Retained'}")
 
             self._update_attr_df(source_attr, id_col, source_df, updated_cols)
 

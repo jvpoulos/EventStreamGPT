@@ -111,7 +111,7 @@ def get_embeddings(cfg: FinetuneConfig):
     cfg.data_config
     optimization_config = cfg.optimization_config
 
-    config.set_to_dataset(train_pyd)
+    # config.set_to_dataset(train_pyd)
 
     # Model
     LM = ESTForEmbedding(config, pretrained_weights_fp=cfg.pretrained_weights_fp)

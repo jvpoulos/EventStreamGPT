@@ -3,6 +3,8 @@ import json
 import os
 from pathlib import Path
 from typing import Any
+import pathlib
+from EventStream.utils import JSONableMixin
 
 import lightning as L
 import omegaconf
@@ -44,6 +46,46 @@ from ..utils import expand_indexed_regression, str_summary
 from dataclasses import dataclass
 from omegaconf import MISSING
 
+from dataclasses import asdict, is_dataclass, fields 
+import collections
+
+def make_json_serializable(item, seen=None):
+    """
+    Converts Python objects into JSON serializable formats, handling various types explicitly and detecting cycles.
+    """
+    if seen is None:
+        seen = set()
+
+    if id(item) in seen:
+        return str(item)  # or return None to avoid serializing cyclic references
+
+    seen.add(id(item))
+
+    if is_dataclass(item):
+        result = {}
+        for field in fields(item):  # Here 'fields' should now be properly recognized
+            value = getattr(item, field.name)
+            result[field.name] = make_json_serializable(value, seen)
+        return result
+    elif isinstance(item, dict):
+        return {k: make_json_serializable(v, seen) for k, v in item.items()}
+    elif isinstance(item, (list, tuple, set)):
+        return [make_json_serializable(i, seen) for i in item]
+    elif isinstance(item, (str, int, float, bool, type(None))):
+        return item
+    elif hasattr(item, '__dict__'):
+        # Convert objects with __dict__ (that are not dataclasses) into dicts
+        return {k: make_json_serializable(v, seen) for k, v in item.__dict__.items()}
+    else:
+        # For any remaining types, convert them to string to ensure serializability
+        return str(item)
+
+def sanitize_config(config):
+    """
+    Recursively sanitize a configuration dictionary to be JSON serializable.
+    """
+    return make_json_serializable(config)
+
 
 class ESTForGenerativeSequenceModelingLM(L.LightningModule):
     """A PyTorch Lightning Module for a `ESTForGenerativeSequenceModeling`."""
@@ -61,39 +103,29 @@ class ESTForGenerativeSequenceModelingLM(L.LightningModule):
         metrics_config: MetricsConfig | dict[str, Any],
         pretrained_weights_fp: Path | None = None,
     ):
-        """Initializes the Lightning Module.
-
-        Args:
-            config (`Union[StructuredEventstreamTransformerConfig, Dict[str, Any]]`):
-                The configuration for the underlying
-                `ESTForGenerativeSequenceModeling` model. Should be
-                in the dedicated `StructuredTransformerConfig` class or be a dictionary
-                parseable as such.
-            optimization_config (`Union[OptimizationConfig, Dict[str, Any]]`):
-                The configuration for the optimization process handled by the Lightning module. Should
-                be in the dedicated `OptimizationConfig` class or be a dictionary parseable
-                as such.
-        """
         super().__init__()
 
-        # If the configurations are dictionaries, convert them to class objects. They may be passed as
-        # dictionaries when the lightning module is loaded from a checkpoint, so we need to support
-        # this functionality.
-        if type(config) is dict:
+        # If the configurations are dictionaries, convert them to class objects.
+        if isinstance(config, dict):
             config = StructuredTransformerConfig(**config)
-        if type(optimization_config) is dict:
+        if isinstance(optimization_config, dict):
             optimization_config = OptimizationConfig(**optimization_config)
-        if type(metrics_config) is dict:
+        if isinstance(metrics_config, dict):
             metrics_config = MetricsConfig(**metrics_config)
 
         self.config = config
         self.optimization_config = optimization_config
         self.metrics_config = metrics_config
 
+        if isinstance(config, StructuredTransformerConfig):
+            config_dict = config.to_dict()
+        else:
+            config_dict = config
+
         self.save_hyperparameters(
             {
-                "config": config.to_dict(),
-                "optimization_config": dataclasses.asdict(optimization_config),
+                "config": config_dict,
+                "optimization_config": optimization_config,  # Pass the object directly
             }
         )
         self.build_metrics()
@@ -515,7 +547,7 @@ class PretrainConfig:
             },
         }
     )
-    optimization_config: OptimizationConfig = dataclasses.field(default_factory=lambda: OptimizationConfig())
+    optimization_config: OptimizationConfig = dataclasses.field(default_factory=OptimizationConfig)
     dataset_path: Path = MISSING  # Remove this line
     data_config: PytorchDatasetConfig = dataclasses.field(default_factory=PytorchDatasetConfig)
     pretraining_metrics_config: MetricsConfig = dataclasses.field(
@@ -548,11 +580,7 @@ class PretrainConfig:
             "do_log_graph": True,
         }
     )
-    wandb_experiment_config_kwargs: dict[str, Any] = dataclasses.field(
-        default_factory=lambda: {
-            "save_dir": "${save_dir}",
-        }
-    )
+    wandb_experiment_config_kwargs: dict[str, Any] = dataclasses.field(default_factory=dict)
     do_final_validation_on_metrics: bool = True
     do_use_filesystem_sharing: bool = True
 
@@ -572,7 +600,7 @@ def train(cfg: PretrainConfig, train_pyd: PytorchDataset, tuning_pyd: PytorchDat
     Args:
         cfg: The pre-training config defining the generative modeling task.
     """
-
+    import wandb 
     L.seed_everything(cfg.seed)
     if cfg.do_use_filesystem_sharing:
         torch.multiprocessing.set_sharing_strategy("file_system")
@@ -581,35 +609,46 @@ def train(cfg: PretrainConfig, train_pyd: PytorchDataset, tuning_pyd: PytorchDat
     optimization_config = cfg.optimization_config
     data_config = cfg.data_config
 
-    config.set_to_dataset(train_pyd)
-    optimization_config.set_to_dataset(train_pyd)
+    # config.set_to_dataset(train_pyd)
+    # optimization_config.set_to_dataset(train_pyd)
 
     if os.environ.get("LOCAL_RANK", "0") == "0":
-        cfg.save_dir.mkdir(parents=True, exist_ok=True)
+        pathlib.Path(cfg.save_dir).mkdir(parents=True, exist_ok=True)
 
         print("Saving config files...")
-        config_fp = cfg.save_dir / "config.json"
+        config_fp = pathlib.Path(cfg.save_dir) / "config.json"
         if config_fp.exists() and not cfg.do_overwrite:
             raise FileExistsError(f"{config_fp} already exists!")
         else:
             print(f"Writing to {config_fp}")
-            config.to_json_file(config_fp)
+            config_fp = pathlib.Path(cfg.save_dir) / "config.json"
+            config_dict = omegaconf.OmegaConf.to_container(config, resolve=True)
+            if not cfg.do_overwrite and config_fp.exists():
+                raise FileExistsError(f"{config_fp} already exists and do_overwrite is False.")
 
-        data_config.to_json_file(cfg.save_dir / "data_config.json", do_overwrite=cfg.do_overwrite)
-        optimization_config.to_json_file(
-            cfg.save_dir / "optimization_config.json", do_overwrite=cfg.do_overwrite
-        )
-        cfg.pretraining_metrics_config.to_json_file(
-            cfg.save_dir / "pretraining_metrics_config.json", do_overwrite=cfg.do_overwrite
-        )
-        cfg.final_validation_metrics_config.to_json_file(
-            cfg.save_dir / "final_validation_metrics_config.json", do_overwrite=cfg.do_overwrite
-        )
+            with open(config_fp, 'w') as f:
+                json.dump(config_dict, f)
+
+        data_config_dict = omegaconf.OmegaConf.to_container(data_config, resolve=True)
+        with open(pathlib.Path(cfg.save_dir) / "data_config.json", 'w') as f:
+            json.dump(data_config_dict, f)
+        optimization_config_dict = omegaconf.OmegaConf.to_container(optimization_config, resolve=True)
+        with open(pathlib.Path(cfg.save_dir) / "optimization_config.json", 'w') as f:
+            json.dump(optimization_config_dict, f)
+
+        pretraining_metrics_config_dict = omegaconf.OmegaConf.to_container(cfg.pretraining_metrics_config, resolve=True)
+        with open(pathlib.Path(cfg.save_dir) / "pretraining_metrics_config.json", 'w') as f:
+            json.dump(pretraining_metrics_config_dict, f)
+
+        final_validation_metrics_config_dict = omegaconf.OmegaConf.to_container(cfg.final_validation_metrics_config, resolve=True)
+        with open(pathlib.Path(cfg.save_dir) / "final_validation_metrics_config.json", 'w') as f:
+            json.dump(final_validation_metrics_config_dict, f)
 
     # Model
+    config_dict = omegaconf.OmegaConf.to_container(config, resolve=True)
     LM = ESTForGenerativeSequenceModelingLM(
-        config=config,
-        optimization_config=optimization_config,
+        config=config_dict,
+        optimization_config=optimization_config,  # Pass the object directly
         metrics_config=cfg.pretraining_metrics_config,
     )
 
@@ -650,7 +689,7 @@ def train(cfg: PretrainConfig, train_pyd: PytorchDataset, tuning_pyd: PytorchDat
 
     if cfg.wandb_logger_kwargs.get("name", None):
         if "do_log_graph" in cfg.wandb_logger_kwargs:
-            do_log_graph = cfg.wandb_logger_kwargs.pop("do_log_graph")
+            do_log_graph = cfg.wandb_logger_kwargs.get("do_log_graph", False)
         else:
             do_log_graph = False
 
@@ -664,8 +703,15 @@ def train(cfg: PretrainConfig, train_pyd: PytorchDataset, tuning_pyd: PytorchDat
                 # Watching the model naturally tracks parameter values and gradients.
                 wandb_logger.watch(LM, log="all", log_graph=True)
 
-            if cfg.wandb_experiment_config_kwargs:
-                wandb_logger.experiment.config.update(cfg.wandb_experiment_config_kwargs)
+        try:
+            wandb_config_kwargs = sanitize_config(cfg.wandb_experiment_config_kwargs)
+            wandb_logger.experiment.config.update(wandb_config_kwargs)
+        except Exception as e:
+            print(f"Failed to sanitize or update wandb config: {str(e)}")
+            raise
+
+            # wandb_experiment_config_kwargs = cfg.wandb_experiment_config_kwargs or {}
+            # wandb_logger.experiment.config.update(wandb_experiment_config_kwargs)
 
         trainer_kwargs["logger"] = wandb_logger
 

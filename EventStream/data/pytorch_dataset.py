@@ -1,6 +1,7 @@
 import json
 from collections import defaultdict
 from pathlib import Path
+import pathlib
 
 import numpy as np
 import polars as pl
@@ -134,10 +135,9 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
         self.task_vocabs = {}
 
         self.vocabulary_config = VocabularyConfig.from_json_file(
-            self.config.save_dir / "vocabulary_config.json"
+            Path("data") / "vocabulary_config.json"
         )
-
-        inferred_measurement_config_fp = self.config.save_dir / "inferred_measurement_configs.json"
+        inferred_measurement_config_fp = Path("data") / "inferred_measurement_configs.json"
         with open(inferred_measurement_config_fp) as f:
             inferred_measurement_configs = {
                 k: MeasurementConfig.from_dict(v) for k, v in json.load(f).items()
@@ -230,7 +230,7 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
                     f"{config.task_df_name}!"
                 )
         else:
-            self.cached_data = pl.scan_parquet(self.config.save_dir / "DL_reps" / f"{split}*.parquet")
+            self.cached_data = pl.scan_parquet(pathlib.Path("data") / "DL_reps" / f"{split}*.parquet")
             self.has_task = False
             self.tasks = None
             self.task_vocabs = None

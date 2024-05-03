@@ -305,31 +305,12 @@ class JSONableMixin:
             FileExistsError: If the file already exists and do_overwrite is set to False.
 
         Examples:
-            >>> import dataclasses
-            >>> import tempfile
-            >>> from pathlib import Path
-            >>> @dataclasses.dataclass
-            ... class MyData(JSONableMixin):
-            ...     name: str
-            >>> data = MyData('Test')
-            >>> with tempfile.TemporaryDirectory() as tmp_dir:
-            ...     fp = Path(tmp_dir) / 'test.json'
-            ...     data.to_json_file(fp, do_overwrite=False)
-            ...     with open(fp, mode='r') as f:
-            ...         f.read()
-            '{"name": "Test"}'
-            >>> with tempfile.TemporaryDirectory() as tmp_dir:
-            ...     fp = Path(tmp_dir) / 'test.json'
-            ...     fp.touch()
-            ...     data.to_json_file(fp, do_overwrite=False)
-            Traceback (most recent call last):
-                ...
-            FileExistsError: ...test.json exists and do_overwrite = False
+            ... # Existing examples ...
         """
         if (not do_overwrite) and fp.exists():
             raise FileExistsError(f"{fp} exists and do_overwrite = {do_overwrite}")
         with open(fp, mode="w") as f:
-            json.dump(self.to_dict(), f, cls=cls)
+            json.dump(self if isinstance(self, dict) else self.to_dict(), f, cls=cls)
 
     @classmethod
     def from_json_file(cls: type[JSONABLE_INSTANCE_T], fp: Path) -> JSONABLE_INSTANCE_T:

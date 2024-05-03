@@ -791,12 +791,17 @@ class Dataset(DatasetBase):
     ) -> tuple[DF_T, str, str, str, pl.DataFrame]:
         metadata = config.measurement_metadata
 
+        print(f"Measure: {measure}")
+        print(f"Config: {config}")
+        print(f"Metadata: {metadata}")
+
         metadata_schema = self.get_metadata_schema(config)
 
         match config.modality:
             case DataModality.UNIVARIATE_REGRESSION:
                 key_col = "const_key"
-                val_col = config.values_column
+                val_col = measure  # Use the measure name as the value column
+                print(f"Univariate Regression - Key column: {key_col}, Value column: {val_col}")
                 metadata_as_polars = pl.DataFrame(
                     {key_col: [measure], **{c: [v] for c, v in metadata.items()}}
                 )
@@ -804,14 +809,23 @@ class Dataset(DatasetBase):
             case DataModality.MULTIVARIATE_REGRESSION:
                 key_col = measure
                 val_col = config.values_column
+                print(f"Multivariate Regression - Key column: {key_col}, Value column: {val_col}")
                 metadata_as_polars = pl.from_pandas(metadata, include_index=True)
             case _:
                 raise ValueError(f"Called _pre_numerical_source on {config.modality} measure {measure}!")
+
+        print(f"Metadata as Polars DataFrame: {metadata_as_polars}")
+        print(f"Source DataFrame schema: {source_df.schema}")
 
         if "outlier_model" in metadata_as_polars and len(metadata_as_polars.drop_nulls("outlier_model")) == 0:
             metadata_as_polars = metadata_as_polars.with_columns(pl.lit(None).alias("outlier_model"))
         if "normalizer" in metadata_as_polars and len(metadata_as_polars.drop_nulls("normalizer")) == 0:
             metadata_as_polars = metadata_as_polars.with_columns(pl.lit(None).alias("normalizer"))
+
+        print(f"Value column (val_col): {val_col}")
+
+        if val_col not in metadata_as_polars.columns:
+            metadata_as_polars = metadata_as_polars.with_columns(pl.lit(None).alias(val_col))
 
         metadata_as_polars = metadata_as_polars.with_columns(
             pl.col(key_col).cast(pl.Categorical),
@@ -868,7 +882,7 @@ class Dataset(DatasetBase):
         Returns: The appropriate `NumericDataModalitySubtype` for the values.
         """
 
-        vals_col = pl.col(vals_col)
+        vals_col_expr = pl.col(vals_col)
 
         if "value_type" in measurement_metadata:
             missing_val_types = measurement_metadata.filter(pl.col("value_type").is_null())[vocab_keys_col]
@@ -879,20 +893,25 @@ class Dataset(DatasetBase):
         else:
             for_val_type_inference = source_df
 
-        # a. Convert to integeres where appropriate.
+          # a. Convert to integeres where appropriate.
         if self.config.min_true_float_frequency is not None:
-            is_int_expr = (
-                ((vals_col == vals_col.round(0)).mean() > (1 - self.config.min_true_float_frequency))
-                .cast(pl.Boolean)
-                .alias("is_int")
-            )
+            if source_df.select(vals_col_expr).dtypes[0] in (pl.Int8, pl.Int16, pl.Int32, pl.Int64):
+                is_int_expr = pl.lit(True).alias("is_int")
+                for_val_type_inference = for_val_type_inference.with_columns(vals_col_expr.cast(pl.Int64).alias(vals_col))
+            else:
+                is_int_expr = (
+                    ((vals_col_expr == vals_col_expr.round(0)).mean() > (1 - self.config.min_true_float_frequency))
+                    .cast(pl.Boolean)
+                    .alias("is_int")
+                )
             int_keys = for_val_type_inference.groupby(vocab_keys_col).agg(is_int_expr)
 
-            measurement_metadata = measurement_metadata.join(int_keys, on=vocab_keys_col, how="outer")
+            # Use a different suffix to avoid column name conflict
+            measurement_metadata = measurement_metadata.join(int_keys, on=vocab_keys_col, how="outer", suffix="_int")
 
             key_is_int = pl.col(vocab_keys_col).is_in(int_keys.filter("is_int")[vocab_keys_col])
             for_val_type_inference = for_val_type_inference.with_columns(
-                pl.when(key_is_int).then(vals_col.round(0)).otherwise(vals_col)
+                pl.when(key_is_int & (source_df.select(vals_col_expr).dtypes[0] != pl.Int64)).then(vals_col_expr.cast(pl.Int64)).otherwise(vals_col_expr)
             )
         else:
             measurement_metadata = measurement_metadata.with_columns(pl.lit(False).alias("is_int"))
@@ -900,7 +919,7 @@ class Dataset(DatasetBase):
         # b. Drop if only has a single observed numerical value.
         dropped_keys = (
             for_val_type_inference.groupby(vocab_keys_col)
-            .agg((vals_col.n_unique() == 1).cast(pl.Boolean).alias("should_drop"))
+            .agg((vals_col_expr.n_unique() == 1).cast(pl.Boolean).alias("should_drop"))
             .filter("should_drop")
         )
         keep_key_expr = ~pl.col(vocab_keys_col).is_in(dropped_keys[vocab_keys_col])
@@ -916,9 +935,9 @@ class Dataset(DatasetBase):
         if self.config.min_unique_numerical_observations is not None:
             is_cat_expr = (
                 lt_count_or_proportion(
-                    vals_col.n_unique(),
+                    vals_col_expr.n_unique(),
                     self.config.min_unique_numerical_observations,
-                    vals_col.len(),
+                    vals_col_expr.len(),
                 )
                 .cast(pl.Boolean)
                 .alias("is_categorical")
@@ -926,7 +945,8 @@ class Dataset(DatasetBase):
 
             categorical_keys = for_val_type_inference.groupby(vocab_keys_col).agg(is_cat_expr)
 
-            measurement_metadata = measurement_metadata.join(categorical_keys, on=vocab_keys_col, how="outer")
+            # Use a different suffix to avoid column name conflict
+            measurement_metadata = measurement_metadata.join(categorical_keys, on=vocab_keys_col, how="outer", suffix="_cat")
         else:
             measurement_metadata = measurement_metadata.with_columns(pl.lit(False).alias("is_categorical"))
 
@@ -943,7 +963,7 @@ class Dataset(DatasetBase):
         return measurement_metadata.with_columns(
             pl.coalesce(["value_type", inferred_value_type]).alias("value_type")
         ).drop(["is_int", "is_categorical"])
-
+        
     @TimeableMixin.TimeAs
     def _fit_measurement_metadata(
         self, measure: str, config: MeasurementConfig, source_df: DF_T
@@ -963,16 +983,24 @@ class Dataset(DatasetBase):
                 ).item()
             else:
                 num_possible = len(orig_source_df)
-                num_non_null = orig_source_df.select(pl.col(vocab_keys_col).drop_nulls().len()).item()
+                num_non_null = orig_source_df.select(pl.col(measure).drop_nulls().len()).item()
 
         # Drop the 'Result' column after calculating total possible and observed instances
         source_df = source_df.drop_nulls([vocab_keys_col, vals_col]).filter(pl.col(vals_col).is_not_nan())
 
+        # Check if measurement metadata is missing for categorical variables
+        if config.measurement_metadata is None:
+            if config.modality in (DataModality.SINGLE_LABEL_CLASSIFICATION, DataModality.MULTI_LABEL_CLASSIFICATION):
+                # Populate metadata for categorical variables
+                config.measurement_metadata = pd.DataFrame({"value_type": [NumericDataModalitySubtype.CATEGORICAL]}, index=[measure])
+            else:
+                raise ValueError(f"Measurement metadata is missing for measure {measure} with modality {config.modality}")
+
         # 1. Determines which vocab elements should be dropped due to insufficient occurrences.
         if self.config.min_valid_vocab_element_observations is not None:
-            should_drop_expr = lt_count_or_proportion(
+            should_drop_expr = pl.lit(lt_count_or_proportion(
                 num_non_null, self.config.min_valid_vocab_element_observations, num_possible
-            ).cast(pl.Boolean)
+            )).cast(pl.Boolean)
 
             dropped_keys = (
                 source_df.groupby(vocab_keys_col)
@@ -1035,7 +1063,7 @@ class Dataset(DatasetBase):
             source_df.update(measurement_metadata.select(vocab_keys_col, "value_type"), on=vocab_keys_col)
             .with_columns(
                 pl.when(pl.col("value_type") == NumericDataModalitySubtype.INTEGER)
-                .then(pl.col(vals_col).round(0))
+                .then(pl.col(vals_col).cast(pl.Float64).round(0))  # Cast to float before rounding
                 .when(pl.col("value_type") == NumericDataModalitySubtype.FLOAT)
                 .then(pl.col(vals_col))
                 .otherwise(None)
@@ -1252,7 +1280,7 @@ class Dataset(DatasetBase):
             pl.when(value_type == NumericDataModalitySubtype.DROPPED)
             .then(keys_col)
             .when(value_type == NumericDataModalitySubtype.CATEGORICAL_INTEGER)
-            .then(keys_col + "__EQ_" + vals_col.round(0).fill_nan(-1).cast(pl.Int64).cast(pl.Utf8))
+            .then(keys_col + "__EQ_" + vals_col.cast(pl.Int64).fill_nan(-1).cast(pl.Utf8))
             .when(value_type == NumericDataModalitySubtype.CATEGORICAL_FLOAT)
             .then(keys_col + "__EQ_" + vals_col.cast(pl.Utf8))
             .otherwise(keys_col)
@@ -1269,13 +1297,12 @@ class Dataset(DatasetBase):
                     ]
                 )
             )
-            .then(np.NaN)
+            .then(pl.lit(None))
             .when(value_type == NumericDataModalitySubtype.INTEGER)
-            .then(vals_col.round(0))
+            .then(vals_col)  # Remove the rounding for integer columns
             .otherwise(vals_col)
             .alias(vals_col_name)
         )
-
         source_df = source_df.with_columns(keys_col, vals_col)
 
         null_idx = keys_col.is_null() | vals_col.is_null() | vals_col.is_nan()
@@ -1312,6 +1339,8 @@ class Dataset(DatasetBase):
             vals_col = M.predict_from_polars(vals_col, pl.col("normalizer"))
             present_source = present_source.with_columns(vals_col)
 
+        present_source = present_source.with_columns(vals_col.cast(pl.Float64))
+        null_source = null_source.with_columns(vals_col.cast(pl.Float64))
         source_df = present_source.vstack(null_source)
 
         return source_df.drop(cols_to_drop_at_end)
@@ -1320,6 +1349,20 @@ class Dataset(DatasetBase):
     def _transform_categorical_measurement(
         self, measure: str, config: MeasurementConfig, source_df: DF_T
     ) -> DF_T:
+        print(f"Transforming categorical measurement: {measure}")
+        print(f"Source DataFrame columns: {source_df.columns}")
+        print(f"Config vocabulary: {config.vocabulary}")
+        print(f"Config measurement metadata: {config.measurement_metadata}")
+        if measure not in source_df.columns:
+            print(f"Warning: Measure {measure} not found in the source DataFrame.")
+            return source_df
+        if config.vocabulary is None:
+            print(f"Warning: Vocabulary is None for measure {measure}. Skipping transformation.")
+            return source_df
+
+        if config.measurement_metadata is None:
+            print(f"Warning: Measurement metadata is None for measure {measure}. Skipping transformation.")
+            return source_df
         if config.modality == DataModality.UNIVARIATE_REGRESSION:
             if config.measurement_metadata.value_type in (
                 NumericDataModalitySubtype.CATEGORICAL_INTEGER,
@@ -1344,17 +1387,24 @@ class Dataset(DatasetBase):
                 return source_df
         elif config.modality == DataModality.MULTI_LABEL_CLASSIFICATION:
             # Handle multi-label classification measurements
+            if config.vocabulary is None:
+                print(f"Warning: Vocabulary is None for measure {measure}")
+                return source_df
+
             vocab_col = config.vocabulary.vocabulary
             vocab_lit = pl.Series(vocab_col).cast(pl.Categorical)
             vocab_el_col = pl.col(measure)
 
-            if vocab_el_col.dtype != pl.Categorical:
-                vocab_el_col = vocab_el_col.cast(pl.Utf8).cast(pl.Categorical)
+            print(f"Measure: {measure}")
+            print(f"Vocab col: {vocab_col}")
+            print(f"Vocab lit: {vocab_lit}")
+            print(f"Vocab el col: {vocab_el_col}")
+            print(f"Source DataFrame schema: {source_df.schema}")
 
             transform_expr = [
                 pl.when(vocab_el_col.is_null())
                 .then(None)
-                .when(~vocab_el_col.is_in(vocab_lit))
+                .when(~vocab_el_col.cast(pl.Utf8).is_in(vocab_lit))
                 .then(pl.lit("UNK"))
                 .otherwise(vocab_el_col)
                 .alias(measure)
@@ -1362,6 +1412,10 @@ class Dataset(DatasetBase):
             return source_df.with_columns(transform_expr)
 
         # Handle other modalities
+        if config.vocabulary is None:
+            print(f"Warning: Vocabulary is None for measure {measure}")
+            return source_df
+
         transform_expr = []
         if config.modality == DataModality.MULTIVARIATE_REGRESSION:
             vocab_lit = pl.Series(config.vocabulary.vocabulary).cast(pl.Categorical)
@@ -1379,7 +1433,7 @@ class Dataset(DatasetBase):
         transform_expr.append(
             pl.when(vocab_el_col.is_null())
             .then(None)
-            .when(~vocab_el_col.is_in(vocab_lit))
+            .when(~vocab_el_col.cast(pl.Utf8).is_in(vocab_lit))
             .then(pl.lit("UNK"))
             .otherwise(vocab_el_col)
             .cast(pl.Categorical)

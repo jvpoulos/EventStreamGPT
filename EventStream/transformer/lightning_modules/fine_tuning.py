@@ -4,6 +4,7 @@ import os
 import random
 from collections.abc import Sequence
 from pathlib import Path
+import pathlib
 from typing import Any
 
 import lightning as L
@@ -459,11 +460,11 @@ def train(cfg: FinetuneConfig):
     data_config = cfg.data_config
     optimization_config = cfg.optimization_config
 
-    config.set_to_dataset(train_pyd)
-    optimization_config.set_to_dataset(train_pyd)
+    # config.set_to_dataset(train_pyd)
+    # optimization_config.set_to_dataset(train_pyd)
 
     if os.environ.get("LOCAL_RANK", "0") == "0":
-        cfg.save_dir.mkdir(parents=True, exist_ok=True)
+        pathlib.Path(cfg.save_dir).mkdir(parents=True, exist_ok=True)
         print("Saving config files...")
         config_fp = cfg.save_dir / "config.json"
         if config_fp.exists() and not cfg.do_overwrite:

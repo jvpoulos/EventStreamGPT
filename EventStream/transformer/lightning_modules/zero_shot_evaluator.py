@@ -3,6 +3,7 @@ import json
 import os
 from collections.abc import Sequence
 from pathlib import Path
+import pathlib
 from typing import Any
 
 import lightning as L
@@ -381,7 +382,7 @@ def zero_shot_evaluation(cfg: FinetuneConfig):
 
     if os.environ.get("LOCAL_RANK", "0") == "0":
         print("Saving final metrics...")
-        cfg.save_dir.mkdir(parents=True, exist_ok=True)
+        pathlib.Path(cfg.save_dir).mkdir(parents=True, exist_ok=True)
 
         with open(cfg.save_dir / "zero_shot_tuning_metrics.json", mode="w") as f:
             json.dump(tuning_metrics, f)
