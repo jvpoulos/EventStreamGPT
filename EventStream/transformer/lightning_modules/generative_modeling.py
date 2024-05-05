@@ -145,6 +145,47 @@ class ESTForGenerativeSequenceModelingLM(L.LightningModule):
         else:
             self.model = model_cls.from_pretrained(pretrained_weights_fp, config=config)
 
+    def do_log_any(self, split, metric_name=None):
+        """Returns True if `metric_name` should be tracked for `split` and any other split."""
+        for s in Split.values():
+            if self.do_log(s, metric_name):
+                return True
+        return False
+
+    def do_log(self, split, metric_name=None):
+        """Returns True if `metric_name` should be tracked for `split`."""
+        if self.metrics_config.do_log_only_loss(split.value):
+            return False
+
+        split_config = self.metrics_config.include_metrics.get(split.value, {})
+        if not split_config:
+            return False
+
+        if metric_name is None or split_config is True:
+            return True
+
+        has_averaging = "_" in metric_name.replace("explained_variance", "")
+        if not has_averaging:
+            return metric_name in split_config
+
+        parts = metric_name.split("_")
+        averaging = parts[0]
+        metric = "_".join(parts[1:])
+
+        permissible_averagings = split_config.get(metric, [])
+        if permissible_averagings is True or averaging in permissible_averagings:
+            return True
+        else:
+            return False
+
+    def log_loss(self, out, split):
+        loss = out.loss
+        self.log(f"{split}_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
+
+        if self.do_log_any(split, "LOSS_PARTS"):
+            for loss_name, loss_value in out.loss_parts.items():
+                self.log(f"{split}_{loss_name}", loss_value, on_step=False, on_epoch=True)
+                
     def save_pretrained(self, model_dir: Path):
         fp = model_dir / "pretrained_weights"
         self.model.save_pretrained(fp)
@@ -360,8 +401,18 @@ class ESTForGenerativeSequenceModelingLM(L.LightningModule):
         log_kwargs = {"batch_size": self.optimization_config.batch_size, "sync_dist": True}
         self.log(f"{split}_loss", results["loss"], **log_kwargs)
 
-        if self.metrics_config.do_log_only_loss(split):
+        if split not in self.metrics_config.do_log_only_loss:
             return
+
+        if self.metrics_config.do_log_only_loss[split]:
+            # Log only the loss
+            self.log_loss(out, split)
+        else:
+            # Log all metrics
+            self.log_loss(out, split)
+            self.log_classification_metrics(out, split)
+            self.log_regression_metrics(out, split)
+            self.log_tte_metrics(out, split)
 
         # We start by logging the losses.
         if self.metrics_config.do_log(split, MetricCategories.LOSS_PARTS):
@@ -490,6 +541,7 @@ class ESTForGenerativeSequenceModelingLM(L.LightningModule):
         Differs from training only in that it does not skip metrics.
         """
         out = self.model(batch)
+        self.log_loss(out, split=Split.TUNING)
         self.log_metrics(out, split=Split.TUNING)
 
     def test_step(self, batch: PytorchBatch, batch_idx: int):

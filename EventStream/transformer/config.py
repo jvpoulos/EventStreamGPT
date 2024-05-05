@@ -165,38 +165,31 @@ class MetricsConfig(JSONableMixin):
         else:
             return False
 
-    def do_log(self, split: Split, cat: MetricCategories, metric_name: str | None = None) -> bool:
-        """Returns True if `metric_name` should be tracked for `split` and `cat`."""
+    def do_log(self, split, metric_name=None):
+        """Returns True if `metric_name` should be tracked for `split`."""
         if self.do_log_only_loss(split):
             return False
 
-        inc_dict = self.include_metrics[split].get(cat, False)
-        if not inc_dict:
+        split_config = self.include_metrics.get(split.value, {})
+        if not split_config:
             return False
-        elif metric_name is None or inc_dict is True:
+
+        if metric_name is None or split_config is True:
             return True
 
         has_averaging = "_" in metric_name.replace("explained_variance", "")
         if not has_averaging:
-            return metric_name in inc_dict
+            return metric_name in split_config
 
         parts = metric_name.split("_")
         averaging = parts[0]
         metric = "_".join(parts[1:])
 
-        permissible_averagings = inc_dict.get(metric, [])
-        if (permissible_averagings is True) or (averaging in permissible_averagings):
+        permissible_averagings = split_config.get(metric, [])
+        if permissible_averagings is True or averaging in permissible_averagings:
             return True
         else:
             return False
-
-    def do_log_any(self, cat: MetricCategories, metric_name: str | None = None) -> bool:
-        """Returns True if `metric_name` should be tracked for `cat` and any split."""
-        for split in Split.values():
-            if self.do_log(split, cat, metric_name):
-                return True
-        return False
-
 
 @hydra_dataclass
 class OptimizationConfig(JSONableMixin):
