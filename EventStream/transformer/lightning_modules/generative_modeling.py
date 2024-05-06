@@ -531,8 +531,7 @@ class ESTForGenerativeSequenceModelingLM(L.LightningModule):
         Differs from training only in that it does not skip metrics.
         """
         out = self.model(batch)
-        self.log_loss(out, split=Split.TUNING)
-        # self.log_metrics(out, split=Split.TUNING)
+        self.log_metrics(out, split=Split.TUNING)
 
     def test_step(self, batch: PytorchBatch, batch_idx: int):
         """Validation step.

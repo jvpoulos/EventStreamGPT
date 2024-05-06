@@ -468,8 +468,6 @@ class DataEmbeddingLayer(torch.nn.Module):
         values_mask: torch.Tensor | None = None,
         cat_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        print("Inspecting input data...")
-        print(f"Max value in indices tensor: {indices.max()}")
         torch._assert(
             indices.max() < self.n_total_embeddings,
             f"Invalid embedding! {indices.max()} >= {self.n_total_embeddings}",
