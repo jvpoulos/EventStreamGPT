@@ -21,6 +21,8 @@ from .transformer import (
     time_from_deltas,
 )
 
+from ..data.vocabulary import VocabularyConfig
+
 
 class NestedAttentionGenerativeOutputLayer(GenerativeOutputLayerBase):
     """The output layer for the nested attention event stream model.
@@ -228,29 +230,8 @@ class NestedAttentionGenerativeOutputLayer(GenerativeOutputLayerBase):
         )
 
 
-class NAPPTForGenerativeSequenceModeling(StructuredGenerationMixin, StructuredTransformerPreTrainedModel):
-    """The end-to-end model for nested attention generative sequence modelling.
-
-    This model is a subclass of :class:`~transformers.StructuredTransformerPreTrainedModel` and is designed
-    for generative pre-training over "event-stream" data, with inputs in the form of `PytorchBatch` objects.
-    It is trained to solve the generative, multivariate, masked temporal point process problem over the
-    defined measurements in the input data. It does so while respecting intra-event causal dependencies
-    specified through the measurements_per_dep_graph_level specified in the config (aka the dependency graph).
-
-    This model largely simply passes the input data through a `NestedAttentionPointProcessTransformer`
-    followed by a `NestedAttentionGenerativeOutputLayer`.
-
-    Args:
-        config: The overall model configuration.
-
-    Raises:
-        ValueError: If the model configuration does not indicate nested attention mode.
-    """
-
-    def __init__(
-        self,
-        config: StructuredTransformerConfig,
-    ):
+class NAPPTForGenerativeSequenceModeling(StructuredTransformerPreTrainedModel):
+    def __init__(self, config: StructuredTransformerConfig, vocabulary_config: VocabularyConfig):
         super().__init__(config)
 
         if config.structured_event_processing_mode != StructuredEventProcessingMode.NESTED_ATTENTION:

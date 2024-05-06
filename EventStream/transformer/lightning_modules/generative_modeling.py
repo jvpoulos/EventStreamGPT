@@ -27,6 +27,7 @@ from transformers import get_polynomial_decay_schedule_with_warmup
 from ...data.config import PytorchDatasetConfig
 from ...data.pytorch_dataset import PytorchDataset
 from ...data.types import DataModality, PytorchBatch
+from ...data.vocabulary import VocabularyConfig  # Add this import statement
 from ...utils import hydra_dataclass, task_wrapper
 from ..conditionally_independent_model import CIPPTForGenerativeSequenceModeling
 from ..config import (
@@ -48,6 +49,8 @@ from omegaconf import MISSING
 
 from dataclasses import asdict, is_dataclass, fields 
 import collections
+
+from ..config import Split
 
 def make_json_serializable(item, seen=None):
     """
@@ -88,19 +91,12 @@ def sanitize_config(config):
 
 
 class ESTForGenerativeSequenceModelingLM(L.LightningModule):
-    """A PyTorch Lightning Module for a `ESTForGenerativeSequenceModeling`."""
-
-    TRAIN_SKIP_METRICS = ("AUROC", "AUPRC", "per_class")
-    CLASSIFICATION = {
-        DataModality.SINGLE_LABEL_CLASSIFICATION,
-        DataModality.MULTI_LABEL_CLASSIFICATION,
-    }
-
     def __init__(
         self,
         config: StructuredTransformerConfig | dict[str, Any],
         optimization_config: OptimizationConfig | dict[str, Any],
         metrics_config: MetricsConfig | dict[str, Any],
+        vocabulary_config: VocabularyConfig,  # Add this parameter
         pretrained_weights_fp: Path | None = None,
     ):
         super().__init__()
@@ -141,20 +137,20 @@ class ESTForGenerativeSequenceModelingLM(L.LightningModule):
                 )
 
         if pretrained_weights_fp is None:
-            self.model = model_cls(config)
+            self.model = model_cls(config, vocabulary_config)  # Pass vocabulary_config
         else:
             self.model = model_cls.from_pretrained(pretrained_weights_fp, config=config)
 
-    def do_log_any(self, split, metric_name=None):
+    def do_log_any(self, split: Split, metric_name=None):
         """Returns True if `metric_name` should be tracked for `split` and any other split."""
         for s in Split.values():
             if self.do_log(s, metric_name):
                 return True
         return False
 
-    def do_log(self, split, metric_name=None):
+    def do_log(self, split: Split, metric_name=None):
         """Returns True if `metric_name` should be tracked for `split`."""
-        if self.metrics_config.do_log_only_loss(split.value):
+        if self.metrics_config.do_log_only_loss(split):
             return False
 
         split_config = self.metrics_config.include_metrics.get(split.value, {})
@@ -178,14 +174,14 @@ class ESTForGenerativeSequenceModelingLM(L.LightningModule):
         else:
             return False
 
-    def log_loss(self, out, split):
+    def log_loss(self, out, split: Split):
         loss = out.loss
         self.log(f"{split}_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
 
-        if self.do_log_any(split, "LOSS_PARTS"):
+        if split in self.metrics_config.include_metrics and "LOSS_PARTS" in self.metrics_config.include_metrics[split]:
             for loss_name, loss_value in out.loss_parts.items():
-                self.log(f"{split}_{loss_name}", loss_value, on_step=False, on_epoch=True)
-                
+                self.log(f"{split}_{loss_name}", loss_value, on_step=False, on_epoch=True) 
+
     def save_pretrained(self, model_dir: Path):
         fp = model_dir / "pretrained_weights"
         self.model.save_pretrained(fp)
@@ -389,30 +385,24 @@ class ESTForGenerativeSequenceModelingLM(L.LightningModule):
         )
 
     def log_metrics(self, results: GenerativeSequenceModelOutput, split: Split):
-        """Logs metric results for a given output result.
-
-        Args:
-            `results` (`transformerForGenerativeSequenceModelOutput`):
-                The results to assess across the suite of metrics.
-            `split` (`str`): The split that should be used when logging metric results.
-        """
-
-        # We always want to log the raw loss.
+        """Logs metric results for a given output result."""
         log_kwargs = {"batch_size": self.optimization_config.batch_size, "sync_dist": True}
+
+        # Log the loss separately
         self.log(f"{split}_loss", results["loss"], **log_kwargs)
 
         if split not in self.metrics_config.do_log_only_loss:
             return
 
         if self.metrics_config.do_log_only_loss[split]:
-            # Log only the loss
-            self.log_loss(out, split)
+            # Log other losses
+            for loss_name, loss_value in results["losses"].items():
+                self.log(f"{split}_{loss_name}", loss_value, **log_kwargs)
         else:
-            # Log all metrics
-            self.log_loss(out, split)
-            self.log_classification_metrics(out, split)
-            self.log_regression_metrics(out, split)
-            self.log_tte_metrics(out, split)
+            # Log other metrics
+            self.log_classification_metrics(results, split)
+            self.log_regression_metrics(results, split)
+            self.log_tte_metrics(results, split)
 
         # We start by logging the losses.
         if self.metrics_config.do_log(split, MetricCategories.LOSS_PARTS):
@@ -542,7 +532,7 @@ class ESTForGenerativeSequenceModelingLM(L.LightningModule):
         """
         out = self.model(batch)
         self.log_loss(out, split=Split.TUNING)
-        self.log_metrics(out, split=Split.TUNING)
+        # self.log_metrics(out, split=Split.TUNING)
 
     def test_step(self, batch: PytorchBatch, batch_idx: int):
         """Validation step.
@@ -656,7 +646,7 @@ def train(cfg: PretrainConfig, train_pyd: PytorchDataset, tuning_pyd: PytorchDat
     L.seed_everything(cfg.seed)
     if cfg.do_use_filesystem_sharing:
         torch.multiprocessing.set_sharing_strategy("file_system")
-
+    
     config = cfg.config
     optimization_config = cfg.optimization_config
     data_config = cfg.data_config
@@ -702,6 +692,7 @@ def train(cfg: PretrainConfig, train_pyd: PytorchDataset, tuning_pyd: PytorchDat
         config=config_dict,
         optimization_config=optimization_config,  # Pass the object directly
         metrics_config=cfg.pretraining_metrics_config,
+        vocabulary_config=train_pyd.vocabulary_config,  # Pass vocabulary_config
     )
 
     # TODO(mmd): Get this working!
@@ -773,7 +764,7 @@ def train(cfg: PretrainConfig, train_pyd: PytorchDataset, tuning_pyd: PytorchDat
         trainer_kwargs["accumulate_grad_batches"] = optimization_config.gradient_accumulation
 
     # Fitting model
-    trainer = L.Trainer(**trainer_kwargs)
+    trainer = L.Trainer(**trainer_kwargs, strategy='ddp_find_unused_parameters_true')
     trainer.fit(model=LM, train_dataloaders=train_dataloader, val_dataloaders=tuning_dataloader)
 
     LM.save_pretrained(cfg.save_dir)

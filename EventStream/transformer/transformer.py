@@ -21,6 +21,7 @@ from ..data.types import PytorchBatch
 from .config import StructuredEventProcessingMode, StructuredTransformerConfig
 from .model_output import TransformerOutputWithPast
 from .structured_attention import StructuredAttention
+from ..data.vocabulary import VocabularyConfig
 
 logger = logging.get_logger(__name__)
 
@@ -687,25 +688,19 @@ class TemporalPositionEncoding(torch.nn.Module):
 
 
 class ConditionallyIndependentPointProcessInputLayer(torch.nn.Module):
-    """Processes input batch and produces event embeddings.
-
-    This layer accepts a batch from an event-stream PyTorch dataset and returns input embeddings from it. This
-    is designed for conditionally independent models, as it does not split the input embeddings into different
-    components corresponding to different dependency graph positions. Combines time and data embeddings.
-
-    Args:
-        config: Configuration parameters for the structured transformer.
-    """
-
     def __init__(
         self,
         config: StructuredTransformerConfig,
+        vocab_sizes_by_measurement: dict[str, int],  # Add this parameter
     ):
         super().__init__()
 
+        print("Initializing DataEmbeddingLayer with the following parameters:")
+        print(f"n_total_embeddings: {max(vocab_sizes_by_measurement.values()) + 125}")
+        print(f"vocab_sizes_by_measurement: {vocab_sizes_by_measurement}")
         self.config = config
         self.data_embedding_layer = DataEmbeddingLayer(
-            n_total_embeddings=config.vocab_size,
+            n_total_embeddings=max(vocab_sizes_by_measurement.values()) + 125,  # Use vocab_sizes_by_measurement
             out_dim=config.hidden_size,
             categorical_embedding_dim=config.categorical_embedding_dim,
             numerical_embedding_dim=config.numerical_embedding_dim,
@@ -745,24 +740,15 @@ class ConditionallyIndependentPointProcessInputLayer(torch.nn.Module):
 
 
 class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTrainedModel):
-    """A transformer model specifically for conditionally independent point processes.
-
-    This model uses an input layer to generate embeddings from an event-stream PyTorch dataset, and
-    an InnerBlock layer for non-structured processing. As a conditionally independent model, all event
-    covariates are predicted simultaneously from the history embedding.
-
-    Args:
-        config: Configuration parameters for the structured transformer.
-
-    Raises:
-        ValueError: If the provided configuration indicates a nested attention model.
-    """
-
-    def __init__(self, config: StructuredTransformerConfig):
+    def __init__(self, config: StructuredTransformerConfig, vocabulary_config: VocabularyConfig):
         super().__init__(config)
 
+        config.vocab_sizes_by_measurement = vocabulary_config.vocab_sizes_by_measurement
+
         self.embed_dim = config.hidden_size
-        self.input_layer = ConditionallyIndependentPointProcessInputLayer(config)
+
+        # Initialize the input layer
+        self.input_layer = ConditionallyIndependentPointProcessInputLayer(config, vocabulary_config.vocab_sizes_by_measurement)
 
         # TODO(mmd): Replace this with InnerBlock for a non-structured version.
         if config.structured_event_processing_mode != StructuredEventProcessingMode.CONDITIONALLY_INDEPENDENT:
@@ -957,7 +943,7 @@ class NestedAttentionPointProcessInputLayer(torch.nn.Module):
             split_by_measurement_indices.append(out_list)
 
         self.data_embedding_layer = DataEmbeddingLayer(
-            n_total_embeddings=config.vocab_size,
+            n_total_embeddings=max(config.vocab_sizes_by_measurement.values()) + 125,
             out_dim=config.hidden_size,
             categorical_embedding_dim=config.categorical_embedding_dim,
             numerical_embedding_dim=config.numerical_embedding_dim,

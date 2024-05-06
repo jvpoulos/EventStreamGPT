@@ -4,6 +4,7 @@ from typing import Any
 import torch
 
 from ..data.types import DataModality, PytorchBatch
+from ..data.vocabulary import VocabularyConfig  # Add this import statement
 from .config import StructuredEventProcessingMode, StructuredTransformerConfig
 from .generation.generation_utils import StructuredGenerationMixin
 from .model_output import (
@@ -19,7 +20,6 @@ from .transformer import (
     expand_mask,
     time_from_deltas,
 )
-
 
 class ConditionallyIndependentGenerativeOutputLayer(GenerativeOutputLayerBase):
     """The output layer for the conditionally independent event stream model.
@@ -162,34 +162,17 @@ class ConditionallyIndependentGenerativeOutputLayer(GenerativeOutputLayerBase):
 
 
 class CIPPTForGenerativeSequenceModeling(StructuredGenerationMixin, StructuredTransformerPreTrainedModel):
-    """The end-to-end model for conditionally independent generative sequence modelling.
-
-    This model is a subclass of :class:`~transformers.StructuredTransformerPreTrainedModel` and is designed
-    for generative pre-training over "event-stream" data, with inputs in the form of `PytorchBatch` objects.
-    It is trained to solve the generative, multivariate, masked temporal point process problem over the
-    defined measurements in the input data.
-
-    This model largely simply passes the input data through a
-    `ConditionallyIndependentPointProcessTransformer` followed by a
-    `ConditionallyIndependentGenerativeOutputLayer`.
-
-    Args:
-        config: The overall model configuration.
-
-    Raises:
-        ValueError: If the model configuration does not indicate conditionally independent mode.
-    """
-
     def __init__(
         self,
         config: StructuredTransformerConfig,
+        vocabulary_config: VocabularyConfig,  # Add this parameter
     ):
         super().__init__(config)
 
         if config.structured_event_processing_mode != StructuredEventProcessingMode.CONDITIONALLY_INDEPENDENT:
             raise ValueError(f"{config.structured_event_processing_mode} invalid!")
 
-        self.encoder = ConditionallyIndependentPointProcessTransformer(config)
+        self.encoder = ConditionallyIndependentPointProcessTransformer(config, vocabulary_config)  # Pass vocabulary_config
         self.output_layer = ConditionallyIndependentGenerativeOutputLayer(config)
 
         # Initialize weights and apply final processing
