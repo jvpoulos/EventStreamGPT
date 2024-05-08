@@ -477,6 +477,7 @@ class StructuredTransformerConfig(PretrainedConfig):
     def __init__(
         self,
         # Data configuration
+        problem_type: str = "single_label_classification",
         vocab_sizes_by_measurement: dict[str, int] | None = None,
         vocab_offsets_by_measurement: dict[str, int] | None = None,
         measurement_configs: dict[str, MeasurementConfig] | None = None,
@@ -525,10 +526,13 @@ class StructuredTransformerConfig(PretrainedConfig):
         use_cache: bool = True,
         **kwargs,
     ):
+        self.problem_type = problem_type
         self.do_use_learnable_sinusoidal_ATE = do_use_learnable_sinusoidal_ATE
         # Resetting default values to appropriate types
         if vocab_sizes_by_measurement is None:
             vocab_sizes_by_measurement = {}
+        self.vocab_sizes_by_measurement = vocab_sizes_by_measurement
+        self.vocab_offsets_by_measurement = vocab_offsets_by_measurement
         if vocab_offsets_by_measurement is None:
             vocab_offsets_by_measurement = {}
         if measurements_idxmap is None:
@@ -551,6 +555,16 @@ class StructuredTransformerConfig(PretrainedConfig):
                     new_meas_configs[k] = v
             measurement_configs = new_meas_configs
         self.measurement_configs = measurement_configs
+
+        if structured_event_processing_mode == StructuredEventProcessingMode.CONDITIONALLY_INDEPENDENT:
+            if measurements_per_dep_graph_level is not None:
+                measurements_per_dep_graph_level = None
+            if do_full_block_in_seq_attention is not None:
+                do_full_block_in_seq_attention = None
+            if do_full_block_in_dep_graph_attention is not None:
+                do_full_block_in_dep_graph_attention = None
+            if dep_graph_window_size is not None:
+                dep_graph_window_size = None
 
         if do_split_embeddings:
             if not type(categorical_embedding_dim) is int and categorical_embedding_dim > 0:
@@ -782,12 +796,15 @@ class StructuredTransformerConfig(PretrainedConfig):
         self.init_std = init_std
 
         self.max_seq_len = max_seq_len
-        self.vocab_sizes_by_measurement = vocab_sizes_by_measurement
         self.vocab_offsets_by_measurement = vocab_offsets_by_measurement
         self.measurements_idxmap = measurements_idxmap
         self.measurements_per_generative_mode = measurements_per_generative_mode
         self.measurements_per_dep_graph_level = measurements_per_dep_graph_level
 
+        self.vocab_offsets_by_measurement = vocab_offsets_by_measurement
+        self.vocab_sizes_by_measurement = vocab_sizes_by_measurement
+        for k in set(self.vocab_offsets_by_measurement.keys()) - set(self.vocab_sizes_by_measurement.keys()):
+            self.vocab_sizes_by_measurement[k] = 1
         self.vocab_size = max(sum(self.vocab_sizes_by_measurement.values()), 1)
 
         self.head_dim = head_dim
@@ -811,7 +828,10 @@ class StructuredTransformerConfig(PretrainedConfig):
         super().__init__(**kwargs)
 
     def measurements_for(self, modality: DataModality) -> list[str]:
-        return self.measurements_per_generative_mode.get(modality, [])
+        # print(f"Checking measurements for modality: {modality}")
+        measurements = self.measurements_per_generative_mode.get(modality, [])
+        # print(f"Measurements: {measurements}")
+        return measurements
 
     def expand_attention_types_params(
         self, attention_types: ATTENTION_TYPES_LIST_T
@@ -820,17 +840,22 @@ class StructuredTransformerConfig(PretrainedConfig):
         if isinstance(attention_types, str):
             return [attention_types] * self.num_hidden_layers
 
+        if isinstance(attention_types, list):
+            # Handle the case where attention_types is a list of strings
+            if all(isinstance(item, str) for item in attention_types):
+                return (attention_types * self.num_hidden_layers)[:self.num_hidden_layers]
+
         if not isinstance(attention_types, list):
             raise TypeError(f"Config Invalid {attention_types} ({type(attention_types)}) is wrong type!")
 
         if isinstance(attention_types[0], str):
-            return (attention_types * self.num_hidden_layers)[: self.num_hidden_layers]
+            return (attention_types * self.num_hidden_layers)[:self.num_hidden_layers]
 
         if isinstance(attention_types[0], (list, tuple)):
             attentions = []
             for sub_list, n_layers in attention_types:
                 attentions.extend(list(sub_list) * n_layers)
-            return attentions[: self.num_hidden_layers]
+            return attentions[:self.num_hidden_layers]
 
         raise TypeError(f"Config Invalid {attention_types} El 0 ({type(attention_types[0])}) is wrong type!")
 

@@ -24,7 +24,6 @@ from ..utils import (
     hydra_dataclass,
     num_initial_spaces,
 )
-from EventStream.data.preprocessing.standard_scaler import StandardScaler
 from .time_dependent_functor import AgeFunctor, TimeDependentFunctor, TimeOfDayFunctor
 from .types import DataModality, InputDataType, InputDFType, TemporalityType
 from .vocabulary import Vocabulary
@@ -294,10 +293,6 @@ class DatasetConfig(JSONableMixin):
         if type(as_dict["save_dir"]) is str:
             as_dict["save_dir"] = Path(as_dict["save_dir"])
             
-        if as_dict["normalizer_config"] is not None:
-            normalizer_cls = globals()[as_dict["normalizer_config"]["cls"]]
-            as_dict["normalizer_config"]["cls"] = normalizer_cls
-
         return cls(**as_dict)
 
     def __eq__(self, other: DatasetConfig) -> bool:
