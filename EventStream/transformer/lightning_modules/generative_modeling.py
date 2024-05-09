@@ -241,54 +241,17 @@ class ESTForGenerativeSequenceModelingLM(L.LightningModule):
 
     def build_metrics(self):
         """Build the various torchmetrics we'll use to track performance."""
-
         self.metrics = {}
 
-        if self.config.problem_type == "single_label_classification":
-            if self.config.num_labels > 2:
-                metric_kwargs = {"num_classes": self.config.num_labels}
-
-                # For judging classification, we'll use macro & weighted accuracy, AUROC, and AUPRC
-                self.metrics[f"{self.config.problem_type}_{self.config.num_labels}"] = torch.nn.ModuleDict(
-                    {
-                        "macro_AUROC": MulticlassAUROC(**metric_kwargs, average="macro"),
-                        "weighted_AUROC": MulticlassAUROC(**metric_kwargs, average="weighted"),
-                        "macro_accuracy": MulticlassAccuracy(**metric_kwargs, average="macro"),
-                        "weighted_accuracy": MulticlassAccuracy(**metric_kwargs, average="weighted"),
-                        "micro_accuracy": MulticlassAccuracy(**metric_kwargs, average="micro"),
-                        "macro_AUPRC": MulticlassAveragePrecision(**metric_kwargs, average="macro"),
-                        "weighted_AUPRC": MulticlassAveragePrecision(**metric_kwargs, average="weighted"),
-                    }
-                )
-            else:
-                # For judging binary classification on A1cGreaterThan7, we'll use accuracy, AUROC, and AUPRC
-                self.metrics["A1cGreaterThan7"] = torch.nn.ModuleDict(
-                    {
-                        "AUROC": BinaryAUROC(),
-                        "accuracy": BinaryAccuracy(),
-                        "AUPRC": BinaryAveragePrecision(),
-                    }
-                )
-        elif self.config.problem_type == "multi_label_classification":
-            metric_kwargs = {"num_labels": self.config.num_labels}
-
-            # For judging classification, we'll use macro & weighted accuracy, AUROC, and AUPRC
-            self.metrics[f"{self.config.problem_type}_{self.config.num_labels}"] = torch.nn.ModuleDict(
-                {
-                    "macro_AUROC": MultilabelAUROC(**metric_kwargs, average="macro"),
-                    "weighted_AUROC": MultilabelAUROC(**metric_kwargs, average="weighted"),
-                    "micro_AUROC": MultilabelAUROC(**metric_kwargs, average="micro"),
-                    "macro_accuracy": MultilabelAccuracy(**metric_kwargs, average="macro"),
-                    "weighted_accuracy": MultilabelAccuracy(**metric_kwargs, average="weighted"),
-                    "micro_accuracy": MultilabelAccuracy(**metric_kwargs, average="micro"),
-                    "macro_AUPRC": MultilabelAveragePrecision(**metric_kwargs, average="macro"),
-                    "weighted_AUPRC": MultilabelAveragePrecision(**metric_kwargs, average="weighted"),
-                    "micro_AUPRC": MultilabelAveragePrecision(**metric_kwargs, average="micro"),
-                }
-            )
-        else:
-            raise ValueError(f"{self.config.problem_type} not valid")
-
+        # For judging binary classification on A1cGreaterThan7, we'll use accuracy, AUROC, and AUPRC
+        self.metrics["A1cGreaterThan7"] = torch.nn.ModuleDict(
+            {
+                "AUROC": BinaryAUROC(),
+                "accuracy": BinaryAccuracy(),
+                "AUPRC": BinaryAveragePrecision(),
+            }
+        )
+    
     def _log_metric_dict(
         self,
         preds: torch.Tensor,
@@ -436,185 +399,88 @@ class ESTForGenerativeSequenceModelingLM(L.LightningModule):
             for loss_name, loss_value in results["losses"].items():
                 self.log(f"{split}_{loss_name}", loss_value, **log_kwargs)
 
-        # Log other metrics
-        self.log_classification_metrics(results, split, metrics_config)
-        # self.log_regression_metrics(results, split, metrics_config)
-        self.log_tte_metrics(results, split, metrics_config)
-
-        # Per data type
-        for measurement, metrics_dict in self.metrics.items():
+        # Log A1cGreaterThan7 classification metrics
+        if "A1cGreaterThan7" in results["preds"]["classification"]:
+            _, sample_dist = results["preds"]["classification"]["A1cGreaterThan7"]
+            preds = sample_dist.logits
+            labels = results["labels"]["classification"]["A1cGreaterThan7"]
             mask = results["event_mask"]
+            preds = preds[mask]
+            labels = labels[mask].long()
 
-            if not mask.any():
-                continue
-
-            for task_type, metrics in metrics_dict.items():
-                if task_type in self.CLASSIFICATION and self.metrics_config.do_log(
-                    split, MetricCategories.CLASSIFICATION
-                ):
-                    # For now, we ignore the is_observed distribution (the first element of the below tuple).
-                    _, sample_dist = results["preds"]["classification"][measurement]
-                    preds = sample_dist.logits
-                    labels = results["labels"]["classification"][measurement]
-
-                    # We need to filter these down to just those corresponding to observed events. Note that
-                    # unlike TTE, the assumption here is that preds and labels correspond to predictions for
-                    # and labels of the events at their indexed position; not for the subsequent event. So we
-                    # don't need to shift `results['event_mask']` here to account for that.
-
-                    preds = preds[mask]
-                    labels = labels[mask].long()
-
-                    self._log_metric_dict(
-                        preds=preds,
-                        labels=labels,
-                        metrics=metrics,
-                        measurement=measurement,
-                        split=split,
-                        cat=MetricCategories.CLASSIFICATION,
-                    )
-
-                # elif task_type == DataModality.MULTIVARIATE_REGRESSION and self.metrics_config.do_log(
-                #     split, MetricCategories.REGRESSION
-                # ):
-                #     vocab_size = self.config.vocab_sizes_by_measurement[measurement]
-
-                #     # Here, like for TTE, we need to sample from the returned distribution before we can use
-                #     # it directly. Here we also need to limit to just those events that are actually observed.
-                #     # Like above, the assumption here is that preds and labels correspond to predictions for
-                #     # and labels of the events at their indexed position; not for the subsequent event. So we
-                #     # don't need to shift `results['event_mask']` here to account for that.
-                #     _, dist = results["preds"]["regression"][measurement]
-                #     preds = dist.sample()[mask]
-                #     labels = results["labels"]["regression"][measurement][mask]
-
-                #     # However, as our regression output is actually indexed only to the group keys that are
-                #     # actually measured (tracked in `results['preds']['regression_indices']`, we need to
-                #     # expand our predictions and labels to be in the full vocabulary space for the metrics to
-                #     # work naturally.
-                #     preds_indices = results["preds"]["regression_indices"][measurement][mask]
-                #     labels_indices = results["labels"]["regression_indices"][measurement][mask]
-
-                #     # We also need to reflect just those data elements for which values were observed:
-                #     data_el_mask = results["dynamic_values_mask"][mask]
-
-                #     preds = preds[data_el_mask]
-                #     labels = labels[data_el_mask]
-                #     preds_indices = preds_indices[data_el_mask]
-                #     labels_indices = labels_indices[data_el_mask]
-
-                #     preds_expanded = expand_indexed_regression(preds, preds_indices, vocab_size)
-                #     labels_expanded = expand_indexed_regression(labels, labels_indices, vocab_size)
-
-                #     self._log_metric_dict(
-                #         preds=preds_expanded,
-                #         labels=labels_expanded,
-                #         metrics=metrics,
-                #         measurement=measurement,
-                #         split=split,
-                #         cat=MetricCategories.REGRESSION,
-                #     )
-                # elif task_type == DataModality.UNIVARIATE_REGRESSION and self.metrics_config.do_log(
-                #     split, MetricCategories.REGRESSION
-                # ):
-                #     # Here, like for TTE, we need to sample from the returned distribution before we can use
-                #     # it directly. Here we also need to limit to just those events that are actually observed.
-                #     # Like above, the assumption here is that preds and labels correspond to predictions for
-                #     # and labels of the events at their indexed position; not for the subsequent event. So we
-                #     # don't need to shift `results['event_mask']` here to account for that.
-                #     # We ignore the is observed distribution here.
-                #     _, dist = results["preds"]["regression"][measurement]
-                #     preds = dist.sample()[mask]
-                #     labels = results["labels"]["regression"][measurement][mask]
-
-                #     self._log_metric_dict(
-                #         preds=preds,
-                #         labels=labels,
-                #         metrics=metrics,
-                #         measurement=measurement,
-                #         split=split,
-                #         cat=MetricCategories.REGRESSION,
-                #     )
-                elif "A1cGreaterThan7" in results["preds"]["classification"]:
-                    _, sample_dist = results["preds"]["classification"]["A1cGreaterThan7"]
-                    preds = sample_dist.logits
-                    labels = results["labels"]["classification"]["A1cGreaterThan7"]
-                    mask = results["event_mask"]
-                    preds = preds[mask]
-                    labels = labels[mask].long()
-
-                    self._log_metric_dict(
-                        preds=preds,
-                        labels=labels,
-                        metrics=self.metrics["A1cGreaterThan7"],
-                        measurement="A1cGreaterThan7",
-                        split=split,
-                        cat=MetricCategories.CLASSIFICATION,
-                        metrics_config=self.metrics_config,
-                    )               
+            self._log_metric_dict(
+                preds=preds,
+                labels=labels,
+                metrics=self.metrics["A1cGreaterThan7"],
+                measurement="A1cGreaterThan7",
+                split=split,
+                cat=MetricCategories.CLASSIFICATION,
+                metrics_config=metrics_config,
+            )
+        else:
+            print("Warning: 'A1cGreaterThan7' not found in the model's predictions.")  
 
     def training_step(self, batch: PytorchBatch, batch_idx: int) -> torch.Tensor:
         out = self.model(batch)
         self.log_metrics(out, split=Split.TRAIN)
 
-        if self.config.problem_type == "single_label_classification":
-            if "A1cGreaterThan7" in out["preds"]["classification"]:
-                _, sample_dist = out["preds"]["classification"]["A1cGreaterThan7"]
-                preds = sample_dist.logits
-                labels = out["labels"]["classification"]["A1cGreaterThan7"].long()
-                mask = out["event_mask"]
-                preds = preds[mask]
-                labels = labels[mask]
+        if "A1cGreaterThan7" in out["preds"]["classification"]:
+            _, sample_dist = out["preds"]["classification"]["A1cGreaterThan7"]
+            preds = sample_dist.logits
+            labels = out["labels"]["classification"]["A1cGreaterThan7"].long()
+            mask = out["event_mask"]
+            preds = preds[mask]
+            labels = labels[mask]
 
-                auroc_metric = self.metrics[f"{self.config.problem_type}_{self.config.num_labels}"]["AUROC"]
-                auroc_value = auroc_metric(preds, labels)
-                self.log(f"train_A1cGreaterThan7_AUROC", auroc_value, on_step=True, on_epoch=True)
+            auroc_metric = self.metrics["A1cGreaterThan7"]["AUROC"]
+            auroc_value = auroc_metric(preds, labels)
+            self.log("train_A1cGreaterThan7_AUROC", auroc_value, on_step=True, on_epoch=True)
 
-        return out["loss"]
+            loss = out["loss"]
+            self.log("train_loss", loss, on_step=True, on_epoch=True)
+
+            return loss
+        else:
+            print("Warning: 'A1cGreaterThan7' not found in the model's predictions.")
+            return out["loss"]
 
     def validation_step(self, batch: PytorchBatch, batch_idx: int):
-        """Validation step.
-
-        Differs from training only in that it does not skip metrics.
-        """
         out = self.model(batch)
         self.log_metrics(out, split=Split.TUNING)
 
-        # Calculate and log AUROC
-        if self.config.problem_type == "single_label_classification":
-            if "A1cGreaterThan7" in out["preds"]["classification"]:
-                _, sample_dist = out["preds"]["classification"]["A1cGreaterThan7"]
-                preds = sample_dist.logits
-                labels = out["labels"]["classification"]["A1cGreaterThan7"].long()
-                mask = out["event_mask"]
-                preds = preds[mask]
-                labels = labels[mask]
+        if "A1cGreaterThan7" in out["preds"]["classification"]:
+            _, sample_dist = out["preds"]["classification"]["A1cGreaterThan7"]
+            preds = sample_dist.logits
+            labels = out["labels"]["classification"]["A1cGreaterThan7"].long()
+            mask = out["event_mask"]
+            preds = preds[mask]
+            labels = labels[mask]
 
-                auroc_metric = self.metrics[f"{self.config.problem_type}_{self.config.num_labels}"]["AUROC"]
-                auroc_value = auroc_metric(preds, labels)
-                self.log(f"val_A1cGreaterThan7_AUROC", auroc_value, on_step=True, on_epoch=True)
+            auroc_metric = self.metrics["A1cGreaterThan7"]["AUROC"]
+            auroc_value = auroc_metric(preds, labels)
+            self.log("val_A1cGreaterThan7_AUROC", auroc_value, on_step=False, on_epoch=True)
+
+            loss = out["loss"]
+            self.log("val_loss", loss, on_step=False, on_epoch=True)
 
     def test_step(self, batch: PytorchBatch, batch_idx: int):
-        """Test step.
-
-        Differs from training only in that it does not skip metrics.
-        """
         out = self.model(batch)
         self.log_metrics(out, split=Split.HELD_OUT)
 
-        # Calculate and log AUROC
-        if self.config.problem_type == "single_label_classification":
-            if "A1cGreaterThan7" in out["preds"]["classification"]:
-                _, sample_dist = out["preds"]["classification"]["A1cGreaterThan7"]
-                preds = sample_dist.logits
-                labels = out["labels"]["classification"]["A1cGreaterThan7"].long()
-                mask = out["event_mask"]
-                preds = preds[mask]
-                labels = labels[mask]
+        if "A1cGreaterThan7" in out["preds"]["classification"]:
+            _, sample_dist = out["preds"]["classification"]["A1cGreaterThan7"]
+            preds = sample_dist.logits
+            labels = out["labels"]["classification"]["A1cGreaterThan7"].long()
+            mask = out["event_mask"]
+            preds = preds[mask]
+            labels = labels[mask]
 
-                auroc_metric = self.metrics[f"{self.config.problem_type}_{self.config.num_labels}"]["AUROC"]
-                auroc_value = auroc_metric(preds, labels)
-                self.log(f"test_A1cGreaterThan7_AUROC", auroc_value, on_step=True, on_epoch=True)
+            auroc_metric = self.metrics["A1cGreaterThan7"]["AUROC"]
+            auroc_value = auroc_metric(preds, labels)
+            self.log("test_A1cGreaterThan7_AUROC", auroc_value, on_step=False, on_epoch=True)
+
+            loss = out["loss"]
+            self.log("test_loss", loss, on_step=False, on_epoch=True)
 
     def configure_optimizers(self):
         """Configures optimizer and learning rate scheduler.
