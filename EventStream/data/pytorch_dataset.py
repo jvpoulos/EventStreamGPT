@@ -486,11 +486,18 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
         if self.config.do_include_subject_id:
             full_subj_data["subject_id"] = self.subject_ids[idx]
         if self.config.do_include_start_time_min:
-            # Note that this is using the python datetime module's `timestamp` function which differs from
-            # some dataframe libraries' timestamp functions (e.g., polars).
             full_subj_data["start_time"] = full_subj_data["start_time"].timestamp() / 60.0
         else:
             full_subj_data.pop("start_time")
+
+        # Ensure the 'A1cGreaterThan7' column is included
+        if "A1cGreaterThan7" in full_subj_data:
+            full_subj_data["A1cGreaterThan7"] = full_subj_data["A1cGreaterThan7"]
+        else:
+            print("Warning: 'A1cGreaterThan7' key not found in full_subj_data.")
+            full_subj_data["A1cGreaterThan7"] = None
+            
+        print(f"A1cGreaterThan7 value for item {idx}: {full_subj_data['A1cGreaterThan7']}")
 
         # If we need to truncate to `self.max_seq_len`, grab a random full-size span to capture that.
         # TODO(mmd): This will proportionally underweight the front and back ends of the subjects data
@@ -701,6 +708,37 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
             A fully collated, tensorized, and padded batch.
         """
         if self.do_produce_static_data:
-            return self.__static_and_dynamic_collate(batch)
+            out_batch = self.__static_and_dynamic_collate(batch)
         else:
-            return self.__dynamic_only_collate(batch)
+            out_batch = self.__dynamic_only_collate(batch)
+
+        if not self.has_task:
+            return out_batch
+
+        self._register_start("collate_task_labels")
+        out_labels = {}
+
+        for task in self.tasks:
+            task_type = self.task_types[task]
+
+            out_labels[task] = []
+            for e in batch:
+                out_labels[task].append(e[task])
+
+            match task_type:
+                case "multi_class_classification":
+                    out_labels[task] = torch.LongTensor(out_labels[task])
+                case "binary_classification":
+                    out_labels[task] = torch.FloatTensor(out_labels[task])
+                case "regression":
+                    out_labels[task] = torch.FloatTensor(out_labels[task])
+                case _:
+                    raise TypeError(f"Don't know how to tensorify task of type {task_type}!")
+
+        # Include the 'A1cGreaterThan7' column in out_labels
+        out_labels["A1cGreaterThan7"] = torch.LongTensor([e["A1cGreaterThan7"] for e in batch])
+
+        out_batch.stream_labels = out_labels
+        self._register_end("collate_task_labels")
+
+        return out_batch

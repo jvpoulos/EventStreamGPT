@@ -22,25 +22,18 @@ from .transformer import (
 )
 
 class ConditionallyIndependentGenerativeOutputLayer(GenerativeOutputLayerBase):
-    """The output layer for the conditionally independent event stream model.
-
-    TODO(mmcdermott):
-        Allow for use of NLL-beta throughout? https://github.com/mmcdermott/EventStreamGPT/issues/26
-
-    Args:
-        config: The overall model configuration.
-
-    Raises:
-        ValueError: If the model configuration does not indicate conditionally independent mode.
-    """
-
     def __init__(
         self,
         config: StructuredTransformerConfig,
+        vocab_offsets_by_measurement: dict[str, int],
+        vocab_sizes_by_measurement: dict[str, int],
     ):
         super().__init__(config)
         if config.structured_event_processing_mode != StructuredEventProcessingMode.CONDITIONALLY_INDEPENDENT:
             raise ValueError(f"{config.structured_event_processing_mode} invalid!")
+
+        self.vocab_offsets_by_measurement = vocab_offsets_by_measurement
+        self.vocab_sizes_by_measurement = vocab_sizes_by_measurement
 
     def forward(
         self,
@@ -104,10 +97,28 @@ class ConditionallyIndependentGenerativeOutputLayer(GenerativeOutputLayerBase):
             for_event_contents_prediction,
             classification_measurements,
         )
-        classification_dists_by_measurement.update(classification_out[1])
-        if not is_generation:
-            classification_losses_by_measurement.update(classification_out[0])
-            classification_labels_by_measurement.update(classification_out[2])
+
+        print("Shape of for_event_contents_prediction:", for_event_contents_prediction.shape)
+        print("Shape of self.ClassificationLayer(for_event_contents_prediction):", self.ClassificationLayer(for_event_contents_prediction).shape)
+
+        try:
+            if "A1cGreaterThan7" in self.vocab_offsets_by_measurement:
+                a1c_vocab_offset = self.vocab_offsets_by_measurement["A1cGreaterThan7"]
+                a1c_vocab_size = self.vocab_sizes_by_measurement["A1cGreaterThan7"]
+                a1c_greater_than_7_logits = self.ClassificationLayer(for_event_contents_prediction)[:, :, a1c_vocab_offset:a1c_vocab_offset+a1c_vocab_size]
+                a1c_greater_than_7_logits = a1c_greater_than_7_logits.squeeze(-1)
+                classification_dists_by_measurement["A1cGreaterThan7"] = (None, torch.distributions.Bernoulli(logits=a1c_greater_than_7_logits))
+
+            if not is_generation and hasattr(batch, "stream_labels"):
+                if batch.stream_labels is not None and "A1cGreaterThan7" in batch.stream_labels:
+                    a1c_greater_than_7_labels = batch.stream_labels["A1cGreaterThan7"]
+                    classification_labels_by_measurement["A1cGreaterThan7"] = a1c_greater_than_7_labels
+                else:
+                    print("Warning: 'A1cGreaterThan7' key not found in the batch labels. Skipping label assignment.")
+            else:
+                print("Warning: 'A1cGreaterThan7' key not found in vocab_offsets_by_measurement. Skipping prediction.")
+        except KeyError:
+            print("Warning: 'A1cGreaterThan7' key not found in vocab_offsets_by_measurement. Skipping prediction.")
 
         regression_out = self.get_regression_outputs(
             batch,
@@ -165,15 +176,19 @@ class CIPPTForGenerativeSequenceModeling(StructuredGenerationMixin, StructuredTr
     def __init__(
         self,
         config: StructuredTransformerConfig,
-        vocabulary_config: VocabularyConfig,  # Add this parameter
+        vocabulary_config: VocabularyConfig,
     ):
         super().__init__(config)
 
         if config.structured_event_processing_mode != StructuredEventProcessingMode.CONDITIONALLY_INDEPENDENT:
             raise ValueError(f"{config.structured_event_processing_mode} invalid!")
 
-        self.encoder = ConditionallyIndependentPointProcessTransformer(config, vocabulary_config)  # Pass vocabulary_config
-        self.output_layer = ConditionallyIndependentGenerativeOutputLayer(config)
+        self.encoder = ConditionallyIndependentPointProcessTransformer(config, vocabulary_config)
+        self.output_layer = ConditionallyIndependentGenerativeOutputLayer(
+            config,
+            vocab_offsets_by_measurement=vocabulary_config.vocab_offsets_by_measurement,
+            vocab_sizes_by_measurement=vocabulary_config.vocab_sizes_by_measurement,
+        )
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -231,21 +246,25 @@ class CIPPTForGenerativeSequenceModeling(StructuredGenerationMixin, StructuredTr
         }
 
     def forward(
-        self, batch: PytorchBatch, is_generation: bool = False, **kwargs
+        self,
+        batch: PytorchBatch,
+        is_generation: bool = False,
+        **kwargs,
     ) -> GenerativeSequenceModelOutput:
-        """This runs the full forward pass of the model.
+        """This runs the full forward pass of the model."""
 
-        Args:
-            batch: The batch of data to be transformed.
-            is_generation: Whether or not the model is being used for generation.
-            **kwargs: Additional keyword arguments, which are used for output structuring and are forwarded to
-                the encoder. The model specifically looks for use_cache, output_attentions, and
-                output_hidden_states keyword arguments, which control whether additional properties should be
-                added to the output.
+        classification_labels_by_measurement = None if is_generation else {}
 
-        Returns:
-            The output of the model, which is a `GenerativeSequenceModelOutput` object.
-        """
+        if not is_generation and hasattr(batch, "stream_labels"):
+            if batch.stream_labels is not None and "A1cGreaterThan7" in batch.stream_labels:
+                # Convert mask to boolean tensor
+                mask = mask.bool()
+                a1c_greater_than_7_labels = a1c_greater_than_7_labels[mask.bool()]
+                classification_labels_by_measurement["A1cGreaterThan7"] = a1c_greater_than_7_labels
+            else:
+                # Set the 'A1cGreaterThan7' key to None if it's not found in the batch labels
+                classification_labels_by_measurement["A1cGreaterThan7"] = None
+
         use_cache = kwargs.get("use_cache", False)
         output_attentions = kwargs.get("output_attentions", False)
         output_hidden_states = kwargs.get("output_hidden_states", False)
@@ -253,6 +272,13 @@ class CIPPTForGenerativeSequenceModeling(StructuredGenerationMixin, StructuredTr
         encoded = self.encoder(batch, **kwargs)
 
         output = self.output_layer(batch, encoded.last_hidden_state, is_generation=is_generation)
+
+        # Set the 'A1cGreaterThan7' key to None in the output if it's not found
+        if "A1cGreaterThan7" not in output["preds"]["classification"]:
+            output["preds"]["classification"]["A1cGreaterThan7"] = (None, None)
+
+        if not is_generation:
+            output["labels"]["classification"] = classification_labels_by_measurement
 
         if use_cache:
             output["past_key_values"] = encoded.past_key_values

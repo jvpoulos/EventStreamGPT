@@ -128,7 +128,7 @@ class ESTForGenerativeSequenceModelingLM(L.LightningModule):
             pretraining_metrics_config = MetricsConfig(**pretraining_metrics_config)
         if isinstance(final_validation_metrics_config, dict):
             final_validation_metrics_config = MetricsConfig(**final_validation_metrics_config)
-
+            
         self.pretraining_metrics_config = pretraining_metrics_config
         self.final_validation_metrics_config = final_validation_metrics_config
 
@@ -147,6 +147,9 @@ class ESTForGenerativeSequenceModelingLM(L.LightningModule):
                 "optimization_config": optimization_config,  # Pass the object directly
             }
         )
+
+        # Initialize the AUROC metric for the binary classification task
+        self.binary_auroc = BinaryAUROC()
 
         # Initialize self.metrics and self.binary_metrics
         self.build_metrics()
@@ -241,16 +244,15 @@ class ESTForGenerativeSequenceModelingLM(L.LightningModule):
 
     def build_metrics(self):
         """Build the various torchmetrics we'll use to track performance."""
-        self.metrics = {}
-
-        # For judging binary classification on A1cGreaterThan7, we'll use accuracy, AUROC, and AUPRC
-        self.metrics["A1cGreaterThan7"] = torch.nn.ModuleDict(
-            {
-                "AUROC": BinaryAUROC(),
-                "accuracy": BinaryAccuracy(),
-                "AUPRC": BinaryAveragePrecision(),
-            }
-        )
+        self.metrics = {
+            "A1cGreaterThan7": torch.nn.ModuleDict(
+                {
+                    "AUROC": self.binary_auroc,
+                    "accuracy": BinaryAccuracy(),
+                    "AUPRC": BinaryAveragePrecision(),
+                }
+            )
+        }
     
     def _log_metric_dict(
         self,
@@ -403,84 +405,70 @@ class ESTForGenerativeSequenceModelingLM(L.LightningModule):
         if "A1cGreaterThan7" in results["preds"]["classification"]:
             _, sample_dist = results["preds"]["classification"]["A1cGreaterThan7"]
             preds = sample_dist.logits
-            labels = results["labels"]["classification"]["A1cGreaterThan7"]
             mask = results["event_mask"]
-            preds = preds[mask]
-            labels = labels[mask].long()
 
-            self._log_metric_dict(
-                preds=preds,
-                labels=labels,
-                metrics=self.metrics["A1cGreaterThan7"],
-                measurement="A1cGreaterThan7",
-                split=split,
-                cat=MetricCategories.CLASSIFICATION,
-                metrics_config=metrics_config,
-            )
+            if "A1cGreaterThan7" in results["labels"]["classification"]:
+                labels = results["labels"]["classification"]["A1cGreaterThan7"]
+                
+                if labels is not None:
+                    # Convert mask to boolean tensor
+                    mask = mask.bool()
+                    
+                    preds = preds[mask]
+                    labels = labels[mask].long()
+
+                    self._log_metric_dict(
+                        preds=preds,
+                        labels=labels,
+                        metrics=self.metrics["A1cGreaterThan7"],
+                        measurement="A1cGreaterThan7",
+                        split=split,
+                        cat=MetricCategories.CLASSIFICATION,
+                        metrics_config=metrics_config,
+                    )
+                else:
+                    print("Warning: 'A1cGreaterThan7' labels are None. Skipping metric logging.")
+            else:
+                print("Warning: 'A1cGreaterThan7' not found in the labels. Skipping metric logging.")
         else:
-            print("Warning: 'A1cGreaterThan7' not found in the model's predictions.")  
+            print("Warning: 'A1cGreaterThan7' not found in the model's predictions. Skipping metric logging.")
+            
+    def calculate_and_log_auroc(self, out, split):
+        if "A1cGreaterThan7" in out["preds"]["classification"]:
+            _, preds_dist = out["preds"]["classification"]["A1cGreaterThan7"]
+            preds = preds_dist.logits
+            labels = out["labels"]["classification"]["A1cGreaterThan7"]
+
+            if labels is not None:
+                self.binary_auroc.update(preds, labels)
+                self.log(f"{split}_A1cGreaterThan7_AUROC", self.binary_auroc, on_step=(split == "train"), on_epoch=True)
+            else:
+                print(f"Warning: 'A1cGreaterThan7' labels are None for split {split}. Skipping AUROC calculation.")
+        else:
+            print(f"Warning: 'A1cGreaterThan7' key not found in predictions for split {split}. Skipping AUROC calculation.")
 
     def training_step(self, batch: PytorchBatch, batch_idx: int) -> torch.Tensor:
         out = self.model(batch)
-        self.log_metrics(out, split=Split.TRAIN)
+        self.calculate_and_log_auroc(out, "train")
 
-        if "A1cGreaterThan7" in out["preds"]["classification"]:
-            _, sample_dist = out["preds"]["classification"]["A1cGreaterThan7"]
-            preds = sample_dist.logits
-            labels = out["labels"]["classification"]["A1cGreaterThan7"].long()
-            mask = out["event_mask"]
-            preds = preds[mask]
-            labels = labels[mask]
+        loss = out["loss"]
+        self.log("train_loss", loss, on_step=True, on_epoch=True)
 
-            auroc_metric = self.metrics["A1cGreaterThan7"]["AUROC"]
-            auroc_value = auroc_metric(preds, labels)
-            self.log("train_A1cGreaterThan7_AUROC", auroc_value, on_step=True, on_epoch=True)
-
-            loss = out["loss"]
-            self.log("train_loss", loss, on_step=True, on_epoch=True)
-
-            return loss
-        else:
-            print("Warning: 'A1cGreaterThan7' not found in the model's predictions.")
-            return out["loss"]
+        return loss
 
     def validation_step(self, batch: PytorchBatch, batch_idx: int):
         out = self.model(batch)
-        self.log_metrics(out, split=Split.TUNING)
+        self.calculate_and_log_auroc(out, "val")
 
-        if "A1cGreaterThan7" in out["preds"]["classification"]:
-            _, sample_dist = out["preds"]["classification"]["A1cGreaterThan7"]
-            preds = sample_dist.logits
-            labels = out["labels"]["classification"]["A1cGreaterThan7"].long()
-            mask = out["event_mask"]
-            preds = preds[mask]
-            labels = labels[mask]
-
-            auroc_metric = self.metrics["A1cGreaterThan7"]["AUROC"]
-            auroc_value = auroc_metric(preds, labels)
-            self.log("val_A1cGreaterThan7_AUROC", auroc_value, on_step=False, on_epoch=True)
-
-            loss = out["loss"]
-            self.log("val_loss", loss, on_step=False, on_epoch=True)
+        loss = out["loss"]
+        self.log("val_loss", loss, on_step=False, on_epoch=True)
 
     def test_step(self, batch: PytorchBatch, batch_idx: int):
         out = self.model(batch)
-        self.log_metrics(out, split=Split.HELD_OUT)
+        self.calculate_and_log_auroc(out, "test")
 
-        if "A1cGreaterThan7" in out["preds"]["classification"]:
-            _, sample_dist = out["preds"]["classification"]["A1cGreaterThan7"]
-            preds = sample_dist.logits
-            labels = out["labels"]["classification"]["A1cGreaterThan7"].long()
-            mask = out["event_mask"]
-            preds = preds[mask]
-            labels = labels[mask]
-
-            auroc_metric = self.metrics["A1cGreaterThan7"]["AUROC"]
-            auroc_value = auroc_metric(preds, labels)
-            self.log("test_A1cGreaterThan7_AUROC", auroc_value, on_step=False, on_epoch=True)
-
-            loss = out["loss"]
-            self.log("test_loss", loss, on_step=False, on_epoch=True)
+        loss = out["loss"]
+        self.log("test_loss", loss, on_step=False, on_epoch=True)
 
     def configure_optimizers(self):
         """Configures optimizer and learning rate scheduler.
