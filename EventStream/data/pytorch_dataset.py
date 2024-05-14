@@ -473,12 +473,7 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
     @SeedableMixin.WithSeed
     @TimeableMixin.TimeAs
     def _seeded_getitem(self, idx: int) -> dict[str, list]:
-        """Returns a Returns a dictionary corresponding to a single subject's data.
-
-        This function is automatically seeded for robustness. See `__getitem__` for a description of the
-        output format.
-        """
-
+        """Returns a dictionary corresponding to a single subject's data."""
         full_subj_data = {c: v for c, v in zip(self.columns, self.cached_data[idx])}
         for k in ["static_indices", "static_measurement_indices"]:
             if full_subj_data[k] is None:
@@ -490,18 +485,10 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
         else:
             full_subj_data.pop("start_time")
 
-        # Ensure the 'A1cGreaterThan7' column is included
-        if "A1cGreaterThan7" in full_subj_data:
-            full_subj_data["A1cGreaterThan7"] = full_subj_data["A1cGreaterThan7"]
-        else:
-            print("Warning: 'A1cGreaterThan7' key not found in full_subj_data.")
-            full_subj_data["A1cGreaterThan7"] = None
-            
-        print(f"A1cGreaterThan7 value for item {idx}: {full_subj_data['A1cGreaterThan7']}")
+        # Ensure the 'A1cGreaterThan7' label is included
+        if "A1cGreaterThan7" not in full_subj_data:
+            full_subj_data["A1cGreaterThan7"] = None  # Set a default value if the key is missing
 
-        # If we need to truncate to `self.max_seq_len`, grab a random full-size span to capture that.
-        # TODO(mmd): This will proportionally underweight the front and back ends of the subjects data
-        # relative to the middle, as there are fewer full length sequences containing those elements.
         seq_len = len(full_subj_data["time_delta"])
         if seq_len > self.max_seq_len:
             with self._time_as("truncate_to_max_seq_len"):
@@ -723,20 +710,24 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
 
             out_labels[task] = []
             for e in batch:
-                out_labels[task].append(e[task])
+                if task in e:
+                    out_labels[task].append(e[task])
+                else:
+                    out_labels[task].append(None)  # Set a default value if the task is missing
 
             match task_type:
                 case "multi_class_classification":
-                    out_labels[task] = torch.LongTensor(out_labels[task])
+                    out_labels[task] = torch.LongTensor([label for label in out_labels[task] if label is not None])
                 case "binary_classification":
-                    out_labels[task] = torch.FloatTensor(out_labels[task])
+                    out_labels[task] = torch.FloatTensor([label for label in out_labels[task] if label is not None])
                 case "regression":
-                    out_labels[task] = torch.FloatTensor(out_labels[task])
+                    out_labels[task] = torch.FloatTensor([label for label in out_labels[task] if label is not None])
                 case _:
                     raise TypeError(f"Don't know how to tensorify task of type {task_type}!")
 
-        # Include the 'A1cGreaterThan7' column in out_labels
-        out_labels["A1cGreaterThan7"] = torch.LongTensor([e["A1cGreaterThan7"] for e in batch])
+        # Include the 'A1cGreaterThan7' labels in out_labels
+        a1c_labels = [e["A1cGreaterThan7"] for e in batch if "A1cGreaterThan7" in e]
+        out_labels["A1cGreaterThan7"] = torch.LongTensor(a1c_labels) if a1c_labels else None
 
         out_batch.stream_labels = out_labels
         self._register_end("collate_task_labels")

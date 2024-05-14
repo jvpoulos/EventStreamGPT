@@ -101,24 +101,15 @@ class ConditionallyIndependentGenerativeOutputLayer(GenerativeOutputLayerBase):
         print("Shape of for_event_contents_prediction:", for_event_contents_prediction.shape)
         print("Shape of self.ClassificationLayer(for_event_contents_prediction):", self.ClassificationLayer(for_event_contents_prediction).shape)
 
-        try:
-            if "A1cGreaterThan7" in self.vocab_offsets_by_measurement:
-                a1c_vocab_offset = self.vocab_offsets_by_measurement["A1cGreaterThan7"]
-                a1c_vocab_size = self.vocab_sizes_by_measurement["A1cGreaterThan7"]
-                a1c_greater_than_7_logits = self.ClassificationLayer(for_event_contents_prediction)[:, :, a1c_vocab_offset:a1c_vocab_offset+a1c_vocab_size]
-                a1c_greater_than_7_logits = a1c_greater_than_7_logits.squeeze(-1)
-                classification_dists_by_measurement["A1cGreaterThan7"] = (None, torch.distributions.Bernoulli(logits=a1c_greater_than_7_logits))
-
-            if not is_generation and hasattr(batch, "stream_labels"):
-                if batch.stream_labels is not None and "A1cGreaterThan7" in batch.stream_labels:
-                    a1c_greater_than_7_labels = batch.stream_labels["A1cGreaterThan7"]
+        if not is_generation and hasattr(batch, "stream_labels") and batch.stream_labels is not None:
+            if "A1cGreaterThan7" in batch.stream_labels:
+                a1c_greater_than_7_labels = batch.stream_labels["A1cGreaterThan7"]
+                if len(a1c_greater_than_7_labels) > 0:
                     classification_labels_by_measurement["A1cGreaterThan7"] = a1c_greater_than_7_labels
                 else:
-                    print("Warning: 'A1cGreaterThan7' key not found in the batch labels. Skipping label assignment.")
+                    classification_labels_by_measurement["A1cGreaterThan7"] = None
             else:
-                print("Warning: 'A1cGreaterThan7' key not found in vocab_offsets_by_measurement. Skipping prediction.")
-        except KeyError:
-            print("Warning: 'A1cGreaterThan7' key not found in vocab_offsets_by_measurement. Skipping prediction.")
+                classification_labels_by_measurement["A1cGreaterThan7"] = None
 
         regression_out = self.get_regression_outputs(
             batch,
@@ -244,7 +235,7 @@ class CIPPTForGenerativeSequenceModeling(StructuredGenerationMixin, StructuredTr
             "batch": batch,
             "past": past,
         }
-
+        
     def forward(
         self,
         batch: PytorchBatch,
@@ -255,15 +246,16 @@ class CIPPTForGenerativeSequenceModeling(StructuredGenerationMixin, StructuredTr
 
         classification_labels_by_measurement = None if is_generation else {}
 
-        if not is_generation and hasattr(batch, "stream_labels"):
-            if batch.stream_labels is not None and "A1cGreaterThan7" in batch.stream_labels:
-                # Convert mask to boolean tensor
-                mask = mask.bool()
-                a1c_greater_than_7_labels = a1c_greater_than_7_labels[mask.bool()]
+        if not is_generation and hasattr(batch, "stream_labels") and batch.stream_labels is not None:
+            print("Available labels in batch.stream_labels:", batch.stream_labels.keys())
+            if "A1cGreaterThan7" in batch.stream_labels:
+                a1c_greater_than_7_labels = batch.stream_labels["A1cGreaterThan7"]
                 classification_labels_by_measurement["A1cGreaterThan7"] = a1c_greater_than_7_labels
+                print("Assigned A1cGreaterThan7 labels to the model.")
             else:
-                # Set the 'A1cGreaterThan7' key to None if it's not found in the batch labels
-                classification_labels_by_measurement["A1cGreaterThan7"] = None
+                print("Warning: 'A1cGreaterThan7' labels not found in the batch.")
+        else:
+            print("Warning: 'stream_labels' not found in the batch.")
 
         use_cache = kwargs.get("use_cache", False)
         output_attentions = kwargs.get("output_attentions", False)

@@ -103,16 +103,7 @@ class ESTForGenerativeSequenceModelingLM(L.LightningModule):
         super().__init__()
 
         # Define the CLASSIFICATION attribute
-        self.CLASSIFICATION = {DataModality.SINGLE_LABEL_CLASSIFICATION, DataModality.MULTI_LABEL_CLASSIFICATION}
-
-        # Initialize the tte_metrics
-        self.tte_metrics = torch.nn.ModuleDict(
-            {
-                "MSE": torchmetrics.MeanSquaredError(),
-                "MSLE": torchmetrics.MeanSquaredLogError(),
-                "explained_variance": torchmetrics.ExplainedVariance(),
-            }
-        )        
+        self.CLASSIFICATION = {DataModality.SINGLE_LABEL_CLASSIFICATION, DataModality.MULTI_LABEL_CLASSIFICATION}   
 
         # If the configurations are dictionaries, convert them to class objects.
         if isinstance(config, dict):
@@ -128,7 +119,7 @@ class ESTForGenerativeSequenceModelingLM(L.LightningModule):
             pretraining_metrics_config = MetricsConfig(**pretraining_metrics_config)
         if isinstance(final_validation_metrics_config, dict):
             final_validation_metrics_config = MetricsConfig(**final_validation_metrics_config)
-            
+
         self.pretraining_metrics_config = pretraining_metrics_config
         self.final_validation_metrics_config = final_validation_metrics_config
 
@@ -168,35 +159,6 @@ class ESTForGenerativeSequenceModelingLM(L.LightningModule):
             self.model = model_cls(config, vocabulary_config)  # Pass vocabulary_config
         else:
             self.model = model_cls.from_pretrained(pretrained_weights_fp, config=config)
-
-    def log_classification_metrics(self, results: GenerativeSequenceModelOutput, split: Split, metrics_config: MetricsConfig):
-        for metrics_dict in self.metrics.values():
-            mask = results["event_mask"]
-
-            if not mask.any():
-                continue
-
-            for task_type, metrics in metrics_dict.items():
-                if task_type in self.CLASSIFICATION and metrics_config.include_metrics.get(split.value, {}).get(MetricCategories.CLASSIFICATION.value, False):
-                    if "A1cGreaterThan7" in results["preds"]["classification"]:
-                        _, sample_dist = results["preds"]["classification"]["A1cGreaterThan7"]
-                        preds = sample_dist.logits
-                        labels = results["labels"]["classification"]["A1cGreaterThan7"]
-
-                        preds = preds[mask]
-                        labels = labels[mask].long()
-
-                        self._log_metric_dict(
-                            preds=preds,
-                            labels=labels,
-                            metrics=metrics,
-                            measurement="A1cGreaterThan7",
-                            split=split,
-                            cat=MetricCategories.CLASSIFICATION,
-                            metrics_config=metrics_config,
-                        )
-                    else:
-                        print("Warning: 'A1cGreaterThan7' not found in the model's predictions.")
 
     def do_log_any(self, split: Split, metric_name=None):
         """Returns True if `metric_name` should be tracked for `split` and any other split."""
@@ -245,13 +207,9 @@ class ESTForGenerativeSequenceModelingLM(L.LightningModule):
     def build_metrics(self):
         """Build the various torchmetrics we'll use to track performance."""
         self.metrics = {
-            "A1cGreaterThan7": torch.nn.ModuleDict(
-                {
-                    "AUROC": self.binary_auroc,
-                    "accuracy": BinaryAccuracy(),
-                    "AUPRC": BinaryAveragePrecision(),
-                }
-            )
+            "A1cGreaterThan7": torch.nn.ModuleDict({
+                "AUROC": BinaryAUROC(),
+            })
         }
     
     def _log_metric_dict(
@@ -288,108 +246,12 @@ class ESTForGenerativeSequenceModelingLM(L.LightningModule):
                     f"with preds ({str_summary(preds)}) and labels ({str_summary(labels)}): {e}."
                 )
 
-    def log_tte_metrics(self, results: GenerativeSequenceModelOutput, split: Split, metrics_config: MetricsConfig):
-        # The output of the model for time-to-event (and for regression targets as well) are pytorch
-        # distribution objects, not scalars. So, for some evaluation metrics, we need to sample values from
-        # those distributions to assess the metric.
-        # TODO(mmd): We should likely be able to control how many samples are used, to minimize variance of
-        # these results.
-        tte_dist = results["preds"]["time_to_event"]
-        tte_preds = tte_dist.sample()
-
-        # After sampling, we also need to slice this down to just those intra-event-times that are actually
-        # observed. This means we should drop the last sequence element (slice to `[:, :-1]` (as our observed
-        # intra-event-times will only exist for the interior of our sequence), then further filter down to
-        # just elements of the prediction for which the next sequence element was not masked
-        # (mask via `results['event_mask'][:, 1:]`). We also need to filter the observed labels down to also
-        # only be present for sequence elements where the next sequence element was truly observed.
-        tte_preds = tte_preds[:, :-1][results["event_mask"][:, 1:]]
-        tte_labels = results["labels"]["time_to_event"][results["event_mask"][:, 1:]]
-
-        # Finally, we can log all relevant TTE metrics given these predictions and labels.
-        self._log_metric_dict(
-            preds=tte_preds,
-            labels=tte_labels,
-            metrics=self.tte_metrics,
-            measurement="TTE",
-            split=split,
-            cat=MetricCategories.TTE,
-            metrics_config=metrics_config,
-        )
-
-    # def log_regression_metrics(self, results: GenerativeSequenceModelOutput, split: Split, metrics_config: MetricsConfig):
-    #     for measurement, metrics_dict in self.metrics.items():
-    #         mask = results["event_mask"]
-
-    #         if not mask.any():
-    #             continue
-
-    #         for task_type, metrics in metrics_dict.items():
-    #             if task_type == DataModality.MULTIVARIATE_REGRESSION and metrics_config.include_metrics.get(split.value, {}).get(MetricCategories.REGRESSION.value, False):
-    #                 vocab_size = self.config.vocab_sizes_by_measurement[measurement]
-
-    #                 # Here, like for TTE, we need to sample from the returned distribution before we can use
-    #                 # it directly. Here we also need to limit to just those events that are actually observed.
-    #                 # Like above, the assumption here is that preds and labels correspond to predictions for
-    #                 # and labels of the events at their indexed position; not for the subsequent event. So we
-    #                 # don't need to shift `results['event_mask']` here to account for that.
-    #                 _, dist = results["preds"]["regression"][measurement]
-    #                 preds = dist.sample()[mask]
-    #                 labels = results["labels"]["regression"][measurement][mask]
-
-    #                 # However, as our regression output is actually indexed only to the group keys that are
-    #                 # actually measured (tracked in `results['preds']['regression_indices']`, we need to
-    #                 # expand our predictions and labels to be in the full vocabulary space for the metrics to
-    #                 # work naturally.
-    #                 preds_indices = results["preds"]["regression_indices"][measurement][mask]
-    #                 labels_indices = results["labels"]["regression_indices"][measurement][mask]
-
-    #                 # We also need to reflect just those data elements for which values were observed:
-    #                 data_el_mask = results["dynamic_values_mask"][mask]
-
-    #                 preds = preds[data_el_mask]
-    #                 labels = labels[data_el_mask]
-    #                 preds_indices = preds_indices[data_el_mask]
-    #                 labels_indices = labels_indices[data_el_mask]
-
-    #                 preds_expanded = expand_indexed_regression(preds, preds_indices, vocab_size)
-    #                 labels_expanded = expand_indexed_regression(labels, labels_indices, vocab_size)
-
-    #                 self._log_metric_dict(
-    #                     preds=preds_expanded,
-    #                     labels=labels_expanded,
-    #                     metrics=metrics,
-    #                     measurement=measurement,
-    #                     split=split,
-    #                     cat=MetricCategories.REGRESSION,
-    #                     metrics_config=metrics_config,
-    #                 )
-    #             elif task_type == DataModality.UNIVARIATE_REGRESSION and metrics_config.include_metrics.get(split.value, {}).get(MetricCategories.REGRESSION.value, False):
-    #                 # Here, like for TTE, we need to sample from the returned distribution before we can use
-    #                 # it directly. Here we also need to limit to just those events that are actually observed.
-    #                 # Like above, the assumption here is that preds and labels correspond to predictions for
-    #                 # and labels of the events at their indexed position; not for the subsequent event. So we
-    #                 # don't need to shift `results['event_mask']` here to account for that.
-    #                 # We ignore the is observed distribution here.
-    #                 _, dist = results["preds"]["regression"][measurement]
-    #                 preds = dist.sample()[mask]
-    #                 labels = results["labels"]["regression"][measurement][mask]
-
-    #                 self._log_metric_dict(
-    #                     preds=preds,
-    #                     labels=labels,
-    #                     metrics=metrics,
-    #                     measurement=measurement,
-    #                     split=split,
-    #                     cat=MetricCategories.REGRESSION,
-    #                 )
-
     def log_metrics(self, results: GenerativeSequenceModelOutput, split: Split):
         """Logs metric results for a given output result."""
         log_kwargs = {"batch_size": self.optimization_config.batch_size, "sync_dist": True}
 
-        # Log the loss separately
-        self.log(f"{split}_loss", results["loss"], **log_kwargs, rank_zero_only=True)
+        # Log the loss
+        self.log(f"{split}_loss", results["loss"], **log_kwargs, rank_zero_only=True, prog_bar=(split == Split.TRAIN))
 
         if split == Split.TRAIN or split == Split.TUNING:
             metrics_config = self.pretraining_metrics_config
@@ -402,21 +264,13 @@ class ESTForGenerativeSequenceModelingLM(L.LightningModule):
                 self.log(f"{split}_{loss_name}", loss_value, **log_kwargs)
 
         # Log A1cGreaterThan7 classification metrics
-        if "A1cGreaterThan7" in results["preds"]["classification"]:
+        if "classification" in results["preds"] and "A1cGreaterThan7" in results["preds"]["classification"]:
             _, sample_dist = results["preds"]["classification"]["A1cGreaterThan7"]
-            preds = sample_dist.logits
-            mask = results["event_mask"]
+            if sample_dist is not None:
+                preds = sample_dist.logits
+                labels = results["labels"]["classification"].get("A1cGreaterThan7", None)
 
-            if "A1cGreaterThan7" in results["labels"]["classification"]:
-                labels = results["labels"]["classification"]["A1cGreaterThan7"]
-                
                 if labels is not None:
-                    # Convert mask to boolean tensor
-                    mask = mask.bool()
-                    
-                    preds = preds[mask]
-                    labels = labels[mask].long()
-
                     self._log_metric_dict(
                         preds=preds,
                         labels=labels,
@@ -429,44 +283,46 @@ class ESTForGenerativeSequenceModelingLM(L.LightningModule):
                 else:
                     print("Warning: 'A1cGreaterThan7' labels are None. Skipping metric logging.")
             else:
-                print("Warning: 'A1cGreaterThan7' not found in the labels. Skipping metric logging.")
+                print("Warning: 'A1cGreaterThan7' sample distribution is None. Skipping metric logging.")
         else:
             print("Warning: 'A1cGreaterThan7' not found in the model's predictions. Skipping metric logging.")
             
     def calculate_and_log_auroc(self, out, split):
         if "A1cGreaterThan7" in out["preds"]["classification"]:
             _, preds_dist = out["preds"]["classification"]["A1cGreaterThan7"]
-            preds = preds_dist.logits
-            labels = out["labels"]["classification"]["A1cGreaterThan7"]
-
-            if labels is not None:
-                self.binary_auroc.update(preds, labels)
-                self.log(f"{split}_A1cGreaterThan7_AUROC", self.binary_auroc, on_step=(split == "train"), on_epoch=True)
+            
+            if preds_dist is not None:
+                preds = preds_dist.logits
+                
+                if "A1cGreaterThan7" in out["labels"]["classification"] and out["labels"]["classification"]["A1cGreaterThan7"] is not None:
+                    labels = out["labels"]["classification"]["A1cGreaterThan7"]
+                    self.binary_auroc.update(preds, labels)
+                    self.log(f"{split}_A1cGreaterThan7_AUROC", self.binary_auroc, on_step=(split == "train"), on_epoch=True)
+                else:
+                    print(f"Warning: 'A1cGreaterThan7' labels are missing or None for split {split}. Skipping AUROC calculation.")
             else:
-                print(f"Warning: 'A1cGreaterThan7' labels are None for split {split}. Skipping AUROC calculation.")
+                print(f"Warning: 'A1cGreaterThan7' prediction distribution is None for split {split}. Skipping AUROC calculation.")
         else:
             print(f"Warning: 'A1cGreaterThan7' key not found in predictions for split {split}. Skipping AUROC calculation.")
 
     def training_step(self, batch: PytorchBatch, batch_idx: int) -> torch.Tensor:
         out = self.model(batch)
+        self.log_metrics(out, Split.TRAIN)
         self.calculate_and_log_auroc(out, "train")
-
         loss = out["loss"]
-        self.log("train_loss", loss, on_step=True, on_epoch=True)
-
         return loss
 
     def validation_step(self, batch: PytorchBatch, batch_idx: int):
         out = self.model(batch)
+        self.log_metrics(out, Split.TUNING)
         self.calculate_and_log_auroc(out, "val")
-
         loss = out["loss"]
         self.log("val_loss", loss, on_step=False, on_epoch=True)
 
     def test_step(self, batch: PytorchBatch, batch_idx: int):
         out = self.model(batch)
+        self.log_metrics(out, Split.HELD_OUT)
         self.calculate_and_log_auroc(out, "test")
-
         loss = out["loss"]
         self.log("test_loss", loss, on_step=False, on_epoch=True)
 
