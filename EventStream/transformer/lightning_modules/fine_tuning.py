@@ -324,6 +324,8 @@ class FinetuneConfig:
         }
     )
 
+    data_config_path: str | None = None
+    
     trainer_config: dict[str, Any] = dataclasses.field(
         default_factory=lambda: {
             "accelerator": "auto",
@@ -380,34 +382,34 @@ class FinetuneConfig:
                     f"{type(self.load_from_model_dir)}({self.load_from_model_dir})"
                 )
 
-        # convert data_config.save_dir to Path
-        match self.data_config["save_dir"]:
-            case str():
-                self.data_config["save_dir"] = Path(self.data_config["save_dir"])
-            case Path():
-                pass
-            case _:
-                raise TypeError(
-                    "`data_config.save_dir` must be a str or path! Got "
-                    f"{type(self.data_config.save_dir)}({self.data_config.save_dir})"
-                )
+        # Check if data_config is a dictionary
+        if isinstance(self.data_config, dict):
+            # Convert data_config to PytorchDatasetConfig
+            self.data_config = PytorchDatasetConfig(**self.data_config)
 
         if (
-            self.data_config.get("train_subset_size", "FULL") != "FULL"
-            and self.data_config.get("train_subset_seed", None) is None
+            self.data_config.train_subset_size != "FULL"
+            and self.data_config.train_subset_seed is None
         ):
-            self.data_config["train_subset_seed"] = int(random.randint(1, int(1e6)))
+            self.data_config.train_subset_seed = int(random.randint(1, int(1e6)))
             print(
                 f"WARNING: train_subset_size={self.data_config.train_subset_size} but "
-                f"seed is unset. Setting to {self.data_config['train_subset_seed']}"
+                f"seed is unset. Setting to {self.data_config.train_subset_seed}"
             )
 
-        data_config_fp = self.load_from_model_dir / "data_config.json"
-        print(f"Loading data_config from {data_config_fp}")
-        reloaded_data_config = PytorchDatasetConfig.from_json_file(data_config_fp)
-        reloaded_data_config.task_df_name = self.task_df_name
+        if data_config_path:
+            data_config_fp = Path(data_config_path)
+            print(f"Loading data_config from {data_config_fp}")
+            reloaded_data_config = PytorchDatasetConfig.from_json_file(data_config_fp)
+            reloaded_data_config.task_df_name = self.task_df_name
+            self.data_config = reloaded_data_config
+        else:
+            # Check if data_config is a dictionary
+            if isinstance(self.data_config, dict):
+                # Convert data_config to PytorchDatasetConfig
+                self.data_config = PytorchDatasetConfig(**self.data_config)
 
-        for param, val in self.data_config.items():
+        for param, val in self.data_config.to_dict().items():
             if val is None:
                 continue
             if param == "task_df_name":

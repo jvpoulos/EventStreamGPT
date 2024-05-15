@@ -11,10 +11,13 @@ from io import StringIO, TextIOBase
 from pathlib import Path
 from textwrap import shorten, wrap
 from typing import Any, Union
+import json
 
 import omegaconf
 import pandas as pd
 import polars as pl
+
+from omegaconf import OmegaConf
 
 from ..utils import (
     COUNT_OR_PROPORTION,
@@ -216,7 +219,8 @@ class PytorchDatasetConfig(DataConfig):
             self.save_dir = Path(self.save_dir)
 
         if self.dataset_path != omegaconf.MISSING:
-            self.dataset = OmegaConf.structured(OmegaConf.load_dataset(self.dataset_path))
+            pass
+            # self.dataset = OmegaConf.structured(OmegaConf.load_dataset(self.dataset_path))
             
         match self.train_subset_size:
             case int() as n if n < 0:
@@ -243,3 +247,12 @@ class PytorchDatasetConfig(DataConfig):
         """Creates a new instance of this class from a plain dictionary."""
         as_dict["save_dir"] = Path(as_dict["save_dir"])
         return cls(**as_dict)
+
+    @classmethod
+    def from_json_file(cls, file_path: Union[str, Path]) -> "PytorchDatasetConfig":
+        try:
+            with open(str(file_path), "r") as f:
+                config_dict = json.load(f)
+        except FileNotFoundError:
+            raise FileNotFoundError(f"The data_config.json file was not found at {file_path}")
+        return cls.from_dict(config_dict)
