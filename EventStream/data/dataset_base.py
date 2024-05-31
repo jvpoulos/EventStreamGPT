@@ -1431,7 +1431,7 @@ class DatasetBase(
             subject_chunks = [list(c) for c in subject_chunks]
 
         for chunk_idx, subjects_list in self._tqdm(list(enumerate(subject_chunks))):
-            cached_df = self.build_DL_cached_representation(subject_ids=subjects_list)
+            cached_df = self.build_DL_cached_representation(subject_ids=None, do_sort_outputs=True)
 
             for split, subjects in self.split_subjects.items():
                 fp = DL_dir / f"{split}_{chunk_idx}.{self.DF_SAVE_FORMAT}"

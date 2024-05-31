@@ -619,7 +619,10 @@ class Dataset(DatasetBase):
                 if cfg.temporality != valid_temporality_type:
                     raise ValueError(f"Column {val_col} found in dataframe of wrong temporality")
 
-                source_df = source_df.with_columns(pl.col(val_col).cast(pl.Float64))
+                if val_col == "SDI_score":  # Special case for SDI_score column
+                    source_df = source_df.with_columns(pl.col(val_col).cast(pl.Float64))
+                else:
+                    source_df = source_df.with_columns(pl.col(val_col).cast(pl.Float64))
 
         # Special case for A1cGreaterThan7 column
         if "A1cGreaterThan7" in source_df.columns and source_df["A1cGreaterThan7"].dtype != pl.Categorical:
@@ -800,7 +803,7 @@ class Dataset(DatasetBase):
         match config.modality:
             case DataModality.UNIVARIATE_REGRESSION:
                 key_col = "const_key"
-                val_col = measure  # Use the measure name as the value column
+                val_col = measure
                 print(f"Univariate Regression - Key column: {key_col}, Value column: {val_col}")
                 metadata_as_polars = pl.DataFrame(
                     {key_col: [measure], **{c: [v] for c, v in metadata.items()}}
@@ -810,7 +813,9 @@ class Dataset(DatasetBase):
                 key_col = measure
                 val_col = config.values_column
                 print(f"Multivariate Regression - Key column: {key_col}, Value column: {val_col}")
-                metadata_as_polars = pl.from_pandas(metadata, include_index=True)
+                metadata_as_polars = pl.DataFrame(
+                    {key_col: [measure], **{c: [v] for c, v in metadata.items() if c != key_col}}
+                )
             case _:
                 raise ValueError(f"Called _pre_numerical_source on {config.modality} measure {measure}!")
 
@@ -821,8 +826,6 @@ class Dataset(DatasetBase):
             metadata_as_polars = metadata_as_polars.with_columns(pl.lit(None).alias("outlier_model"))
         if "normalizer" in metadata_as_polars and len(metadata_as_polars.drop_nulls("normalizer")) == 0:
             metadata_as_polars = metadata_as_polars.with_columns(pl.lit(None).alias("normalizer"))
-
-        print(f"Value column (val_col): {val_col}")
 
         if val_col not in metadata_as_polars.columns:
             metadata_as_polars = metadata_as_polars.with_columns(pl.lit(None).alias(val_col))
@@ -1021,6 +1024,9 @@ class Dataset(DatasetBase):
                 .drop("value_type_right")
             )
             source_df = source_df.filter(~pl.col(vocab_keys_col).is_in(dropped_keys[vocab_keys_col]))
+
+            if measure == 'SDI_score':
+                source_df = source_df.fill_null(0)
 
             if len(source_df) == 0:
                 measurement_metadata = measurement_metadata.to_pandas()
@@ -1252,6 +1258,7 @@ class Dataset(DatasetBase):
         source_df, keys_col_name, vals_col_name, inliers_col_name, _ = self._prep_numerical_source(
             measure, config, source_df
         )
+
         keys_col = pl.col(keys_col_name)
         vals_col = pl.col(vals_col_name)
 
@@ -1280,9 +1287,9 @@ class Dataset(DatasetBase):
             pl.when(value_type == NumericDataModalitySubtype.DROPPED)
             .then(keys_col)
             .when(value_type == NumericDataModalitySubtype.CATEGORICAL_INTEGER)
-            .then(keys_col + "__EQ_" + vals_col.cast(pl.Int64).fill_nan(-1).cast(pl.Utf8))
+            .then(keys_col + "__EQ_" + vals_col.fill_nan(0).cast(pl.Int64).cast(pl.Utf8))
             .when(value_type == NumericDataModalitySubtype.CATEGORICAL_FLOAT)
-            .then(keys_col + "__EQ_" + vals_col.cast(pl.Utf8))
+            .then(keys_col + "__EQ_" + vals_col.fill_nan(0).cast(pl.Utf8))
             .otherwise(keys_col)
             .alias(keys_col_name)
         )
@@ -1298,14 +1305,24 @@ class Dataset(DatasetBase):
                 )
             )
             .then(pl.lit(None))
-            .when(value_type == NumericDataModalitySubtype.INTEGER)
-            .then(vals_col)  # Remove the rounding for integer columns
-            .otherwise(vals_col)
+            .otherwise(vals_col.fill_nan(0))
             .alias(vals_col_name)
         )
-        source_df = source_df.with_columns(keys_col, vals_col)
 
-        null_idx = keys_col.is_null() | vals_col.is_null() | vals_col.is_nan()
+        null_idx = keys_col.is_null() | vals_col.is_null()
+
+        source_df = source_df.with_columns(
+            pl.when(null_idx)
+            .then(pl.lit(None))
+            .otherwise(pl.struct([keys_col, vals_col]))
+            .alias("temp")
+        )
+
+        source_df = source_df.select(
+            pl.all().exclude([keys_col_name, vals_col_name, "temp"]),
+            pl.col("temp").struct.field(keys_col_name).alias(keys_col_name),
+            pl.col("temp").struct.field(vals_col_name).cast(pl.Float32).alias(vals_col_name),
+        )
 
         null_source = source_df.filter(null_idx)
         present_source = source_df.filter(~null_idx)
@@ -1315,12 +1332,11 @@ class Dataset(DatasetBase):
                 null_source = null_source.with_columns(pl.lit(None).cast(pl.Boolean).alias(inliers_col_name))
             return null_source.drop(cols_to_drop_at_end)
 
-        # 5. Add inlier/outlier indices and remove learned outliers.
         if self.config.outlier_detector_config is not None:
             M = self._get_preprocessing_model(self.config.outlier_detector_config, for_fit=False)
 
             inliers_col = ~M.predict_from_polars(vals_col, pl.col("outlier_model")).alias(inliers_col_name)
-            vals_col = pl.when(inliers_col).then(vals_col).otherwise(np.NaN)
+            vals_col = pl.when(inliers_col).then(vals_col).otherwise(0)
 
             present_source = present_source.with_columns(inliers_col, vals_col)
             null_source = null_source.with_columns(pl.lit(None).cast(pl.Boolean).alias(inliers_col_name))
@@ -1332,15 +1348,14 @@ class Dataset(DatasetBase):
         if len(present_source) == 0:
             return null_source.drop(cols_to_drop_at_end)
 
-        # 6. Normalize values.
         if self.config.normalizer_config is not None:
             M = self._get_preprocessing_model(self.config.normalizer_config, for_fit=False)
 
             vals_col = M.predict_from_polars(vals_col, pl.col("normalizer"))
             present_source = present_source.with_columns(vals_col)
 
-        present_source = present_source.with_columns(vals_col.cast(pl.Float64))
-        null_source = null_source.with_columns(vals_col.cast(pl.Float64))
+        present_source = present_source.with_columns(vals_col.cast(pl.Float32))
+        null_source = null_source.with_columns(vals_col.cast(pl.Float32))
         source_df = present_source.vstack(null_source)
 
         return source_df.drop(cols_to_drop_at_end)
@@ -1453,73 +1468,97 @@ class Dataset(DatasetBase):
 
     def _melt_df(self, source_df: DF_T, id_cols: Sequence[str], measures: list[str]) -> pl.Expr:
         """Re-formats `source_df` into the desired deep-learning output format."""
-        struct_exprs = []
+        exprs = []
+        value_var_names = []
         total_vocab_size = self.vocabulary_config.total_vocab_size
         idx_dt = self.get_smallest_valid_uint_type(total_vocab_size)
 
+        # List of columns to exclude from processing
+        exclude_columns = ["A1cGreaterThan7", "event_type"]
+
         for m in measures:
-            if m == "event_type":
-                cfg = None
-                modality = DataModality.SINGLE_LABEL_CLASSIFICATION
-            else:
-                cfg = self.measurement_configs[m]
-                modality = cfg.modality
+            if m not in source_df.columns or m in exclude_columns:
+                continue  # Skip the measurement if it doesn't exist in the source DataFrame or is in the exclusion list
 
             if m in self.measurement_vocabs:
-                idx_present_expr = pl.col(m).is_not_null() & pl.col(m).is_in(self.measurement_vocabs[m])
-                idx_value_expr = pl.col(m).map_dict(self.unified_vocabulary_idxmap[m], return_dtype=idx_dt)
+                idx_present_expr = (pl.col(m).is_not_null() & pl.col(m).is_in(self.measurement_vocabs[m])).alias(f"{m}_present")
+                idx_value_expr = pl.col(m).map_dict(self.unified_vocabulary_idxmap[m], return_dtype=idx_dt).alias(f"{m}_index")
             else:
-                idx_present_expr = pl.col(m).is_not_null()
-                idx_value_expr = pl.lit(self.unified_vocabulary_idxmap[m][m]).cast(idx_dt)
+                idx_present_expr = pl.col(m).is_not_null().alias(f"{m}_present")
+                idx_value_expr = pl.lit(self.unified_vocabulary_idxmap[m][m]).cast(idx_dt).alias(f"{m}_index")
 
-            idx_present_expr = idx_present_expr.cast(pl.Boolean).alias("present")
-            idx_value_expr = idx_value_expr.alias("index")
-
-            if (modality == DataModality.UNIVARIATE_REGRESSION) and (
-                cfg.measurement_metadata.value_type
-                in (NumericDataModalitySubtype.FLOAT, NumericDataModalitySubtype.INTEGER)
-            ):
-                val_expr = pl.col(m)
-            elif modality == DataModality.MULTIVARIATE_REGRESSION:
-                val_expr = pl.col(cfg.values_column)
+            if self.measurement_configs[m].modality == DataModality.UNIVARIATE_REGRESSION:
+                val_expr = pl.col(m).alias(f"{m}_value")
+            elif self.measurement_configs[m].modality == DataModality.MULTIVARIATE_REGRESSION:
+                val_expr = pl.col(self.measurement_configs[m].values_column).alias(f"{m}_value")
             else:
-                val_expr = pl.lit(None).cast(pl.Float64)
+                val_expr = pl.lit(None).cast(pl.Float64).alias(f"{m}_value")
 
-            struct_exprs.append(
-                pl.struct([idx_present_expr, idx_value_expr, val_expr.alias("value")]).alias(m)
-            )
+            exprs.extend([idx_present_expr, idx_value_expr, val_expr])
+            value_var_names.extend([f"{m}_present", f"{m}_index", f"{m}_value"])
 
         measurements_idx_dt = self.get_smallest_valid_uint_type(len(self.unified_measurements_idxmap))
 
-        if not struct_exprs:
-            # If there are no struct expressions, return an empty DataFrame with the specified columns
+        if not exprs:
+            # If there are no expressions, return an empty DataFrame with the specified columns
             return pl.DataFrame({col: [] for col in id_cols + ["measurement_index", "index", "value"]})
 
-        return (
-            source_df.select(*id_cols, *struct_exprs)
+        # Ensure only existing columns are selected
+        available_columns = source_df.columns
+        value_var_names = [col for col in value_var_names if col in available_columns]
+
+        # Print columns for debugging
+        print("Available columns in source_df:", available_columns)
+        print("Selected value_var_names:", value_var_names)
+
+        if not value_var_names:
+            # If there are no valid value_var_names, return an empty DataFrame with the specified columns
+            return pl.DataFrame({col: [] for col in id_cols + ["measurement_index", "index", "value"]})
+
+        melted_df = (
+            source_df.select(*id_cols, *value_var_names)
             .melt(
                 id_vars=id_cols,
-                value_vars=measures,
-                variable_name="measurement",
+                value_vars=value_var_names,
+                variable_name="variable",
                 value_name="value",
             )
-            .filter(pl.col("value").struct.field("present"))
-            .select(
-                *id_cols,
-                pl.col("measurement")
-                .map_dict(self.unified_measurements_idxmap)
-                .cast(measurements_idx_dt)
-                .alias("measurement_index"),
-                pl.col("value").struct.field("index").alias("index"),
-                pl.col("value").struct.field("value").alias("value"),
+            .with_columns(
+                pl.col("variable").str.replace_all(r"_present$", "").alias("measurement"),
+                pl.col("variable").str.contains("_present$").alias("is_present"),
+                pl.col("variable").str.contains("_index$").alias("is_index"),
+                pl.col("variable").str.contains("_value$").alias("is_value"),
             )
         )
+
+        melted_df_present = (
+            melted_df
+            .filter(pl.col("is_present"))
+            .with_columns(
+                pl.col("measurement").map_dict(self.unified_measurements_idxmap).cast(measurements_idx_dt).alias("measurement_index"),
+                pl.col("value").cast(pl.Boolean).alias("present"),
+            )
+        )
+
+        melted_df_index = melted_df.filter(pl.col("is_index")).select(*id_cols, "measurement", pl.col("value").alias("index"))
+        melted_df_value = melted_df.filter(pl.col("is_value")).select(*id_cols, "measurement", pl.col("value").alias("value"))
+
+        melted_df = (
+            melted_df_present
+            .join(melted_df_index, on=id_cols + ["measurement"], how="left")
+            .join(melted_df_value, on=id_cols + ["measurement"], how="left")
+            .filter(pl.col("present"))
+            .select(*id_cols, "measurement_index", "index", "value")
+        )
+
+        return melted_df
+
 
     def build_DL_cached_representation(
         self, subject_ids: list[int] | None = None, do_sort_outputs: bool = False
     ) -> DF_T:
         # Identify the measurements sourced from each dataframe:
-        subject_measures, event_measures, dynamic_measures = [], ["event_type"], []
+        subject_measures, event_measures, dynamic_measures = [], ["event_type"], ["next_event_measurements"]
         for m in self.unified_measurements_vocab[1:]:
             temporality = self.measurement_configs[m].temporality
             match temporality:
@@ -1538,13 +1577,19 @@ class Dataset(DatasetBase):
         else:
             subjects_df = self.subjects_df
 
-        static_data = (
-            self._melt_df(subjects_df, ["subject_id"], subject_measures)
-            .groupby("subject_id")
-            .agg(
-                pl.col("measurement_index").alias("static_measurement_indices"),
-                pl.col("index").alias("static_indices"),
-            )
+        # Add this code to ensure the 'A1cGreaterThan7' column is present
+        if 'A1cGreaterThan7' not in subjects_df.columns:
+            subjects_df = subjects_df.with_columns(pl.lit(None).alias('A1cGreaterThan7'))
+
+        # Convert the 'A1cGreaterThan7' column to numerical representation
+        subjects_df = subjects_df.with_columns(
+            pl.col("A1cGreaterThan7").map_dict({"1.0": 1, "0.0": 0, None: None}, return_dtype=pl.UInt8).alias("A1cGreaterThan7")
+        )
+
+        static_data = subjects_df.select(
+            "subject_id",
+            *[pl.col(m).alias(f"static_indices_{m}") for m in subject_measures],
+            *[(pl.col(m).is_null().cast(pl.Int32) == 0).alias(f"static_counts_{m}") for m in subject_measures]
         )
 
         # 2. Process event data into the right format.
@@ -1554,7 +1599,20 @@ class Dataset(DatasetBase):
         else:
             events_df = self.events_df
             event_ids = None
-        event_data = self._melt_df(events_df, ["subject_id", "timestamp", "event_id"], event_measures)
+
+        # Filter out rows with null timestamps
+        events_df = events_df.filter(pl.col("timestamp").is_not_null())
+
+        event_data = events_df.select(
+            "subject_id",
+            "timestamp",
+            "event_id",
+            *[pl.col(m).alias(f"{m}_index") for m in event_measures]
+        ).groupby(["subject_id", "event_id"]).agg(
+            pl.col("timestamp").first().alias("timestamp"),
+            *[pl.col(f"{m}_index").alias(f"dynamic_indices_{m}") for m in event_measures],
+            *[(pl.col(f"{m}_index").is_null().cast(pl.Int32) == 0).alias(f"dynamic_counts_{m}") for m in event_measures],
+        )
 
         # 3. Process measurement data into the right base format:
         if event_ids:
@@ -1565,35 +1623,39 @@ class Dataset(DatasetBase):
             dynamic_measurements_df = self.dynamic_measurements_df
 
         dynamic_ids = ["event_id", "measurement_id"] if do_sort_outputs else ["event_id"]
-        dynamic_data = self._melt_df(dynamic_measurements_df, dynamic_ids, dynamic_measures)
 
-        if do_sort_outputs:
-            dynamic_data = dynamic_data.sort("event_id", "measurement_id")
-
-        # 4. Join dynamic and event data.
-
-        event_data = pl.concat([event_data, dynamic_data], how="diagonal")
-        event_data = (
-            event_data.groupby("event_id")
-            .agg(
-                pl.col("timestamp").drop_nulls().first().alias("timestamp"),
-                pl.col("subject_id").drop_nulls().first().alias("subject_id"),
-                pl.col("measurement_index").alias("dynamic_measurement_indices"),
-                pl.col("index").alias("dynamic_indices"),
-                pl.col("value").alias("dynamic_values"),
+        if dynamic_measures and not dynamic_measurements_df.is_empty():
+            dynamic_data = dynamic_measurements_df.select(
+                *dynamic_ids,
+                *[pl.col(m).alias(f"{m}_value") for m in dynamic_measures if m != "next_event_measurements"],
+            ).groupby(dynamic_ids).agg(
+                *[pl.col(f"{m}_value").alias(f"dynamic_indices_{m}") for m in dynamic_measures if m != "next_event_measurements"],
+                *[(pl.col(f"{m}_value").is_null().cast(pl.Int32) == 0).alias(f"dynamic_counts_{m}") for m in dynamic_measures if m != "next_event_measurements"],
             )
-            .sort("subject_id", "timestamp")
-            .groupby("subject_id")
-            .agg(
-                pl.col("timestamp").first().alias("start_time"),
-                ((pl.col("timestamp") - pl.col("timestamp").min()).dt.nanoseconds() / (1e9 * 60)).alias(
-                    "time"
-                ),
-                pl.col("dynamic_measurement_indices"),
-                pl.col("dynamic_indices"),
-                pl.col("dynamic_values"),
+
+            if "next_event_measurements" in dynamic_measurements_df.columns:
+                dynamic_data = dynamic_data.join(
+                    dynamic_measurements_df.select(
+                        *dynamic_ids,
+                        pl.col("next_event_measurements").alias("dynamic_indices_next_event_measurements"),
+                        (pl.col("next_event_measurements").is_null().cast(pl.Int32) == 0).alias("dynamic_counts_next_event_measurements")
+                    ),
+                    on=dynamic_ids,
+                    how="left"
+                )
+
+            if do_sort_outputs:
+                dynamic_data = dynamic_data.sort("event_id", "measurement_id")
+
+            # 4. Join dynamic and event data.
+            event_data = event_data.join(dynamic_data, on="event_id", how="left")
+        else:
+            event_data = event_data.with_columns(
+                *[pl.lit(None).alias(f"dynamic_indices_{m}") for m in dynamic_measures if m != "next_event_measurements"],
+                *[pl.lit(0).alias(f"dynamic_counts_{m}") for m in dynamic_measures if m != "next_event_measurements"],
+                pl.lit(None).alias("dynamic_indices_next_event_measurements"),
+                pl.lit(0).alias("dynamic_counts_next_event_measurements")
             )
-        )
 
         out = static_data.join(event_data, on="subject_id", how="outer")
         if do_sort_outputs:
@@ -1970,17 +2032,18 @@ class Dataset(DatasetBase):
         if isinstance(df, Path):
             df = pl.scan_parquet(df)
 
+        # Handle null values in the "timestamp" column
+        df = df.with_columns(
+            pl.col("timestamp").fill_null(pl.datetime(1900, 1, 1))
+        )
+
         def time_aggd_col_alias_fntr(new_agg: str | None = None) -> Callable[[str], str]:
             if new_agg is None:
-
                 def f(c: str) -> str:
                     return "/".join([window_size] + c.split("/")[1:])
-
             else:
-
                 def f(c: str) -> str:
                     return "/".join([window_size] + c.split("/")[1:-1] + [new_agg])
-
             return f
 
         # Columns to convert to counts:
@@ -2020,11 +2083,12 @@ class Dataset(DatasetBase):
             )
             df = df.explode(*[c for c in df.columns if c != "subject_id"])
         else:
-            df = df.groupby_rolling(
-                index_column="timestamp",
-                by="subject_id",
-                period=window_size,
-            ).agg(
+            # Calculate the window start and end times
+            window_start = df["timestamp"].dt.truncate(window_size)
+            window_end = window_start + pl.durationDt.nanoseconds(pl.to_url(window_size))
+
+            # Group by subject_id and the calculated window start/end times
+            grouped_df = df.groupby(["subject_id", window_start, window_end]).agg(
                 # present to counts
                 present_indicator_cols.sum().map_alias(time_aggd_col_alias_fntr("count")),
                 # values to stats
@@ -2044,6 +2108,9 @@ class Dataset(DatasetBase):
                 cols_to_min.min().map_alias(time_aggd_col_alias_fntr()),
                 cols_to_max.max().map_alias(time_aggd_col_alias_fntr()),
             )
+
+            # Drop the window_end column and rename window_start to timestamp
+            df = grouped_df.drop("window_end").rename({"window_start": "timestamp"})
 
         return self._normalize_flat_rep_df_cols(df, set_count_0_to_null=True)
 

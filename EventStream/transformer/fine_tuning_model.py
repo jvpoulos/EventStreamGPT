@@ -12,26 +12,28 @@ from .transformer import (
 from .utils import safe_masked_max, safe_weighted_avg
 
 
-class ESTForStreamClassification(StructuredTransformerPreTrainedModel):
-    """A model for fine-tuning on classification tasks.
+from ..data.vocabulary import VocabularyConfig
 
-    Args:
-        config: The model configuration class to use. This must contain the relevant fine-tuning task
-            information (e.g., `num_labels`, `finetuning_task`, `pooling_method`, and `id2label`).
-    """
+class ESTForStreamClassification(StructuredTransformerPreTrainedModel):
+    """A model for fine-tuning on classification tasks."""
 
     def __init__(
         self,
         config: StructuredTransformerConfig,
+        vocabulary_config: VocabularyConfig,
     ):
         super().__init__(config)
 
         self.task = config.finetuning_task
+        print(f"self.task type: {type(self.task)}")
+        print(f"self.task value: {self.task}")
 
         if self._uses_dep_graph:
             self.encoder = NestedAttentionPointProcessTransformer(config)
         else:
-            self.encoder = ConditionallyIndependentPointProcessTransformer(config)
+            self.encoder = ConditionallyIndependentPointProcessTransformer(
+                config, vocabulary_config=vocabulary_config  # Pass the vocabulary_config argument
+            )
 
         self.pooling_method = config.task_specific_params["pooling_method"]
 
@@ -81,7 +83,31 @@ class ESTForStreamClassification(StructuredTransformerPreTrainedModel):
                 raise ValueError(f"{self.pooling_method} is not a supported pooling method.")
 
         logits = self.logit_layer(stream_encoded).squeeze(-1)
-        labels = batch["stream_labels"][self.task]
+
+        if "stream_labels" not in batch or batch["stream_labels"] is None:
+            # Labels are missing
+            return StreamClassificationModelOutput(
+                loss=None,
+                preds=logits,
+                labels=None,
+            )
+        
+        if isinstance(self.task, str):
+            labels = batch["stream_labels"].get(self.task)
+        else:
+            labels = batch["stream_labels"]
+
+        print("Labels in the forward pass:")
+        print(batch["stream_labels"])
+
+        if labels is None:
+            # Labels for the specific task are missing
+            return StreamClassificationModelOutput(
+                loss=None,
+                preds=logits,
+                labels=None,
+            )
+
         loss = self.criteria(logits, labels)
 
         return StreamClassificationModelOutput(

@@ -6,15 +6,16 @@ from collections.abc import Sequence
 from pathlib import Path
 import pathlib
 from typing import Any
+import json
 
 import lightning as L
 import omegaconf
+from omegaconf import DictConfig
 import torch
 import torch.multiprocessing
 import torchmetrics
-from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
+from lightning.pytorch.callbacks import Callback, LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
-from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf
 from torchmetrics.classification import (
     BinaryAccuracy,
@@ -40,6 +41,9 @@ from ..config import OptimizationConfig, StructuredTransformerConfig
 from ..fine_tuning_model import ESTForStreamClassification
 from ..model_output import StreamClassificationModelOutput
 from ..utils import str_summary
+
+from ...data.vocabulary import VocabularyConfig
+from pytorch_lightning.loggers import WandbLogger
 
 
 class ESTForStreamClassificationLM(L.LightningModule):
@@ -87,10 +91,16 @@ class ESTForStreamClassificationLM(L.LightningModule):
         )
         self.build_metrics()
 
+        # Load the vocabulary_config from a file
+        vocabulary_config_path = "data/vocabulary_config.json"
+        with open(vocabulary_config_path, "r") as f:
+            vocabulary_config_dict = json.load(f)
+        vocabulary_config = VocabularyConfig.from_dict(vocabulary_config_dict)
+
         if pretrained_weights_fp is None or pretrained_weights_fp == "skip":
-            self.model = ESTForStreamClassification(config)
+            self.model = ESTForStreamClassification(config, vocabulary_config)
         else:
-            self.model = ESTForStreamClassification.from_pretrained(pretrained_weights_fp, config=config)
+            self.model = ESTForStreamClassification.from_pretrained(pretrained_weights_fp, config=config, vocabulary_config=vocabulary_config)
 
     def save_pretrained(self, model_dir: Path):
         fp = model_dir / "pretrained_weights"
@@ -190,20 +200,13 @@ class ESTForStreamClassificationLM(L.LightningModule):
                 )
 
     def log_metrics(self, results: StreamClassificationModelOutput, skip_metrics: Sequence[str], prefix: str):
-        """Logs metric results for a given output result.
+        """Logs metric results for a given output result."""
 
-        Args:
-            `results` (`transformerForGenerativeSequenceModelOutput`):
-                The results to assess across the suite of metrics.
-            `skip_metrics` (`Sequence[str]`):
-                A list of metrics to skip. Entries are not full metric names, but rather are partial names and
-                any metric whose name contains an element of `skip_metrics` will be skipped.
-                For example, if `skip_metrics = ['AUROC', 'AUPRC']`, then a metric with name `'macro_AUROC'`
-                or `'micro_AUPRC'` would be skipped, whereas a metric named `'weighted_accuracy'` would not.
-            `prefix` (`str`):
-                The prefix that should be used when logging metric results. Will likely be 'train', 'tuning',
-                or 'held_out', for example.
-        """
+        if results.labels is None:
+            # Skip logging metrics if labels are missing
+            if results.loss is not None:
+                self.log(f"{prefix}_loss", results.loss)
+            return
 
         self._log_metric_dict(
             preds=results.preds,
@@ -213,67 +216,99 @@ class ESTForStreamClassificationLM(L.LightningModule):
             prefix=prefix,
         )
 
-        self.log(f"{prefix}_loss", results.loss)
+        if results.loss is not None:
+            self.log(f"{prefix}_loss", results.loss)
 
     def training_step(self, batch, batch_idx):
-        """Training step.
-
-        Skips logging all AUROC, AUPRC, and per_class metric to save compute.
-        """
         out = self.model(batch)
         self.log_metrics(out, skip_metrics=("AUROC", "AUPRC", "per_class"), prefix="train")
-
-        return out["loss"]
+        self.calculate_and_log_auroc(out, "train")
+        loss = out["loss"]
+        return loss
 
     def validation_step(self, batch, batch_idx):
-        """Validation step.
-
-        Differs from training only in that it does not skip metrics.
-        """
         out = self.model(batch)
         self.log_metrics(out, skip_metrics=[], prefix="tuning")
+        self.calculate_and_log_auroc(out, "val")
+        loss = out["loss"]
+        self.log("val_loss", loss, on_step=False, on_epoch=True)
 
     def test_step(self, batch, batch_idx):
-        """Validation step.
-
-        Differs from training only in that it does not skip metrics.
-        """
         out = self.model(batch)
         self.log_metrics(out, skip_metrics=[], prefix="held_out")
+        self.calculate_and_log_auroc(out, "test")
+        loss = out["loss"]
+        self.log("test_loss", loss, on_step=False, on_epoch=True)
 
     def configure_optimizers(self):
-        """Configures optimizer and learning rate scheduler.
+        """Configures optimizer and learning rate scheduler."""
 
-        Currently this module uses the AdamW optimizer, with configurable weight_decay, with a learning rate
-        warming up from 0 on a per-step manner to the configurable `self.optimization_config.init_lr`, then
-        undergoes polynomial decay as specified via `self.optimization_config`.
-        """
+        if cfg.wandb_logger_kwargs.get("name", None):
+            if "do_log_graph" in cfg.wandb_logger_kwargs:
+                do_log_graph = cfg.wandb_logger_kwargs.pop("do_log_graph")
+            else:
+                do_log_graph = False
+
+            wandb_logger = WandbLogger(
+                **{k: v for k, v in cfg.wandb_logger_kwargs.items() if v is not None},
+                save_dir=cfg.save_dir,
+            )
+
+            if os.environ.get("LOCAL_RANK", "0") == "0":
+                if do_log_graph:
+                    wandb_logger.watch(LM, log="all", log_graph=True)
+
+                if cfg.wandb_experiment_config_kwargs:
+                    wandb_logger.experiment.config.update(cfg.wandb_experiment_config_kwargs)
+
+            trainer_kwargs["logger"] = wandb_logger
+                
         opt = torch.optim.AdamW(
             self.model.parameters(),
-            lr=self.optimization_config.init_lr,
-            weight_decay=self.optimization_config.weight_decay,
+            lr=self.optimization_config.init_lr,  # Use dot notation
+            weight_decay=self.optimization_config.weight_decay,  # Use dot notation
         )
-        scheduler = get_polynomial_decay_schedule_with_warmup(
-            optimizer=opt,
-            num_warmup_steps=self.optimization_config.lr_num_warmup_steps,
-            num_training_steps=self.optimization_config.max_training_steps,
-            power=self.optimization_config.lr_decay_power,
-            lr_end=self.optimization_config.end_lr,
-        )
-        return {
-            "optimizer": opt,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "interval": "step",
-            },
-        }
 
+        num_warmup_steps = self.optimization_config.lr_num_warmup_steps  # Use dot notation
+        num_training_steps = self.optimization_config.max_training_steps  # Use dot notation
+
+        if num_warmup_steps is None and num_training_steps is not None and hasattr(self.optimization_config, 'lr_frac_warmup_steps'):
+            num_warmup_steps = int(num_training_steps * self.optimization_config.lr_frac_warmup_steps)  # Use dot notation
+
+        if num_warmup_steps is not None and num_training_steps is not None:
+            scheduler = get_polynomial_decay_schedule_with_warmup(
+                optimizer=opt,
+                num_warmup_steps=num_warmup_steps,
+                num_training_steps=num_training_steps,
+                power=self.optimization_config.lr_decay_power,  # Use dot notation
+                lr_end=self.optimization_config.end_lr,  # Use dot notation
+            )
+        else:
+            scheduler = None
+
+        if scheduler is not None:
+            return {
+                "optimizer": opt,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "interval": "step",
+                },
+            }
+        else:
+            return {"optimizer": opt}
 
 @hydra_dataclass
 class FinetuneConfig:
     experiment_dir: str | Path | None = "${load_from_model_dir}/finetuning"
     load_from_model_dir: str | Path | None = omegaconf.MISSING
     task_df_name: str | None = omegaconf.MISSING
+    optimization_config_path: str = omegaconf.MISSING
+    pretrain_config_path: str | None = None
+    dataset_path: str | None = None
+    pretraining_metrics_config: dict[str, Any] | None = None
+    final_validation_metrics_config: dict[str, Any] | None = None
+    do_final_validation_metrics_config: dict[str, Any] | None = None
+    do_final_validation_on_metrics: dict[str, Any] | None = None
 
     pretrained_weights_fp: Path | str | None = "${load_from_model_dir}/pretrained_weights"
     save_dir: str | None = (
@@ -290,6 +325,7 @@ class FinetuneConfig:
             "team": None,
             "log_model": True,
             "do_log_graph": True,
+            "log_metrics": True,  # Add this line to enable metric logging
         }
     )
 
@@ -337,7 +373,7 @@ class FinetuneConfig:
     )
     do_use_filesystem_sharing: bool = True
 
-    def __post_init__(self):
+    def __post_init__(self, data_config_path: str = None):
         match self.save_dir:
             case str():
                 self.save_dir = Path(self.save_dir)
@@ -382,21 +418,7 @@ class FinetuneConfig:
                     f"{type(self.load_from_model_dir)}({self.load_from_model_dir})"
                 )
 
-        # Check if data_config is a dictionary
-        if isinstance(self.data_config, dict):
-            # Convert data_config to PytorchDatasetConfig
-            self.data_config = PytorchDatasetConfig(**self.data_config)
-
-        if (
-            self.data_config.train_subset_size != "FULL"
-            and self.data_config.train_subset_seed is None
-        ):
-            self.data_config.train_subset_seed = int(random.randint(1, int(1e6)))
-            print(
-                f"WARNING: train_subset_size={self.data_config.train_subset_size} but "
-                f"seed is unset. Setting to {self.data_config.train_subset_seed}"
-            )
-
+        reloaded_data_config = None
         if data_config_path:
             data_config_fp = Path(data_config_path)
             print(f"Loading data_config from {data_config_fp}")
@@ -408,21 +430,33 @@ class FinetuneConfig:
             if isinstance(self.data_config, dict):
                 # Convert data_config to PytorchDatasetConfig
                 self.data_config = PytorchDatasetConfig(**self.data_config)
+                reloaded_data_config = self.data_config
 
-        for param, val in self.data_config.to_dict().items():
-            if val is None:
-                continue
-            if param == "task_df_name":
-                if val != self.task_df_name:
-                    print(
-                        f"WARNING: task_df_name is set in data_config_overrides to {val}! "
-                        f"Original is {self.task_df_name}. Ignoring data_config..."
-                    )
-                continue
-            print(f"Overwriting {param} in data_config from {getattr(reloaded_data_config, param)} to {val}")
-            setattr(reloaded_data_config, param, val)
+        if (
+            self.data_config.train_subset_size != "FULL"
+            and self.data_config.train_subset_seed is None
+        ):
+            self.data_config.train_subset_seed = int(random.randint(1, int(1e6)))
+            print(
+                f"WARNING: train_subset_size={self.data_config.train_subset_size} but "
+                f"seed is unset. Setting to {self.data_config.train_subset_seed}"
+            )
 
-        self.data_config = reloaded_data_config
+        if reloaded_data_config:
+            for param, val in self.data_config.to_dict().items():
+                if val is None:
+                    continue
+                if param == "task_df_name":
+                    if val != self.task_df_name:
+                        print(
+                            f"WARNING: task_df_name is set in data_config_overrides to {val}! "
+                            f"Original is {self.task_df_name}. Ignoring data_config..."
+                        )
+                    continue
+                print(f"Overwriting {param} in data_config from {getattr(reloaded_data_config, param)} to {val}")
+                setattr(reloaded_data_config, param, val)
+
+            self.data_config = reloaded_data_config
 
         config_fp = self.load_from_model_dir / "config.json"
         print(f"Loading config from {config_fp}")
@@ -436,7 +470,13 @@ class FinetuneConfig:
 
         self.config = reloaded_config
 
-        reloaded_pretrain_config = OmegaConf.load(self.load_from_model_dir / "pretrain_config.yaml")
+        if self.pretrain_config_path:
+            pretrain_config_fp = Path(self.pretrain_config_path)
+            print(f"Loading pretrain_config from {pretrain_config_fp}")
+            reloaded_pretrain_config = OmegaConf.load(pretrain_config_fp)
+        else:
+            reloaded_pretrain_config = OmegaConf.load(self.load_from_model_dir / "pretrain_config.yaml")
+
         if self.wandb_logger_kwargs.get("project", None) is None:
             print(f"Setting wandb project to {reloaded_pretrain_config.wandb_logger_kwargs.project}")
             self.wandb_logger_kwargs["project"] = reloaded_pretrain_config.wandb_logger_kwargs.project
@@ -451,6 +491,13 @@ def train(cfg: FinetuneConfig):
             which you wish to fine-tune.
     """
 
+    # Add a custom callback to handle missing metrics
+    class HandleMissingMetricsCallback(Callback):
+        def on_validation_end(self, trainer, pl_module):
+            metrics = trainer.callback_metrics
+            if "tuning_loss" not in metrics:
+                metrics["tuning_loss"] = float("inf")
+
     L.seed_everything(cfg.seed)
     if cfg.do_use_filesystem_sharing:
         torch.multiprocessing.set_sharing_strategy("file_system")
@@ -462,9 +509,6 @@ def train(cfg: FinetuneConfig):
     data_config = cfg.data_config
     optimization_config = cfg.optimization_config
 
-    # config.set_to_dataset(train_pyd)
-    # optimization_config.set_to_dataset(train_pyd)
-
     if os.environ.get("LOCAL_RANK", "0") == "0":
         pathlib.Path(cfg.save_dir).mkdir(parents=True, exist_ok=True)
         print("Saving config files...")
@@ -475,10 +519,13 @@ def train(cfg: FinetuneConfig):
             print(f"Writing to {config_fp}")
             config.to_json_file(config_fp)
 
-        data_config.to_json_file(cfg.save_dir / "data_config.json", do_overwrite=cfg.do_overwrite)
-        optimization_config.to_json_file(
-            cfg.save_dir / "optimization_config.json", do_overwrite=cfg.do_overwrite
-        )
+        data_config_dict = cfg.data_config.to_dict()
+        with open(cfg.save_dir / "data_config.json", "w") as f:
+            json.dump(data_config_dict, f, indent=2)
+
+        optimization_config_dict = cfg.optimization_config
+        with open(cfg.save_dir / "optimization_config.json", "w") as f:
+            json.dump(optimization_config_dict, f, indent=2)
 
     # Model
     model_params = dict(config=config, optimization_config=optimization_config)
@@ -495,15 +542,15 @@ def train(cfg: FinetuneConfig):
     # Setting up torch dataloader
     train_dataloader = torch.utils.data.DataLoader(
         train_pyd,
-        batch_size=optimization_config.batch_size,
-        num_workers=optimization_config.num_dataloader_workers,
+        batch_size=optimization_config['batch_size'],  # Access 'batch_size' as a dictionary key
+        num_workers=optimization_config['num_dataloader_workers'],  # Access 'num_dataloader_workers' as a dictionary key
         collate_fn=train_pyd.collate,
         shuffle=True,
     )
     tuning_dataloader = torch.utils.data.DataLoader(
         tuning_pyd,
-        batch_size=optimization_config.validation_batch_size,
-        num_workers=optimization_config.num_dataloader_workers,
+        batch_size=optimization_config['validation_batch_size'],  # Access 'validation_batch_size' as a dictionary key
+        num_workers=optimization_config['num_dataloader_workers'],  # Access 'num_dataloader_workers' as a dictionary key
         collate_fn=tuning_pyd.collate,
         shuffle=False,
     )
@@ -517,21 +564,36 @@ def train(cfg: FinetuneConfig):
         mode="min",
         save_top_k=3,
     )
+
+    # Add a custom callback to handle metric comparison
+    class HandleMetricComparisonCallback(Callback):
+        def on_save_checkpoint(self, trainer, pl_module, checkpoint):
+            metrics = trainer.callback_metrics
+            if "tuning_loss" in metrics:
+                metrics["tuning_loss"] = torch.tensor(metrics["tuning_loss"])
+
     callbacks = [
         LearningRateMonitor(logging_interval="step"),
         checkpoint_callback,
+        HandleMetricComparisonCallback(),  # Add the custom callback
     ]
-    if optimization_config.patience is not None:
+
+    if 'patience' in optimization_config and optimization_config['patience'] is not None:
         callbacks.append(
-            EarlyStopping(monitor="tuning_loss", mode="min", patience=optimization_config.patience)
+            EarlyStopping(monitor="tuning_loss", mode="min", patience=optimization_config['patience'])
         )
+
+    if (optimization_config.get('gradient_accumulation') is not None) and (
+        optimization_config['gradient_accumulation'] > 1
+    ):
+        trainer_kwargs["accumulate_grad_batches"] = optimization_config['gradient_accumulation']
 
     checkpoints_dir = cfg.save_dir / "model_checkpoints"
     checkpoints_dir.mkdir(parents=False, exist_ok=True)
 
     trainer_kwargs = dict(
         **cfg.trainer_config,
-        max_epochs=optimization_config.max_epochs,
+        max_epochs=optimization_config['max_epochs'],  # Access 'max_epochs' as a dictionary key
         callbacks=callbacks,
     )
 
@@ -556,11 +618,6 @@ def train(cfg: FinetuneConfig):
 
         trainer_kwargs["logger"] = wandb_logger
 
-    if (optimization_config.gradient_accumulation is not None) and (
-        optimization_config.gradient_accumulation > 1
-    ):
-        trainer_kwargs["accumulate_grad_batches"] = optimization_config.gradient_accumulation
-
     trainer = L.Trainer(**trainer_kwargs)
     trainer.fit(model=LM, train_dataloaders=train_dataloader, val_dataloaders=tuning_dataloader)
 
@@ -574,6 +631,20 @@ def train(cfg: FinetuneConfig):
     )
     tuning_metrics = trainer.validate(model=LM, dataloaders=tuning_dataloader, ckpt_path="best")
     held_out_metrics = trainer.test(model=LM, dataloaders=held_out_dataloader, ckpt_path="best")
+
+    # Output predictions to file
+    output_dir = Path(cfg.save_dir) / "predictions"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Evaluate on tuning set
+    tuning_outputs = trainer.predict(model=LM, dataloaders=tuning_dataloader, ckpt_path="best")
+    with open(output_dir / "tuning_predictions.json", "w") as f:
+        json.dump(tuning_outputs, f)
+
+    # Evaluate on held-out set
+    held_out_outputs = trainer.predict(model=LM, dataloaders=held_out_dataloader, ckpt_path="best")
+    with open(output_dir / "held_out_predictions.json", "w") as f:
+        json.dump(held_out_outputs, f)
 
     if os.environ.get("LOCAL_RANK", "0") == "0":
         print("Saving final metrics...")

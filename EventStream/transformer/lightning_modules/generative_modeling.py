@@ -209,7 +209,13 @@ class ESTForGenerativeSequenceModelingLM(L.LightningModule):
         self.metrics = {
             "A1cGreaterThan7": torch.nn.ModuleDict({
                 "AUROC": BinaryAUROC(),
-            })
+            }),
+            "next_event_time": torch.nn.ModuleDict({
+                "MSE": MeanSquaredError(),
+            }),  
+            "next_event_measurements": torch.nn.ModuleDict({
+                "AUROC": MultilabelAUROC(num_labels=self.config.num_labels),
+            }),
         }
     
     def _log_metric_dict(
@@ -263,7 +269,35 @@ class ESTForGenerativeSequenceModelingLM(L.LightningModule):
             for loss_name, loss_value in results["losses"].items():
                 self.log(f"{split}_{loss_name}", loss_value, **log_kwargs)
 
-        # Log A1cGreaterThan7 classification metrics
+        if "next_event_time" in results["preds"]["regression"]:
+            preds = results["preds"]["regression"]["next_event_time"].squeeze()
+            labels = results["labels"]["regression"]["next_event_time"]
+
+            self._log_metric_dict(
+                preds=preds,
+                labels=labels,
+                metrics=self.metrics["next_event_time"],
+                measurement="next_event_time",
+                split=split,
+                cat=MetricCategories.MULTIVARIATE_REGRESSION,
+                metrics_config=metrics_config,
+            )
+
+        if "next_event_measurements" in results["preds"]["classification"]:
+            preds = results["preds"]["classification"]["next_event_measurements"].logits
+            labels = results["labels"]["classification"]["next_event_measurements"]
+
+            self._log_metric_dict(
+                preds=preds, 
+                labels=labels,
+                metrics=self.metrics["next_event_measurements"],
+                measurement="next_event_measurements",
+                split=split,
+                cat=MetricCategories.MULTI_LABEL_CLASSIFICATION,
+                metrics_config=metrics_config,
+            )
+            
+        # Modify the `log_metrics` method to handle missing labels
         if "classification" in results["preds"] and "A1cGreaterThan7" in results["preds"]["classification"]:
             _, sample_dist = results["preds"]["classification"]["A1cGreaterThan7"]
             if sample_dist is not None:
@@ -411,6 +445,7 @@ class PretrainConfig:
             "team": None,
             "log_model": True,
             "do_log_graph": True,
+            "log_metrics": True,  # Add this line to enable metric logging
         }
     )
     wandb_experiment_config_kwargs: dict[str, Any] = dataclasses.field(default_factory=dict)
@@ -532,26 +567,24 @@ def train(cfg: PretrainConfig, train_pyd: PytorchDataset, tuning_pyd: PytorchDat
         max_epochs=optimization_config.max_epochs,
         callbacks=callbacks,
     )
+    
     if cfg.wandb_logger_kwargs.get("name", None):
         if "do_log_graph" in cfg.wandb_logger_kwargs:
-            do_log_graph = cfg.wandb_logger_kwargs.get("do_log_graph", False)
+            do_log_graph = cfg.wandb_logger_kwargs.pop("do_log_graph")
         else:
             do_log_graph = False
 
-        serializable_config = {
-            k: v for k, v in cfg.wandb_experiment_config_kwargs.items()
-            if isinstance(v, (str, int, float, bool, type(None)))
-        }
         wandb_logger = WandbLogger(
             **{k: v for k, v in cfg.wandb_logger_kwargs.items() if v is not None},
-            save_dir=str(cfg.save_dir),  # Convert to string
-            config=serializable_config,
+            save_dir=cfg.save_dir,
         )
 
         if os.environ.get("LOCAL_RANK", "0") == "0":
             if do_log_graph:
-                # Watching the model naturally tracks parameter values and gradients.
                 wandb_logger.watch(LM, log="all", log_graph=True)
+
+            if cfg.wandb_experiment_config_kwargs:
+                wandb_logger.experiment.config.update(cfg.wandb_experiment_config_kwargs)
 
         trainer_kwargs["logger"] = wandb_logger
 
@@ -563,6 +596,20 @@ def train(cfg: PretrainConfig, train_pyd: PytorchDataset, tuning_pyd: PytorchDat
     # Fitting model
     trainer = L.Trainer(**trainer_kwargs, strategy='ddp_find_unused_parameters_true')
     trainer.fit(model=LM, train_dataloaders=train_dataloader, val_dataloaders=tuning_dataloader)
+
+    # Output predictions to file
+    output_dir = Path(cfg.save_dir) / "predictions"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Evaluate on tuning set
+    tuning_outputs = trainer.predict(model=LM, dataloaders=tuning_dataloader)
+    with open(output_dir / "tuning_predictions.json", "w") as f:
+        json.dump(tuning_outputs, f)
+
+    # Evaluate on held-out set
+    held_out_outputs = trainer.predict(model=LM, dataloaders=held_out_dataloader)
+    with open(output_dir / "held_out_predictions.json", "w") as f:
+        json.dump(held_out_outputs, f)
 
     LM.save_pretrained(cfg.save_dir)
 

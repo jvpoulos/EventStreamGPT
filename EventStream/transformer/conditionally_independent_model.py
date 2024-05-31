@@ -264,6 +264,10 @@ class CIPPTForGenerativeSequenceModeling(StructuredGenerationMixin, StructuredTr
         encoded = self.encoder(batch, **kwargs)
 
         output = self.output_layer(batch, encoded.last_hidden_state, is_generation=is_generation)
+        
+        # Add the next_event_time and next_event_measurements predictions
+        output["preds"]["regression"]["next_event_time"] = output["preds"]["regression"].get("next_event_time", None)
+        output["preds"]["classification"]["next_event_measurements"] = output["preds"]["classification"].get("next_event_measurements", None)
 
         # Set the 'A1cGreaterThan7' key to None in the output if it's not found
         if "A1cGreaterThan7" not in output["preds"]["classification"]:

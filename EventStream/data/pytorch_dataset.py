@@ -146,6 +146,9 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
 
         self.split = split
 
+        self.config.save_dir = Path(self.config.save_dir)
+
+        # Add this code in the `__init__` method
         if self.config.task_df_name is not None:
             task_dir = self.config.save_dir / "DL_reps" / "for_task" / config.task_df_name
             raw_task_df_fp = self.config.save_dir / "task_dfs" / f"{self.config.task_df_name}.parquet"
@@ -230,7 +233,7 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
                     f"{config.task_df_name}!"
                 )
         else:
-            self.cached_data = pl.scan_parquet(pathlib.Path("data") / "DL_reps" / f"{split}*.parquet")
+            self.cached_data = pl.scan_parquet(self.config.save_dir / "DL_reps" / f"{split}*.parquet")
             self.has_task = False
             self.tasks = None
             self.task_vocabs = None
@@ -265,13 +268,14 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
             .collect()
         )
 
-        if stats["min"].item() <= 0:
+        min_inter_event_time = stats["min"].item()
+        if min_inter_event_time is not None and min_inter_event_time <= 0:
             bad_inter_event_times = self.cached_data.filter(pl.col("time_delta").list.min() <= 0).collect()
             bad_subject_ids = [str(x) for x in list(bad_inter_event_times["subject_id"])]
             warning_strs = [
                 f"WARNING: Observed inter-event times <= 0 for {len(bad_inter_event_times)} subjects!",
                 f"ESD Subject IDs: {', '.join(bad_subject_ids)}",
-                f"Global min: {stats['min'].item()}",
+                f"Global min: {min_inter_event_time}",
             ]
             if self.config.save_dir is not None:
                 fp = self.config.save_dir / f"malformed_data_{self.split}.parquet"
@@ -702,6 +706,20 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
         if not self.has_task:
             return out_batch
 
+        print("Batch size:", len(batch))
+        print("Labels in the batch:")
+        for e in batch:
+            if "A1cGreaterThan7" in e:
+                print(e["A1cGreaterThan7"])
+            else:
+                print("Label missing")
+
+        # Modify the code in the `collate` function to handle missing labels
+        a1c_labels = [e["A1cGreaterThan7"] for e in batch if "A1cGreaterThan7" in e]
+        if not a1c_labels:
+            print("Warning: 'A1cGreaterThan7' labels missing in the batch")  
+        out_labels["A1cGreaterThan7"] = torch.LongTensor(a1c_labels) if a1c_labels else None
+                
         self._register_start("collate_task_labels")
         out_labels = {}
 
@@ -713,7 +731,8 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
                 if task in e:
                     out_labels[task].append(e[task])
                 else:
-                    out_labels[task].append(None)  # Set a default value if the task is missing
+                    print(f"Warning: Label for task '{task}' missing in batch element: {e}")
+                    out_labels[task].append(None)
 
             match task_type:
                 case "multi_class_classification":
@@ -725,10 +744,12 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
                 case _:
                     raise TypeError(f"Don't know how to tensorify task of type {task_type}!")
 
-        # Include the 'A1cGreaterThan7' labels in out_labels
+        # Include the 'A1cGreaterThan7' labels in out_labels                
         a1c_labels = [e["A1cGreaterThan7"] for e in batch if "A1cGreaterThan7" in e]
+        if not a1c_labels:
+            print("Warning: 'A1cGreaterThan7' labels missing in the batch")
         out_labels["A1cGreaterThan7"] = torch.LongTensor(a1c_labels) if a1c_labels else None
-
+        
         out_batch.stream_labels = out_labels
         self._register_end("collate_task_labels")
 

@@ -266,8 +266,11 @@ class PytorchBatch:
             raise KeyError(f"Key {item} not found")
         setattr(self, item, val)
 
-    def __eq__(self, other: "PytorchBatch") -> bool:
+    def __eq__(self, other: Any) -> bool:
         """Checks for equality between self and other."""
+        if not isinstance(other, PytorchBatch):
+            return False
+
         if self.keys() != other.keys():
             return False
 
