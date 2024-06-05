@@ -24,6 +24,7 @@ from torchmetrics.classification import (
     MultilabelAUROC,
     MultilabelAveragePrecision,
 )
+from torchmetrics import MeanSquaredError
 from transformers import get_polynomial_decay_schedule_with_warmup
 
 from ...data.config import PytorchDatasetConfig
@@ -506,6 +507,7 @@ def train(cfg: PretrainConfig, train_pyd: PytorchDataset, tuning_pyd: PytorchDat
                 json.dump(config_dict, f)
 
         data_config_dict = omegaconf.OmegaConf.to_container(data_config, resolve=True)
+        data_config_dict = {k: str(v) if isinstance(v, pathlib.PosixPath) else v for k, v in data_config_dict.items()}
         with open(pathlib.Path(cfg.save_dir) / "data_config.json", 'w') as f:
             json.dump(data_config_dict, f)
         optimization_config_dict = omegaconf.OmegaConf.to_container(optimization_config, resolve=True)

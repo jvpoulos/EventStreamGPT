@@ -53,8 +53,10 @@ class ESTForStreamClassificationLM(L.LightningModule):
         self,
         config: StructuredTransformerConfig | dict[str, Any],
         optimization_config: OptimizationConfig | dict[str, Any],
+        cfg,
         pretrained_weights_fp: Path | str | None = None,
         do_debug_mode: bool = True,
+        **model_params
     ):
         """Initializes the Lightning Module.
 
@@ -71,6 +73,7 @@ class ESTForStreamClassificationLM(L.LightningModule):
         """
         super().__init__()
 
+
         # If the configurations are dictionaries, convert them to class objects. They may be passed as
         # dictionaries when the lightning module is loaded from a checkpoint, so we need to support
         # this functionality.
@@ -81,6 +84,7 @@ class ESTForStreamClassificationLM(L.LightningModule):
 
         self.config = config
         self.optimization_config = optimization_config
+        self.cfg = cfg  # Assign the passed `cfg` instance to the instance attribute
         self.do_debug_mode = do_debug_mode
 
         self.save_hyperparameters(
@@ -243,45 +247,47 @@ class ESTForStreamClassificationLM(L.LightningModule):
     def configure_optimizers(self):
         """Configures optimizer and learning rate scheduler."""
 
-        if cfg.wandb_logger_kwargs.get("name", None):
-            if "do_log_graph" in cfg.wandb_logger_kwargs:
-                do_log_graph = cfg.wandb_logger_kwargs.pop("do_log_graph")
+        trainer_kwargs = {}  # Initialize an empty dictionary
+
+        if self.cfg.wandb_logger_kwargs.get("name", None):
+            if "do_log_graph" in self.cfg.wandb_logger_kwargs:
+                do_log_graph = self.cfg.wandb_logger_kwargs.pop("do_log_graph")
             else:
                 do_log_graph = False
 
             wandb_logger = WandbLogger(
-                **{k: v for k, v in cfg.wandb_logger_kwargs.items() if v is not None},
-                save_dir=cfg.save_dir,
+                **{k: v for k, v in self.cfg.wandb_logger_kwargs.items() if v is not None},
+                save_dir=self.cfg.save_dir,
             )
 
             if os.environ.get("LOCAL_RANK", "0") == "0":
                 if do_log_graph:
-                    wandb_logger.watch(LM, log="all", log_graph=True)
+                    wandb_logger.watch(self, log="all", log_graph=True)
 
-                if cfg.wandb_experiment_config_kwargs:
-                    wandb_logger.experiment.config.update(cfg.wandb_experiment_config_kwargs)
+                if self.cfg.wandb_experiment_config_kwargs:
+                    wandb_logger.experiment.config.update(self.cfg.wandb_experiment_config_kwargs)
 
             trainer_kwargs["logger"] = wandb_logger
-                
+
         opt = torch.optim.AdamW(
             self.model.parameters(),
-            lr=self.optimization_config.init_lr,  # Use dot notation
-            weight_decay=self.optimization_config.weight_decay,  # Use dot notation
+            lr=self.optimization_config.init_lr,
+            weight_decay=self.optimization_config.weight_decay,
         )
 
-        num_warmup_steps = self.optimization_config.lr_num_warmup_steps  # Use dot notation
-        num_training_steps = self.optimization_config.max_training_steps  # Use dot notation
+        num_warmup_steps = self.optimization_config.lr_num_warmup_steps
+        num_training_steps = self.optimization_config.max_training_steps
 
         if num_warmup_steps is None and num_training_steps is not None and hasattr(self.optimization_config, 'lr_frac_warmup_steps'):
-            num_warmup_steps = int(num_training_steps * self.optimization_config.lr_frac_warmup_steps)  # Use dot notation
+            num_warmup_steps = int(num_training_steps * self.optimization_config.lr_frac_warmup_steps)
 
         if num_warmup_steps is not None and num_training_steps is not None:
             scheduler = get_polynomial_decay_schedule_with_warmup(
                 optimizer=opt,
                 num_warmup_steps=num_warmup_steps,
                 num_training_steps=num_training_steps,
-                power=self.optimization_config.lr_decay_power,  # Use dot notation
-                lr_end=self.optimization_config.end_lr,  # Use dot notation
+                power=self.optimization_config.lr_decay_power,
+                lr_end=self.optimization_config.end_lr,
             )
         else:
             scheduler = None
@@ -308,9 +314,9 @@ class FinetuneConfig:
     pretraining_metrics_config: dict[str, Any] | None = None
     final_validation_metrics_config: dict[str, Any] | None = None
     do_final_validation_metrics_config: dict[str, Any] | None = None
-    do_final_validation_on_metrics: dict[str, Any] | None = None
+    do_final_validation_on_metrics: bool = False
+    pretrained_weights_fp: Path | str | None = "skip"
 
-    pretrained_weights_fp: Path | str | None = "${load_from_model_dir}/pretrained_weights"
     save_dir: str | None = (
         "${experiment_dir}/${task_df_name}/"
         "subset_size_${data_config.train_subset_size}/"
@@ -325,7 +331,6 @@ class FinetuneConfig:
             "team": None,
             "log_model": True,
             "do_log_graph": True,
-            "log_metrics": True,  # Add this line to enable metric logging
         }
     )
 
@@ -357,6 +362,7 @@ class FinetuneConfig:
             "task_df_name": "${task_df_name}",
             "train_subset_size": "FULL",
             "train_subset_seed": 1,
+            "dl_reps_dir": None,
         }
     )
 
@@ -393,6 +399,11 @@ class FinetuneConfig:
             self.config = StructuredTransformerConfig(
                 **{k: v for k, v in self.config.items() if v is not None}
             )
+            
+            # Remove the 'dl_reps_dir' key from the data_config dictionary
+            if 'dl_reps_dir' in self.data_config:
+                del self.data_config['dl_reps_dir']
+            
             self.data_config = PytorchDatasetConfig(**self.data_config)
             return
 
@@ -428,35 +439,16 @@ class FinetuneConfig:
         else:
             # Check if data_config is a dictionary
             if isinstance(self.data_config, dict):
+                # Remove the 'dl_reps_dir' key from the data_config dictionary
+                dl_reps_dir = self.data_config.pop('dl_reps_dir', None)
+                
                 # Convert data_config to PytorchDatasetConfig
                 self.data_config = PytorchDatasetConfig(**self.data_config)
+                
+                # Set the dl_reps_dir attribute
+                self.data_config.dl_reps_dir = dl_reps_dir
+                
                 reloaded_data_config = self.data_config
-
-        if (
-            self.data_config.train_subset_size != "FULL"
-            and self.data_config.train_subset_seed is None
-        ):
-            self.data_config.train_subset_seed = int(random.randint(1, int(1e6)))
-            print(
-                f"WARNING: train_subset_size={self.data_config.train_subset_size} but "
-                f"seed is unset. Setting to {self.data_config.train_subset_seed}"
-            )
-
-        if reloaded_data_config:
-            for param, val in self.data_config.to_dict().items():
-                if val is None:
-                    continue
-                if param == "task_df_name":
-                    if val != self.task_df_name:
-                        print(
-                            f"WARNING: task_df_name is set in data_config_overrides to {val}! "
-                            f"Original is {self.task_df_name}. Ignoring data_config..."
-                        )
-                    continue
-                print(f"Overwriting {param} in data_config from {getattr(reloaded_data_config, param)} to {val}")
-                setattr(reloaded_data_config, param, val)
-
-            self.data_config = reloaded_data_config
 
         config_fp = self.load_from_model_dir / "config.json"
         print(f"Loading config from {config_fp}")
@@ -485,12 +477,10 @@ class FinetuneConfig:
 @task_wrapper
 def train(cfg: FinetuneConfig):
     """Runs the end to end training procedure for the fine-tuning model.
-
     Args:
         cfg: The fine-tuning configuration object specifying the cohort and task for which and model from
             which you wish to fine-tune.
     """
-
     # Add a custom callback to handle missing metrics
     class HandleMissingMetricsCallback(Callback):
         def on_validation_end(self, trainer, pl_module):
@@ -502,8 +492,17 @@ def train(cfg: FinetuneConfig):
     if cfg.do_use_filesystem_sharing:
         torch.multiprocessing.set_sharing_strategy("file_system")
 
-    train_pyd = PytorchDataset(cfg.data_config, split="train")
-    tuning_pyd = PytorchDataset(cfg.data_config, split="tuning")
+    train_pyd = PytorchDataset(cfg.data_config, split="train", dl_reps_dir=Path("data/DL_reps"))
+    tuning_pyd = PytorchDataset(cfg.data_config, split="tuning", dl_reps_dir=Path("data/DL_reps"))
+
+    # Check if the train and tuning datasets are empty
+    if len(train_pyd) == 0 or len(tuning_pyd) == 0:
+        print("Train dataset length:", len(train_pyd))
+        print("Tuning dataset length:", len(tuning_pyd))
+        print("Data config:", cfg.data_config)
+        print("Cached data in train dataset:", train_pyd.cached_data)
+        print("Cached data in tuning dataset:", tuning_pyd.cached_data)
+        raise ValueError("Train or tuning dataset is empty. Please check your data.")
 
     config = cfg.config
     data_config = cfg.data_config
@@ -527,12 +526,18 @@ def train(cfg: FinetuneConfig):
         with open(cfg.save_dir / "optimization_config.json", "w") as f:
             json.dump(optimization_config_dict, f, indent=2)
 
-    # Model
-    model_params = dict(config=config, optimization_config=optimization_config)
+    # Check if the problem_type is None or an empty string
+    if not config.problem_type:
+        # Set the problem_type based on your problem
+        config.problem_type = 'single_label_classification'
+        # Or, you can set it based on the task_df_name or any other condition
+
+     # Model
+    model_params = dict()
     if cfg.pretrained_weights_fp is not None:
         model_params["pretrained_weights_fp"] = cfg.pretrained_weights_fp
 
-    LM = ESTForStreamClassificationLM(**model_params)
+    LM = ESTForStreamClassificationLM(config, optimization_config, cfg, **model_params)
 
     # TODO(mmd): Get this working!
     # if cfg.compile:
@@ -583,6 +588,12 @@ def train(cfg: FinetuneConfig):
             EarlyStopping(monitor="tuning_loss", mode="min", patience=optimization_config['patience'])
         )
 
+    trainer_kwargs = dict(
+        **cfg.trainer_config,
+        max_epochs=optimization_config['max_epochs'],
+        callbacks=callbacks,
+    )
+
     if (optimization_config.get('gradient_accumulation') is not None) and (
         optimization_config['gradient_accumulation'] > 1
     ):
@@ -590,12 +601,6 @@ def train(cfg: FinetuneConfig):
 
     checkpoints_dir = cfg.save_dir / "model_checkpoints"
     checkpoints_dir.mkdir(parents=False, exist_ok=True)
-
-    trainer_kwargs = dict(
-        **cfg.trainer_config,
-        max_epochs=optimization_config['max_epochs'],  # Access 'max_epochs' as a dictionary key
-        callbacks=callbacks,
-    )
 
     if cfg.wandb_logger_kwargs.get("name", None):
         if "do_log_graph" in cfg.wandb_logger_kwargs:
@@ -655,3 +660,5 @@ def train(cfg: FinetuneConfig):
             json.dump(held_out_metrics, f)
 
     return tuning_metrics[0]["tuning_loss"], tuning_metrics, held_out_metrics
+
+__all__ = ['FinetuneConfig', 'train']

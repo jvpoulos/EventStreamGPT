@@ -477,6 +477,7 @@ class StructuredTransformerConfig(PretrainedConfig):
     def __init__(
         self,
         # Data configuration
+        num_labels: int | None = None,
         problem_type: str = "single_label_classification",
         vocab_sizes_by_measurement: dict[str, int] | None = None,
         vocab_offsets_by_measurement: dict[str, int] | None = None,
@@ -565,6 +566,23 @@ class StructuredTransformerConfig(PretrainedConfig):
                 do_full_block_in_dep_graph_attention = None
             if dep_graph_window_size is not None:
                 dep_graph_window_size = None
+
+        # Remove num_labels from kwargs if it's None
+        if num_labels is None:
+            kwargs.pop("num_labels", None)
+        else:
+            kwargs["num_labels"] = num_labels
+
+        # Call the parent constructor with the updated kwargs
+        super().__init__(**kwargs)
+
+        # Initialize id2label and label2id based on the value of num_labels
+        if num_labels is None:
+            self.id2label = None
+            self.label2id = None
+        else:
+            self.id2label = {i: f"LABEL_{i}" for i in range(num_labels)}
+            self.label2id = {label: i for i, label in self.id2label.items()}
 
         if do_split_embeddings:
             if not type(categorical_embedding_dim) is int and categorical_embedding_dim > 0:

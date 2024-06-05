@@ -92,9 +92,13 @@ class Query:
 INPUT_DF_T = Union[Path, pd.DataFrame, pl.DataFrame, Query]
 
 class Dataset(DatasetBase):
-    def __init__(self, config: DatasetConfig, **kwargs):
-        self.config = config
-        super().__init__(config, **kwargs)
+    def __init__(self, config=None, subjects_df=None, events_df=None, dynamic_measurements_df=None, **kwargs):
+        if config is None:
+            config = DatasetConfig()
+            super().__init__(config, **kwargs)
+        else:
+            self.config = config
+            super().__init__(config, subjects_df, events_df, dynamic_measurements_df, **kwargs)
     """The polars specific implementation of the dataset.
 
     Args:
@@ -623,10 +627,6 @@ class Dataset(DatasetBase):
                     source_df = source_df.with_columns(pl.col(val_col).cast(pl.Float64))
                 else:
                     source_df = source_df.with_columns(pl.col(val_col).cast(pl.Float64))
-
-        # Special case for A1cGreaterThan7 column
-        if "A1cGreaterThan7" in source_df.columns and source_df["A1cGreaterThan7"].dtype != pl.Categorical:
-            source_df = source_df.with_columns(pl.col("A1cGreaterThan7").cast(pl.Utf8).cast(pl.Categorical))
 
         return source_df, id_col_dt
 
@@ -1576,15 +1576,6 @@ class Dataset(DatasetBase):
             subjects_df = self._filter_col_inclusion(self.subjects_df, {"subject_id": subject_ids})
         else:
             subjects_df = self.subjects_df
-
-        # Add this code to ensure the 'A1cGreaterThan7' column is present
-        if 'A1cGreaterThan7' not in subjects_df.columns:
-            subjects_df = subjects_df.with_columns(pl.lit(None).alias('A1cGreaterThan7'))
-
-        # Convert the 'A1cGreaterThan7' column to numerical representation
-        subjects_df = subjects_df.with_columns(
-            pl.col("A1cGreaterThan7").map_dict({"1.0": 1, "0.0": 0, None: None}, return_dtype=pl.UInt8).alias("A1cGreaterThan7")
-        )
 
         static_data = subjects_df.select(
             "subject_id",

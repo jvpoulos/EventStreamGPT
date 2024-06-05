@@ -298,3 +298,28 @@ class DatasetConfig(JSONableMixin):
     def __eq__(self, other: DatasetConfig) -> bool:
         """Returns true if self and other are equal."""
         return self.to_dict() == other.to_dict()
+
+    @classmethod
+    def load(cls, load_dir: Path, do_pickle_config: bool = True) -> "DatasetBase":
+        attrs_fp = load_dir / "E.pkl"
+
+        if attrs_fp.stat().st_size == 0:
+            raise ValueError(f"The attributes file {attrs_fp} is empty.")
+
+        DatasetConfig = get_dataset_config()
+        reloaded_config = None
+        attrs_to_add = {}
+
+        if do_pickle_config:
+            with open(load_dir / "config.json") as f:
+                config_dict = json.load(f)
+                attrs_to_add["config"] = DatasetConfig.from_dict(config_dict)
+        else:
+            reloaded_config = DatasetConfig.from_json_file(load_dir / "config.json")
+            if reloaded_config.save_dir != load_dir:
+                print(f"Updating config.save_dir from {reloaded_config.save_dir} to {load_dir}")
+                reloaded_config.save_dir = load_dir
+            attrs_to_add["config"] = reloaded_config
+
+
+        return super()._load(attrs_fp, **attrs_to_add)

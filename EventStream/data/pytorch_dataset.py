@@ -2,11 +2,13 @@ import json
 from collections import defaultdict
 from pathlib import Path
 import pathlib
+import traceback
 
 import numpy as np
 import polars as pl
 import torch
 from mixins import SaveableMixin, SeedableMixin, TimeableMixin
+from EventStream.data.dataset_config import DatasetConfig
 
 from .config import (
     MeasurementConfig,
@@ -16,6 +18,11 @@ from .config import (
     VocabularyConfig,
 )
 from .types import PytorchBatch
+
+try:
+    from pyo3 import PanicException
+except ImportError:
+    PanicException = Exception
 
 DATA_ITEM_T = dict[str, list[float]]
 
@@ -127,7 +134,7 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
 
         raise TypeError(f"Can't process label of {dtype} type!")
 
-    def __init__(self, config: PytorchDatasetConfig, split: str):
+    def __init__(self, config: DatasetConfig, split: str, dl_reps_dir: str = None):
         super().__init__()
 
         self.config = config
@@ -146,12 +153,56 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
 
         self.split = split
 
+        self.dl_reps_dir = Path(dl_reps_dir) if dl_reps_dir else None
+
         self.config.save_dir = Path(self.config.save_dir)
 
-        # Add this code in the `__init__` method
+        if self.dl_reps_dir:
+            parquet_files = list(self.dl_reps_dir.glob(f"{split}*.parquet"))
+            if parquet_files:
+                print(f"Loading parquet files for split '{split}': {parquet_files}")
+                self.cached_data = pl.scan_parquet(self.dl_reps_dir / f"{split}*.parquet")
+                self.cached_data = self.cached_data.with_columns([
+                    pl.col(col_name).cast(pl.Int64)
+                    if col_name.endswith("_id") or col_name.endswith("_ids")
+                    else pl.col(col_name)
+                    for col_name in self.cached_data.columns
+                ])
+            else:
+                print(f"No parquet files found for split '{split}'")
+                self.cached_data = pl.DataFrame()
+        else:
+            self.cached_data = pl.DataFrame()
+
+        if isinstance(self.cached_data, pl.LazyFrame):
+            if "dynamic_indices" in self.cached_data.columns:
+                length_constraint = pl.col("dynamic_indices").list.lengths() >= config.min_seq_len
+                self.cached_data = self.cached_data.filter(length_constraint)
+            
+            if "subject_id" in self.cached_data.columns:
+                self.subject_ids = self.cached_data.select("subject_id").collect().to_series().to_list()
+                self.cached_data = self.cached_data.drop("subject_id")
+            else:
+                self.subject_ids = None
+            self.columns = self.cached_data.columns
+            self.cached_data = self.cached_data.collect().to_numpy()
+        
+        elif isinstance(self.cached_data, pl.DataFrame):
+            if not self.cached_data.is_empty() and "dynamic_indices" in self.cached_data.columns:
+                length_constraint = pl.col("dynamic_indices").list.lengths() >= config.min_seq_len
+                self.cached_data = self.cached_data.filter(length_constraint)
+            
+            if "subject_id" in self.cached_data.columns:
+                self.subject_ids = self.cached_data.select("subject_id").to_list()
+                self.cached_data = self.cached_data.drop("subject_id")
+            else:
+                self.subject_ids = None
+            self.columns = self.cached_data.columns
+            self.cached_data = self.cached_data.to_numpy()
+
         if self.config.task_df_name is not None:
             task_dir = self.config.save_dir / "DL_reps" / "for_task" / config.task_df_name
-            raw_task_df_fp = self.config.save_dir / "task_dfs" / f"{self.config.task_df_name}.parquet"
+            raw_task_df_fp = self.dl_reps_dir / f"{self.config.task_df_name}.parquet" if self.dl_reps_dir else None
             task_info_fp = task_dir / "task_info.json"
 
             self.has_task = True
@@ -214,7 +265,7 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
 
                 if self.split != "train":
                     print(f"WARNING: Constructing task-specific dataset on non-train split {self.split}!")
-                for cached_data_fp in Path(self.config.save_dir / "DL_reps").glob(f"{split}*.parquet"):
+                for cached_data_fp in Path(self.dl_reps_dir).glob(f"{split}*.parquet"):
                     task_df_fp = task_dir / cached_data_fp.name
                     if task_df_fp.is_file():
                         continue
@@ -233,7 +284,7 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
                     f"{config.task_df_name}!"
                 )
         else:
-            self.cached_data = pl.scan_parquet(self.config.save_dir / "DL_reps" / f"{split}*.parquet")
+            self.cached_data = pl.scan_parquet(self.dl_reps_dir / f"{split}*.parquet") if self.dl_reps_dir else pl.DataFrame()
             self.has_task = False
             self.tasks = None
             self.task_vocabs = None
@@ -242,75 +293,67 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
         self.seq_padding_side = config.seq_padding_side
         self.max_seq_len = config.max_seq_len
 
-        length_constraint = pl.col("dynamic_indices").list.lengths() >= config.min_seq_len
-        self.cached_data = self.cached_data.filter(length_constraint)
-
         if "time_delta" not in self.cached_data.columns:
-            self.cached_data = self.cached_data.with_columns(
-                (pl.col("start_time") + pl.duration(minutes=pl.col("time").list.first())).alias("start_time"),
-                pl.col("time")
-                .list.eval(
-                    # We fill with 1 here as it will be ignored in the code anyways as the next event's
-                    # event mask will be null.
-                    # TODO(mmd): validate this in a test.
-                    (pl.col("").shift(-1) - pl.col("")).fill_null(1)
-                )
-                .alias("time_delta"),
-            ).drop("time")
-
-        stats = (
-            self.cached_data.select(pl.col("time_delta").explode().drop_nulls().alias("inter_event_time"))
-            .select(
-                pl.col("inter_event_time").min().alias("min"),
-                pl.col("inter_event_time").log().mean().alias("mean_log"),
-                pl.col("inter_event_time").log().std().alias("std_log"),
-            )
-            .collect()
-        )
-
-        min_inter_event_time = stats["min"].item()
-        if min_inter_event_time is not None and min_inter_event_time <= 0:
-            bad_inter_event_times = self.cached_data.filter(pl.col("time_delta").list.min() <= 0).collect()
-            bad_subject_ids = [str(x) for x in list(bad_inter_event_times["subject_id"])]
-            warning_strs = [
-                f"WARNING: Observed inter-event times <= 0 for {len(bad_inter_event_times)} subjects!",
-                f"ESD Subject IDs: {', '.join(bad_subject_ids)}",
-                f"Global min: {min_inter_event_time}",
-            ]
-            if self.config.save_dir is not None:
-                fp = self.config.save_dir / f"malformed_data_{self.split}.parquet"
-                bad_inter_event_times.write_parquet(fp)
-                warning_strs.append(f"Wrote malformed data records to {fp}")
-            warning_strs.append("Removing malformed subjects")
-
-            print("\n".join(warning_strs))
-
-            self.cached_data = self.cached_data.filter(pl.col("time_delta").list.min() > 0)
-
-        self.mean_log_inter_event_time_min = stats["mean_log"].item()
-        self.std_log_inter_event_time_min = stats["std_log"].item()
-
-        self.cached_data = self.cached_data.collect()
-
-        if self.config.train_subset_size not in (None, "FULL") and self.split == "train":
-            match self.config.train_subset_size:
-                case int() as n if n > 0:
-                    kwargs = {"n": n}
-                case float() as frac if 0 < frac < 1:
-                    kwargs = {"fraction": frac}
-                case _:
-                    raise TypeError(
-                        f"Can't process subset size of {type(self.config.train_subset_size)}, "
-                        f"{self.config.train_subset_size}"
+            if "start_time" in self.cached_data.columns and "time" in self.cached_data.columns:
+                self.cached_data = self.cached_data.with_columns(
+                    (pl.col("start_time") + pl.duration(minutes=pl.col("time").list.first())).alias("start_time"),
+                    pl.col("time")
+                    .list.eval(
+                        # We fill with 1 here as it will be ignored in the code anyways as the next event's
+                        # event mask will be null.
+                        # TODO(mmd): validate this in a test.
+                        (pl.col("").shift(-1) - pl.col("")).fill_null(1)
                     )
+                    .alias("time_delta"),
+                ).drop("time")
+            else:
+                print("Warning: 'start_time' or 'time' column not found in self.cached_data. Skipping 'time_delta' calculation.")
 
-            self.cached_data = self.cached_data.sample(seed=self.config.train_subset_seed, **kwargs)
+        if "time_delta" in self.cached_data.columns:
+            stats = (
+                self.cached_data.select(pl.col("time_delta").explode().drop_nulls().alias("inter_event_time"))
+                .select(
+                    pl.col("inter_event_time").min().alias("min"),
+                    pl.col("inter_event_time").log().mean().alias("mean_log"),
+                    pl.col("inter_event_time").log().std().alias("std_log"),
+                )
+                .collect()
+            )
+
+            min_inter_event_time = stats["min"].item()
+            if min_inter_event_time is not None and min_inter_event_time <= 0:
+                bad_inter_event_times = self.cached_data.filter(pl.col("time_delta").list.min() <= 0).collect()
+                bad_subject_ids = [str(x) for x in list(bad_inter_event_times["subject_id"])]
+                warning_strs = [
+                    f"WARNING: Observed inter-event times <= 0 for {len(bad_inter_event_times)} subjects!",
+                    f"ESD Subject IDs: {', '.join(bad_subject_ids)}",
+                    f"Global min: {min_inter_event_time}",
+                ]
+                if self.config.save_dir is not None:
+                    fp = self.config.save_dir / f"malformed_data_{self.split}.parquet"
+                    bad_inter_event_times.write_parquet(fp)
+                    warning_strs.append(f"Wrote malformed data records to {fp}")
+                warning_strs.append("Removing malformed subjects")
+
+                print("\n".join(warning_strs))
+
+                self.cached_data = self.cached_data.filter(pl.col("time_delta").list.min() > 0)
+
+            self.mean_log_inter_event_time_min = stats["mean_log"].item()
+            self.std_log_inter_event_time_min = stats["std_log"].item()
+        else:
+            print("Warning: 'time_delta' column not found in self.cached_data. Skipping inter-event time statistics calculation.")
+            self.mean_log_inter_event_time_min = None
+            self.std_log_inter_event_time_min = None
 
         with self._time_as("convert_to_rows"):
-            self.subject_ids = self.cached_data["subject_id"].to_list()
-            self.cached_data = self.cached_data.drop("subject_id")
+            if "subject_id" in self.cached_data.columns:
+                self.subject_ids = self.cached_data.select("subject_id").collect().to_series().to_list()
+                self.cached_data = self.cached_data.drop("subject_id")
+            else:
+                self.subject_ids = None
             self.columns = self.cached_data.columns
-            self.cached_data = self.cached_data.rows()
+            self.cached_data = self.cached_data.collect().to_numpy()
 
     @staticmethod
     def _build_task_cached_df(task_df: pl.LazyFrame, cached_data: pl.LazyFrame) -> pl.LazyFrame:
@@ -477,55 +520,72 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
     @SeedableMixin.WithSeed
     @TimeableMixin.TimeAs
     def _seeded_getitem(self, idx: int) -> dict[str, list]:
-        """Returns a dictionary corresponding to a single subject's data."""
-        full_subj_data = {c: v for c, v in zip(self.columns, self.cached_data[idx])}
-        for k in ["static_indices", "static_measurement_indices"]:
-            if full_subj_data[k] is None:
-                full_subj_data[k] = []
-        if self.config.do_include_subject_id:
-            full_subj_data["subject_id"] = self.subject_ids[idx]
-        if self.config.do_include_start_time_min:
-            full_subj_data["start_time"] = full_subj_data["start_time"].timestamp() / 60.0
-        else:
-            full_subj_data.pop("start_time")
+        """Returns a Returns a dictionary corresponding to a single subject's data.
 
-        # Ensure the 'A1cGreaterThan7' label is included
-        if "A1cGreaterThan7" not in full_subj_data:
-            full_subj_data["A1cGreaterThan7"] = None  # Set a default value if the key is missing
+        This function is automatically seeded for robustness. See `__getitem__` for a description of the
+        output format.
+        """
+        try:
+            full_subj_data = {c: v for c, v in zip(self.columns, self.cached_data[idx])}
+            for k in ["static_indices", "static_measurement_indices"]:
+                if full_subj_data.get(k) is None:
+                    full_subj_data[k] = []
+            if self.config.do_include_subject_id:
+                full_subj_data["subject_id"] = self.subject_ids[idx]
+            if self.config.do_include_start_time_min:
+                # Note that this is using the python datetime module's `timestamp` function which differs from
+                # some dataframe libraries' timestamp functions (e.g., polars).
+                full_subj_data["start_time"] = full_subj_data["start_time"].timestamp() / 60.0
+            else:
+                full_subj_data.pop("start_time", None)
 
-        seq_len = len(full_subj_data["time_delta"])
-        if seq_len > self.max_seq_len:
-            with self._time_as("truncate_to_max_seq_len"):
-                match self.config.subsequence_sampling_strategy:
-                    case SubsequenceSamplingStrategy.RANDOM:
-                        start_idx = np.random.choice(seq_len - self.max_seq_len)
-                    case SubsequenceSamplingStrategy.TO_END:
-                        start_idx = seq_len - self.max_seq_len
-                    case SubsequenceSamplingStrategy.FROM_START:
-                        start_idx = 0
-                    case _:
-                        raise ValueError(
-                            f"Invalid sampling strategy: {self.config.subsequence_sampling_strategy}!"
-                        )
+            # If "time_delta" is not present in the data, set it to an empty list
+            if "time_delta" not in full_subj_data:
+                full_subj_data["time_delta"] = []
 
-                if self.config.do_include_start_time_min:
-                    full_subj_data["start_time"] += sum(full_subj_data["time_delta"][:start_idx])
-                if self.config.do_include_subsequence_indices:
-                    full_subj_data["start_idx"] = start_idx
-                    full_subj_data["end_idx"] = start_idx + self.max_seq_len
+            # If we need to truncate to `self.max_seq_len`, grab a random full-size span to capture that.
+            # TODO(mmd): This will proportionally underweight the front and back ends of the subjects data
+            # relative to the middle, as there are fewer full length sequences containing those elements.
+            seq_len = len(full_subj_data["time_delta"])
+            if seq_len > self.max_seq_len:
+                with self._time_as("truncate_to_max_seq_len"):
+                    match self.config.subsequence_sampling_strategy:
+                        case SubsequenceSamplingStrategy.RANDOM:
+                            start_idx = np.random.choice(seq_len - self.max_seq_len)
+                        case SubsequenceSamplingStrategy.TO_END:
+                            start_idx = seq_len - self.max_seq_len
+                        case SubsequenceSamplingStrategy.FROM_START:
+                            start_idx = 0
+                        case _:
+                            raise ValueError(
+                                f"Invalid sampling strategy: {self.config.subsequence_sampling_strategy}!"
+                            )
 
-                for k in (
-                    "time_delta",
-                    "dynamic_indices",
-                    "dynamic_values",
-                    "dynamic_measurement_indices",
-                ):
-                    full_subj_data[k] = full_subj_data[k][start_idx : start_idx + self.max_seq_len]
-        elif self.config.do_include_subsequence_indices:
-            full_subj_data["start_idx"] = 0
-            full_subj_data["end_idx"] = seq_len
+                    if self.config.do_include_start_time_min:
+                        full_subj_data["start_time"] += sum(full_subj_data["time_delta"][:start_idx])
+                    if self.config.do_include_subsequence_indices:
+                        full_subj_data["start_idx"] = start_idx
+                        full_subj_data["end_idx"] = start_idx + self.max_seq_len
 
-        return full_subj_data
+                    for k in (
+                        "time_delta",
+                        "dynamic_indices",
+                        "dynamic_values",
+                        "dynamic_measurement_indices",
+                    ):
+                        if k in full_subj_data:
+                            full_subj_data[k] = full_subj_data[k][start_idx : start_idx + self.max_seq_len]
+            elif self.config.do_include_subsequence_indices:
+                full_subj_data["start_idx"] = 0
+                full_subj_data["end_idx"] = seq_len
+
+            return full_subj_data
+
+        except (IndexError, KeyError) as e:
+            print(f"Error accessing cached data at index {idx}: {str(e)}")
+            print("Cached data length:", len(self.cached_data))
+            print("Cached data:", self.cached_data)
+            raise e
 
     def __static_and_dynamic_collate(self, batch: list[DATA_ITEM_T]) -> PytorchBatch:
         """An internal collate function for both static and dynamic data."""

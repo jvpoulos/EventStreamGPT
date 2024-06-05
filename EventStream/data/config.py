@@ -189,6 +189,7 @@ class PytorchDatasetConfig(DataConfig):
     save_dir: Path = MISSING
     dataset = MISSING 
     dataset_path: Path = MISSING
+    dl_reps_dir: str | None = None
 
     max_seq_len: int = 256
     min_seq_len: int = 2

@@ -456,7 +456,12 @@ class DatasetBase(
         else:
             attrs_to_add["inferred_measurement_configs"] = {}
 
-        return super()._load(attrs_fp, **attrs_to_add)
+        loaded_object = super()._load(attrs_fp, **attrs_to_add)
+
+        if isinstance(loaded_object, dict):
+            raise ValueError("Loaded object is a dictionary. Expected a Dataset instance.")
+
+        return loaded_object
 
     def save(self, **kwargs):
         """Saves the calling object to disk, in the directory `self.config.save_dir`.

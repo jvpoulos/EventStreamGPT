@@ -579,7 +579,10 @@ class MeasurementConfig(JSONableMixin):
                     f"{as_dict['_measurement_metadata']} and {as_dict['modality']} incompatible!"
                 )
 
-        if as_dict["functor"] is not None:
+        # Handle the case where the 'functor' key is missing
+        if "functor" not in as_dict:
+            as_dict["functor"] = None
+        elif as_dict["functor"] is not None:
             if as_dict["temporality"] != TemporalityType.FUNCTIONAL_TIME_DEPENDENT:
                 raise ValueError(
                     "Only TemporalityType.FUNCTIONAL_TIME_DEPENDENT measures can have functors. Got "
