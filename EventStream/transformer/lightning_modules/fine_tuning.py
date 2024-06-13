@@ -6,13 +6,12 @@ from collections.abc import Sequence
 from pathlib import Path
 import pathlib
 from typing import Any
-import json
 
 import lightning as L
 import omegaconf
 from omegaconf import DictConfig
 import torch
-import torch.multiprocessing
+import torch.multiprocessing as mp
 import torchmetrics
 from lightning.pytorch.callbacks import Callback, LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
@@ -45,6 +44,8 @@ from ..utils import str_summary
 from ...data.vocabulary import VocabularyConfig
 from pytorch_lightning.loggers import WandbLogger
 
+mp.set_start_method('spawn')
+
 
 class ESTForStreamClassificationLM(L.LightningModule):
     """A PyTorch Lightning Module for a `ESTForStreamClassification` model."""
@@ -73,10 +74,6 @@ class ESTForStreamClassificationLM(L.LightningModule):
         """
         super().__init__()
 
-
-        # If the configurations are dictionaries, convert them to class objects. They may be passed as
-        # dictionaries when the lightning module is loaded from a checkpoint, so we need to support
-        # this functionality.
         if type(config) is dict:
             config = StructuredTransformerConfig(**config)
         if type(optimization_config) is dict:
@@ -118,7 +115,6 @@ class ESTForStreamClassificationLM(L.LightningModule):
             if not self.do_debug_mode:
                 metric_kwargs["validate_args"] = False
 
-            # For judging classification, we'll use macro & weighted accuracy, AUROC, and AUPRC
             self.metrics = torch.nn.ModuleDict(
                 {
                     "macro_AUROC": MulticlassAUROC(**metric_kwargs, average="macro"),
@@ -135,7 +131,6 @@ class ESTForStreamClassificationLM(L.LightningModule):
             if not self.do_debug_mode:
                 metric_kwargs["validate_args"] = False
 
-            # For judging classification, we'll use macro & weighted accuracy, AUROC, and AUPRC
             self.metrics = torch.nn.ModuleDict(
                 {
                     "AUROC": BinaryAUROC(**metric_kwargs),
@@ -148,7 +143,6 @@ class ESTForStreamClassificationLM(L.LightningModule):
             if not self.do_debug_mode:
                 metric_kwargs["validate_args"] = False
 
-            # For judging classification, we'll use macro & weighted accuracy, AUROC, and AUPRC
             self.metrics = torch.nn.ModuleDict(
                 {
                     "macro_AUROC": MultilabelAUROC(**metric_kwargs, average="macro"),
@@ -189,8 +183,6 @@ class ESTForStreamClassificationLM(L.LightningModule):
                 or 'held_out', for example.
         """
         for metric_name, metric in metrics.items():
-            # We'll want to skip a metric if any element of our skip_metrics list is a substring of the metric
-            # name:
             if any(to_skip in metric_name for to_skip in skip_metrics):
                 continue
 
@@ -207,7 +199,6 @@ class ESTForStreamClassificationLM(L.LightningModule):
         """Logs metric results for a given output result."""
 
         if results.labels is None:
-            # Skip logging metrics if labels are missing
             if results.loss is not None:
                 self.log(f"{prefix}_loss", results.loss)
             return
@@ -247,27 +238,27 @@ class ESTForStreamClassificationLM(L.LightningModule):
     def configure_optimizers(self):
         """Configures optimizer and learning rate scheduler."""
 
-        trainer_kwargs = {}  # Initialize an empty dictionary
+        # trainer_kwargs = {}
 
-        if self.cfg.wandb_logger_kwargs.get("name", None):
-            if "do_log_graph" in self.cfg.wandb_logger_kwargs:
-                do_log_graph = self.cfg.wandb_logger_kwargs.pop("do_log_graph")
-            else:
-                do_log_graph = False
+        # if self.cfg.wandb_logger_kwargs.get("name", None):
+        #     if "do_log_graph" in self.cfg.wandb_logger_kwargs:
+        #         do_log_graph = self.cfg.wandb_logger_kwargs.pop("do_log_graph")
+        #     else:
+        #         do_log_graph = False
 
-            wandb_logger = WandbLogger(
-                **{k: v for k, v in self.cfg.wandb_logger_kwargs.items() if v is not None},
-                save_dir=self.cfg.save_dir,
-            )
+        #     wandb_logger = WandbLogger(
+        #         **{k: v for k, v in self.cfg.wandb_logger_kwargs.items() if v is not None},
+        #         save_dir=self.cfg.save_dir,
+        #     )
 
-            if os.environ.get("LOCAL_RANK", "0") == "0":
-                if do_log_graph:
-                    wandb_logger.watch(self, log="all", log_graph=True)
+        #     if os.environ.get("LOCAL_RANK", "0") == "0":
+        #         if do_log_graph:
+        #             wandb_logger.watch(self, log="all", log_graph=True)
 
-                if self.cfg.wandb_experiment_config_kwargs:
-                    wandb_logger.experiment.config.update(self.cfg.wandb_experiment_config_kwargs)
+        #         if self.cfg.wandb_experiment_config_kwargs:
+        #             wandb_logger.experiment.config.update(self.cfg.wandb_experiment_config_kwargs)
 
-            trainer_kwargs["logger"] = wandb_logger
+        #     trainer_kwargs["logger"] = wandb_logger
 
         opt = torch.optim.AdamW(
             self.model.parameters(),
@@ -328,9 +319,7 @@ class FinetuneConfig:
         default_factory=lambda: {
             "name": "${task_df_name}_finetuning",
             "project": None,
-            "team": None,
             "log_model": True,
-            "do_log_graph": True,
         }
     )
 
@@ -343,7 +332,6 @@ class FinetuneConfig:
     do_overwrite: bool = False
     seed: int = 1
 
-    # Config override parameters
     config: dict[str, Any] = dataclasses.field(
         default_factory=lambda: {
             **{k: None for k in StructuredTransformerConfig().to_dict().keys()},
@@ -400,7 +388,6 @@ class FinetuneConfig:
                 **{k: v for k, v in self.config.items() if v is not None}
             )
             
-            # Remove the 'dl_reps_dir' key from the data_config dictionary
             if 'dl_reps_dir' in self.data_config:
                 del self.data_config['dl_reps_dir']
             
@@ -437,17 +424,10 @@ class FinetuneConfig:
             reloaded_data_config.task_df_name = self.task_df_name
             self.data_config = reloaded_data_config
         else:
-            # Check if data_config is a dictionary
             if isinstance(self.data_config, dict):
-                # Remove the 'dl_reps_dir' key from the data_config dictionary
                 dl_reps_dir = self.data_config.pop('dl_reps_dir', None)
-                
-                # Convert data_config to PytorchDatasetConfig
                 self.data_config = PytorchDatasetConfig(**self.data_config)
-                
-                # Set the dl_reps_dir attribute
                 self.data_config.dl_reps_dir = dl_reps_dir
-                
                 reloaded_data_config = self.data_config
 
         config_fp = self.load_from_model_dir / "config.json"
@@ -475,11 +455,14 @@ class FinetuneConfig:
 
 
 @task_wrapper
-def train(cfg: FinetuneConfig):
+def train(cfg: FinetuneConfig, train_pyd: PytorchDataset, tuning_pyd: PytorchDataset, held_out_pyd: PytorchDataset, wandb_logger: WandbLogger | None = None):
     """Runs the end to end training procedure for the fine-tuning model.
     Args:
         cfg: The fine-tuning configuration object specifying the cohort and task for which and model from
             which you wish to fine-tune.
+        train_pyd: The PyTorch dataset for the training split.
+        tuning_pyd: The PyTorch dataset for the tuning split.
+        held_out_pyd: The PyTorch dataset for the held-out split.
     """
     # Add a custom callback to handle missing metrics
     class HandleMissingMetricsCallback(Callback):
@@ -492,17 +475,17 @@ def train(cfg: FinetuneConfig):
     if cfg.do_use_filesystem_sharing:
         torch.multiprocessing.set_sharing_strategy("file_system")
 
-    train_pyd = PytorchDataset(cfg.data_config, split="train", dl_reps_dir=Path("data/DL_reps"))
-    tuning_pyd = PytorchDataset(cfg.data_config, split="tuning", dl_reps_dir=Path("data/DL_reps"))
+    # Set the dl_reps_dir attribute correctly
+    cfg.data_config.dl_reps_dir = cfg.data_config.save_dir / "DL_reps"
 
-    # Check if the train and tuning datasets are empty
-    if len(train_pyd) == 0 or len(tuning_pyd) == 0:
-        print("Train dataset length:", len(train_pyd))
-        print("Tuning dataset length:", len(tuning_pyd))
-        print("Data config:", cfg.data_config)
-        print("Cached data in train dataset:", train_pyd.cached_data)
-        print("Cached data in tuning dataset:", tuning_pyd.cached_data)
-        raise ValueError("Train or tuning dataset is empty. Please check your data.")
+    print(f"Train dataset length: {len(train_pyd)}")
+    print(f"Tuning dataset length: {len(tuning_pyd)}")
+    print(f"Held-out dataset length: {len(held_out_pyd)}")
+
+    tuning_metrics = None  # Initialize tuning_metrics with a default value
+    held_out_metrics = None
+    if len(train_pyd) == 0:
+        raise ValueError("Train dataset is empty. Please ensure the dataset is properly loaded and preprocessed.")
 
     config = cfg.config
     data_config = cfg.data_config
@@ -519,6 +502,8 @@ def train(cfg: FinetuneConfig):
             config.to_json_file(config_fp)
 
         data_config_dict = cfg.data_config.to_dict()
+        data_config_dict["save_dir"] = str(data_config_dict["save_dir"])  # Convert PosixPath to string
+        data_config_dict["dl_reps_dir"] = str(data_config_dict["dl_reps_dir"])  # Convert PosixPath to string
         with open(cfg.save_dir / "data_config.json", "w") as f:
             json.dump(data_config_dict, f, indent=2)
 
@@ -526,139 +511,143 @@ def train(cfg: FinetuneConfig):
         with open(cfg.save_dir / "optimization_config.json", "w") as f:
             json.dump(optimization_config_dict, f, indent=2)
 
-    # Check if the problem_type is None or an empty string
-    if not config.problem_type:
-        # Set the problem_type based on your problem
-        config.problem_type = 'single_label_classification'
-        # Or, you can set it based on the task_df_name or any other condition
+        if os.environ.get("LOCAL_RANK", "0") == "0":
+            if cfg.wandb_experiment_config_kwargs:
+                wandb_logger.experiment.config.update(cfg.wandb_experiment_config_kwargs)
 
-     # Model
+    if not config.problem_type:
+        config.problem_type = 'single_label_classification'
+
     model_params = dict()
     if cfg.pretrained_weights_fp is not None:
         model_params["pretrained_weights_fp"] = cfg.pretrained_weights_fp
 
     LM = ESTForStreamClassificationLM(config, optimization_config, cfg, **model_params)
 
-    # TODO(mmd): Get this working!
-    # if cfg.compile:
-    #     print("Compiling model!")
-    #     LM = torch.compile(LM)
-
-    # Setting up torch dataloader
-    train_dataloader = torch.utils.data.DataLoader(
-        train_pyd,
-        batch_size=optimization_config['batch_size'],  # Access 'batch_size' as a dictionary key
-        num_workers=optimization_config['num_dataloader_workers'],  # Access 'num_dataloader_workers' as a dictionary key
-        collate_fn=train_pyd.collate,
-        shuffle=True,
-    )
-    tuning_dataloader = torch.utils.data.DataLoader(
-        tuning_pyd,
-        batch_size=optimization_config['validation_batch_size'],  # Access 'validation_batch_size' as a dictionary key
-        num_workers=optimization_config['num_dataloader_workers'],  # Access 'num_dataloader_workers' as a dictionary key
-        collate_fn=tuning_pyd.collate,
-        shuffle=False,
-    )
-
-    # Setting up model configurations
-    # This will track the learning rate value as it updates through warmup and decay.
-    checkpoint_callback = ModelCheckpoint(
-        dirpath=None,
-        filename="{epoch}-{val_loss:.2f}-best_model",
-        monitor="tuning_loss",
-        mode="min",
-        save_top_k=3,
-    )
-
-    # Add a custom callback to handle metric comparison
-    class HandleMetricComparisonCallback(Callback):
-        def on_save_checkpoint(self, trainer, pl_module, checkpoint):
-            metrics = trainer.callback_metrics
-            if "tuning_loss" in metrics:
-                metrics["tuning_loss"] = torch.tensor(metrics["tuning_loss"])
-
-    callbacks = [
-        LearningRateMonitor(logging_interval="step"),
-        checkpoint_callback,
-        HandleMetricComparisonCallback(),  # Add the custom callback
-    ]
-
-    if 'patience' in optimization_config and optimization_config['patience'] is not None:
-        callbacks.append(
-            EarlyStopping(monitor="tuning_loss", mode="min", patience=optimization_config['patience'])
+    if __name__ == '__main__':
+        train_dataloader = torch.utils.data.DataLoader(
+            train_pyd,
+            batch_size=optimization_config['batch_size'],
+            num_workers=optimization_config['num_dataloader_workers'],
+            collate_fn=train_pyd.collate,
+            shuffle=True,
         )
 
-    trainer_kwargs = dict(
-        **cfg.trainer_config,
-        max_epochs=optimization_config['max_epochs'],
-        callbacks=callbacks,
-    )
-
-    if (optimization_config.get('gradient_accumulation') is not None) and (
-        optimization_config['gradient_accumulation'] > 1
-    ):
-        trainer_kwargs["accumulate_grad_batches"] = optimization_config['gradient_accumulation']
-
-    checkpoints_dir = cfg.save_dir / "model_checkpoints"
-    checkpoints_dir.mkdir(parents=False, exist_ok=True)
-
-    if cfg.wandb_logger_kwargs.get("name", None):
-        if "do_log_graph" in cfg.wandb_logger_kwargs:
-            do_log_graph = cfg.wandb_logger_kwargs.pop("do_log_graph")
-        else:
-            do_log_graph = False
-
-        wandb_logger = WandbLogger(
-            **{k: v for k, v in cfg.wandb_logger_kwargs.items() if v is not None},
-            save_dir=cfg.save_dir,
+        tuning_dataloader = torch.utils.data.DataLoader(
+            tuning_pyd,
+            batch_size=optimization_config['validation_batch_size'],
+            num_workers=optimization_config['num_dataloader_workers'],
+            collate_fn=tuning_pyd.collate,
+            shuffle=False,
         )
+
+        held_out_dataloader = torch.utils.data.DataLoader(
+            held_out_pyd,
+            batch_size=optimization_config['validation_batch_size'],
+            num_workers=optimization_config['num_dataloader_workers'],
+            collate_fn=held_out_pyd.collate,
+            shuffle=False,
+        )
+
+        checkpoint_callback = ModelCheckpoint(
+            dirpath=None,
+            filename="{epoch}-{val_loss:.2f}-best_model",
+            monitor="tuning_loss",
+            mode="min",
+            save_top_k=3,
+        )
+
+        class HandleMetricComparisonCallback(Callback):
+            def on_save_checkpoint(self, trainer, pl_module, checkpoint):
+                metrics = trainer.callback_metrics
+                if "tuning_loss" in metrics:
+                    metrics["tuning_loss"] = torch.tensor(metrics["tuning_loss"])
+
+        callbacks = [
+            LearningRateMonitor(logging_interval="step"),
+            checkpoint_callback,
+            HandleMetricComparisonCallback(),  # Add the custom callback
+        ]
+
+        if 'patience' in optimization_config and optimization_config['patience'] is not None:
+            callbacks.append(
+                EarlyStopping(monitor="tuning_loss", mode="min", patience=optimization_config['patience'])
+            )
+
+        trainer_kwargs = dict(
+            **cfg.trainer_config,
+            max_epochs=optimization_config['max_epochs'],
+            callbacks=callbacks,
+            logger=wandb_logger,  # Add the logger to the trainer
+        )
+
+        if (optimization_config.get('gradient_accumulation') is not None) and (
+            optimization_config['gradient_accumulation'] > 1
+        ):
+            trainer_kwargs["accumulate_grad_batches"] = optimization_config['gradient_accumulation']
+
+        checkpoints_dir = cfg.save_dir / "model_checkpoints"
+        checkpoints_dir.mkdir(parents=False, exist_ok=True)
+
+        if cfg.wandb_logger_kwargs.get("name", None):
+            if "do_log_graph" in cfg.wandb_logger_kwargs:
+                do_log_graph = cfg.wandb_logger_kwargs.pop("do_log_graph")
+            else:
+                do_log_graph = False
+
+            wandb_logger = WandbLogger(
+                **{k: v for k, v in cfg.wandb_logger_kwargs.items() if v is not None},
+                save_dir=cfg.save_dir,
+            )
+
+            if os.environ.get("LOCAL_RANK", "0") == "0":
+                if do_log_graph:
+                    wandb_logger.watch(LM, log="all", log_graph=True)
+
+                if cfg.wandb_experiment_config_kwargs:
+                    wandb_logger.experiment.config.update(cfg.wandb_experiment_config_kwargs)
+
+            trainer_kwargs["logger"] = wandb_logger
+
+        trainer = L.Trainer(
+            **trainer_kwargs,
+            max_epochs=optimization_config['max_epochs'],
+            callbacks=callbacks,
+            logger=wandb_logger if wandb_logger is not None else None,  # Use the passed wandb_logger
+            train_dataloaders=train_dataloader,
+            val_dataloaders=tuning_dataloader,
+            test_dataloaders=held_out_dataloader,
+        )
+
+        trainer.fit(model=LM)
+
+        tuning_metrics = None
+        if len(tuning_pyd) > 0:
+            tuning_metrics = trainer.validate(model=LM, dataloaders=tuning_dataloader, ckpt_path="best")
+
+        held_out_metrics = None
+        if len(held_out_pyd) > 0:
+            held_out_metrics = trainer.test(model=LM, dataloaders=held_out_dataloader, ckpt_path="best")
+
+        output_dir = Path(cfg.save_dir) / "predictions"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        tuning_outputs = trainer.predict(model=LM, dataloaders=tuning_dataloader, ckpt_path="best")
+        with open(output_dir / "tuning_predictions.json", "w") as f:
+            json.dump(tuning_outputs, f)
+
+        held_out_outputs = trainer.predict(model=LM, dataloaders=held_out_dataloader, ckpt_path="best")
+        with open(output_dir / "held_out_predictions.json", "w") as f:
+            json.dump(held_out_outputs, f)
 
         if os.environ.get("LOCAL_RANK", "0") == "0":
-            if do_log_graph:
-                # Watching the model naturally tracks parameter values and gradients.
-                wandb_logger.watch(LM, log="all", log_graph=True)
+            print("Saving final metrics...")
 
-            if cfg.wandb_experiment_config_kwargs:
-                wandb_logger.experiment.config.update(cfg.wandb_experiment_config_kwargs)
+            with open(cfg.save_dir / "tuning_metrics.json", mode="w") as f:
+                json.dump(tuning_metrics, f)
+            with open(cfg.save_dir / "held_out_metrics.json", mode="w") as f:
+                json.dump(held_out_metrics, f)
 
-        trainer_kwargs["logger"] = wandb_logger
-
-    trainer = L.Trainer(**trainer_kwargs)
-    trainer.fit(model=LM, train_dataloaders=train_dataloader, val_dataloaders=tuning_dataloader)
-
-    held_out_pyd = PytorchDataset(cfg.data_config, split="held_out")
-    held_out_dataloader = torch.utils.data.DataLoader(
-        held_out_pyd,
-        batch_size=optimization_config.validation_batch_size,
-        num_workers=optimization_config.num_dataloader_workers,
-        collate_fn=held_out_pyd.collate,
-        shuffle=False,
-    )
-    tuning_metrics = trainer.validate(model=LM, dataloaders=tuning_dataloader, ckpt_path="best")
-    held_out_metrics = trainer.test(model=LM, dataloaders=held_out_dataloader, ckpt_path="best")
-
-    # Output predictions to file
-    output_dir = Path(cfg.save_dir) / "predictions"
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Evaluate on tuning set
-    tuning_outputs = trainer.predict(model=LM, dataloaders=tuning_dataloader, ckpt_path="best")
-    with open(output_dir / "tuning_predictions.json", "w") as f:
-        json.dump(tuning_outputs, f)
-
-    # Evaluate on held-out set
-    held_out_outputs = trainer.predict(model=LM, dataloaders=held_out_dataloader, ckpt_path="best")
-    with open(output_dir / "held_out_predictions.json", "w") as f:
-        json.dump(held_out_outputs, f)
-
-    if os.environ.get("LOCAL_RANK", "0") == "0":
-        print("Saving final metrics...")
-
-        with open(cfg.save_dir / "tuning_metrics.json", mode="w") as f:
-            json.dump(tuning_metrics, f)
-        with open(cfg.save_dir / "held_out_metrics.json", mode="w") as f:
-            json.dump(held_out_metrics, f)
-
-    return tuning_metrics[0]["tuning_loss"], tuning_metrics, held_out_metrics
+    return None, tuning_metrics, held_out_metrics
 
 __all__ = ['FinetuneConfig', 'train']

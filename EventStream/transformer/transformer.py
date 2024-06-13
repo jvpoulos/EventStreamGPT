@@ -192,6 +192,11 @@ class InnerSelfAttention(nn.Module):
         attn_weights = torch.matmul(query, key.transpose(-1, -2))
         # attn_weights is of shape batch, head, query_seq_length, key_seq_length
 
+        # Move the tensors to the appropriate device
+        query = query.to(attn_weights.device)
+        key = key.to(attn_weights.device)
+        value = value.to(attn_weights.device)
+
         query_length, key_length = query.size(-2), key.size(-2)
         causal_mask = self.bias[:, :, key_length - query_length : key_length, :key_length].to(torch.bool)
         mask_value = torch.finfo(attn_weights.dtype).min
@@ -271,6 +276,8 @@ class InnerSelfAttention(nn.Module):
             present = None
 
         attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask)
+
+        attn_output = attn_output.to(hidden_states.device)
 
         attn_output = self._merge_heads(attn_output, self.num_heads, self.head_dim)
         attn_output = self.out_proj(attn_output)
@@ -721,23 +728,36 @@ class ConditionallyIndependentPointProcessInputLayer(torch.nn.Module):
         self.embedding_dropout = torch.nn.Dropout(p=config.input_dropout)
 
     def forward(self, batch: PytorchBatch) -> torch.Tensor:
-        """Returns input event embeddings for the provided batch.
-
-        Args:
-            batch: A PytorchBatch instance containing input data.
-        """
-
         data_embed = self.data_embedding_layer(batch)
-        time_embed = self.time_embedding_layer(batch)
+        
+        if "time_delta" not in batch or batch["time_delta"] is None:
+            print("'time_delta' is missing or None in the batch.")
+            print(f"Batch contents: {batch}")
+            # Return the data embeddings only if 'time_delta' is missing or None
+            return data_embed
+        
+        if self.do_use_sinusoidal:
+            time_embed = self.time_embedding_layer_sinusoidal(batch["time_delta"])
+        else:
+            if "time" not in batch or batch["time"] is None:
+                print("'time' is missing or None in the batch.")
+                print(f"Batch contents: {batch}")
+                # Return the data embeddings only if 'time' is missing or None
+                return data_embed
+            
+            # Ensure 'time' is on the same device as 'data_embed'
+            time = batch["time"].to(data_embed.device)
+            time_embed = self.time_embedding_layer(time)
+
+        # Ensure 'data_embed' and 'time_embed' are on the same device before addition
+        data_embed = data_embed.to(time_embed.device)
         embed = data_embed + time_embed
 
-        if batch.event_mask is not None:
-            embed = torch.where(
-                batch.event_mask.unsqueeze(-1).expand_as(embed), embed, torch.zeros_like(embed)
-            )
+        mask = batch.event_mask.unsqueeze(-1)
+        mask = mask.expand_as(embed)
+        embed = torch.where(mask, embed, torch.zeros_like(embed))
 
-        return self.embedding_dropout(embed)
-
+        return embed
 
 class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTrainedModel):
     def __init__(self, config: StructuredTransformerConfig, vocabulary_config: VocabularyConfig):

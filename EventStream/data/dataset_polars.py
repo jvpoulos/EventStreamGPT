@@ -95,10 +95,22 @@ class Dataset(DatasetBase):
     def __init__(self, config=None, subjects_df=None, events_df=None, dynamic_measurements_df=None, **kwargs):
         if config is None:
             config = DatasetConfig()
-            super().__init__(config, **kwargs)
         else:
-            self.config = config
+            # If config is a dictionary, convert it to a DatasetConfig object
+            if isinstance(config, dict):
+                config = DatasetConfig.from_dict(config)
+
+        self.config = config
+
+        # Check if the necessary attributes exist in the loaded object
+        if hasattr(self, 'subjects_df') and hasattr(self, 'events_df') and hasattr(self, 'dynamic_measurements_df'):
             super().__init__(config, subjects_df, events_df, dynamic_measurements_df, **kwargs)
+        else:
+            # Initialize the necessary attributes with default values
+            self.subjects_df = None
+            self.events_df = None
+            self.dynamic_measurements_df = None
+            super().__init__(config, **kwargs)
     """The polars specific implementation of the dataset.
 
     Args:
@@ -582,11 +594,11 @@ class Dataset(DatasetBase):
 
     def _validate_initial_df(
         self,
-        source_df: DF_T | None,
+        source_df: pl.DataFrame | None,
         id_col_name: str,
-        valid_temporality_type: TemporalityType,
-        linked_id_cols: dict[str, pl.datatypes.DataTypeClass] | None = None,
-    ) -> tuple[DF_T | None, pl.datatypes.DataTypeClass]:
+        valid_temporality_type: str,
+        linked_id_cols: dict[str, pl.datatypes.DataType] | None = None,
+    ) -> tuple[pl.DataFrame | None, pl.datatypes.DataType]:
         if source_df is None:
             return None, None
 
@@ -599,7 +611,7 @@ class Dataset(DatasetBase):
         if id_col_name not in source_df:
             source_df = source_df.with_row_count(name=id_col_name)
 
-        id_col, id_col_dt = self._validate_id_col(source_df.get_column(id_col_name))
+        id_col, id_col_dt = self._validate_id_col(source_df[id_col_name])
         source_df = source_df.with_columns(id_col)
 
         for col, cfg in self.config.measurement_configs.items():
@@ -1203,51 +1215,21 @@ class Dataset(DatasetBase):
                 raise AssertionError(f"Failed to build vocabulary for {measure}") from e
 
     @TimeableMixin.TimeAs
-    def _transform_multi_label_classification(
-        self, measure: str, config: MeasurementConfig, source_df: DF_T
-    ) -> DF_T:
-        print(f"Transforming measure: {measure}")
-        print(f"Source DataFrame schema: {source_df.schema}")
+    def _transform_multi_label_classification(self, measure, config, source_df):
+        # Convert the dynamic_indices column to string type
+        source_df = source_df.with_columns(pl.col(measure).cast(str))
 
-        vocab_col = config.vocabulary.vocabulary
-        vocab_set = set(vocab_col)
-
-        print(f"vocab_col: {vocab_col}")
-        print(f"vocab_set: {vocab_set}")
-
-        print(f"source_df before transformation: {source_df.head()}")
-
-        # Check the data type of the measure column
-        print(f"Data type of {measure} column: {source_df[measure].dtype}")
-
-        # Convert the measure column to string if it's not already a string
-        if source_df[measure].dtype != pl.Utf8:
-            source_df = source_df.with_columns(pl.col(measure).cast(pl.Utf8))
-            print(f"Converted {measure} column to string")
-            print(f"source_df after conversion: {source_df.head()}")
-
-        # Split the measure column by '|' and convert to list
+        # Split the dynamic_indices column into a list
         source_df = source_df.with_columns(
-            pl.col(measure).apply(lambda x: x.split("|") if x is not None else []).alias(f"{measure}_list")
+            pl.col(measure).map_elements(lambda x: [x], return_dtype=pl.List(pl.Utf8)).alias(f"{measure}_list")
         )
 
-        print(f"source_df after splitting: {source_df.head()}")
-
-        # Transform the values in the list
+        # Explode the dynamic_indices_list column and count the occurrences
         transformed_df = source_df.with_columns(
-            pl.col(f"{measure}_list").apply(lambda x: [elem if elem in vocab_set else "UNK" for elem in x])
+            pl.col(f"{measure}_list").explode().alias(measure)
+        ).with_columns(
+            pl.col(f"{measure}_list").map_elements(len, return_dtype=pl.UInt32).alias(f"{measure}_counts")
         )
-
-        print(f"transformed_df: {transformed_df.head()}")
-
-        # Drop the original measure column before renaming the exploded column
-        transformed_df = transformed_df.drop(measure)
-
-        # Explode the transformed list column and rename it to the original measure name
-        transformed_df = transformed_df.explode(f"{measure}_list").rename({f"{measure}_list": measure})
-
-        print(f"transformed_df after explode: {transformed_df.head()}")
-        print(f"Result DataFrame schema: {transformed_df.schema}")
 
         return transformed_df
      
@@ -1553,7 +1535,6 @@ class Dataset(DatasetBase):
 
         return melted_df
 
-
     def build_DL_cached_representation(
         self, subject_ids: list[int] | None = None, do_sort_outputs: bool = False
     ) -> DF_T:
@@ -1638,7 +1619,6 @@ class Dataset(DatasetBase):
             if do_sort_outputs:
                 dynamic_data = dynamic_data.sort("event_id", "measurement_id")
 
-            # 4. Join dynamic and event data.
             event_data = event_data.join(dynamic_data, on="event_id", how="left")
         else:
             event_data = event_data.with_columns(

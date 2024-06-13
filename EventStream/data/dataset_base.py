@@ -13,7 +13,7 @@ import json
 from collections import defaultdict
 from collections.abc import Hashable, Sequence
 from pathlib import Path
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, TypeVar, Union
 
 import humanize
 import numpy as np
@@ -29,6 +29,7 @@ from .types import DataModality, InputDataType, InputDFType, TemporalityType
 from .visualize import Visualizer
 from .vocabulary import Vocabulary, VocabularyConfig
 from .measurement_config import MeasurementConfig
+from .dataset_config import DatasetConfig, MeasurementConfig
 from typing import TYPE_CHECKING
 
 import json
@@ -427,9 +428,15 @@ class DatasetBase(
         self._dynamic_measurements_df = dynamic_measurements_df
 
     @classmethod
-    def load(cls, load_dir: Path, do_pickle_config: bool = True) -> "DatasetBase":
-        attrs_fp = load_dir / "E.pkl"
+    def load(cls, dir_or_config: Union[Path, dict[str, Any]], do_pickle_config: bool = True, **kwargs) -> "Dataset":
+        if isinstance(dir_or_config, dict):
+            # If the input is a dictionary, create a new Dataset instance directly
+            config = DatasetConfig.from_dict(dir_or_config)
+            return cls(config=config, **kwargs)
+        else:
+            load_dir = dir_or_config
 
+        attrs_fp = load_dir / "E.pkl"
         if attrs_fp.stat().st_size == 0:
             raise ValueError(f"The attributes file {attrs_fp} is empty.")
 
@@ -447,6 +454,10 @@ class DatasetBase(
                 reloaded_config.save_dir = load_dir
             attrs_to_add["config"] = reloaded_config
 
+        print("Attributes to add:")
+        for key, value in attrs_to_add.items():
+            print(f"Key: {key}, Type: {type(value)}")
+
         inferred_measurement_configs_fp = load_dir / "inferred_measurement_configs.json"
         if inferred_measurement_configs_fp.is_file():
             with open(inferred_measurement_configs_fp) as f:
@@ -456,10 +467,36 @@ class DatasetBase(
         else:
             attrs_to_add["inferred_measurement_configs"] = {}
 
-        loaded_object = super()._load(attrs_fp, **attrs_to_add)
+        class Wrapper:
+            def __init__(self, **kwargs):
+                for key, value in kwargs.items():
+                    setattr(self, key, value)
 
-        if isinstance(loaded_object, dict):
-            raise ValueError("Loaded object is a dictionary. Expected a Dataset instance.")
+        wrapped_attrs = Wrapper(**attrs_to_add)
+
+        print("Wrapped attributes before loading:")
+        for attr in dir(wrapped_attrs):
+            if not attr.startswith('__'):
+                print(f"{attr}: {type(getattr(wrapped_attrs, attr))}")
+
+        try:
+            loaded_object = DatasetBase._load(attrs_fp)
+        except AttributeError:
+            print("AttributeError occurred during loading. Creating a new Dataset object.")
+            config = attrs_to_add["config"]
+            subjects_df_fp = load_dir / "subjects_df.parquet"
+            events_df_fp = load_dir / "events_df.parquet"
+            dynamic_measurements_df_fp = load_dir / "dynamic_measurements_df.parquet"
+
+            subjects_df = pl.read_parquet(subjects_df_fp) if subjects_df_fp.is_file() else None
+            events_df = pl.read_parquet(events_df_fp) if events_df_fp.is_file() else None
+            dynamic_measurements_df = pl.read_parquet(dynamic_measurements_df_fp) if dynamic_measurements_df_fp.is_file() else None
+
+            loaded_object = cls(config=config, subjects_df=subjects_df, events_df=events_df, dynamic_measurements_df=dynamic_measurements_df, **kwargs)
+
+        # Debugging statements to check the loaded object
+        print("Loaded object type:", type(loaded_object))
+        print("Loaded object contents:", loaded_object)
 
         return loaded_object
 
@@ -537,12 +574,12 @@ class DatasetBase(
         subjects_df: DF_T | None = None,
         events_df: DF_T | None = None,
         dynamic_measurements_df: DF_T | None = None,
+        do_overwrite: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
 
-        if "do_overwrite" in kwargs:
-            self.do_overwrite = kwargs["do_overwrite"]
+        self.do_overwrite = do_overwrite
 
         if config is None:
             config = get_dataset_config()
@@ -560,18 +597,6 @@ class DatasetBase(
         self.split_subjects = {}
 
     def _validate_and_set_initial_properties(self, subjects_df, events_df, dynamic_measurements_df):
-        """Validates the input dataframes and sets initial properties of the calling object.
-
-        This validates that the initial dataframes are appropriately configured, re-sets certain types to
-        minimal-memory ``dtypes`` (e.g., ensuring ID columns are set to the smallest valid ``uint`` type), and
-        sets non-DF parameters such as `subject_ids`, `event_types`, and `n_events_per_subject`.
-
-        Args:
-            subjects_df: The subjects dataframe.
-            events_df: The events dataframe.
-            dynamic_measurements_df: The dynamic measurements dataframe.
-        """
-
         self.subject_ids = []
         self.event_types = []
         self.n_events_per_subject = {}
@@ -1436,12 +1461,37 @@ class DatasetBase(
             subject_chunks = [list(c) for c in subject_chunks]
 
         for chunk_idx, subjects_list in self._tqdm(list(enumerate(subject_chunks))):
-            cached_df = self.build_DL_cached_representation(subject_ids=None, do_sort_outputs=True)
+            cached_df = self.build_DL_cached_representation(subject_ids=subjects_list, do_sort_outputs=True)
+
+            if cached_df.is_empty():
+                print(f"Warning: Cached data is empty for chunk {chunk_idx}. Skipping this chunk.")
+                continue
 
             for split, subjects in self.split_subjects.items():
                 fp = DL_dir / f"{split}_{chunk_idx}.{self.DF_SAVE_FORMAT}"
 
                 split_cached_df = self._filter_col_inclusion(cached_df, {"subject_id": subjects})
+                select_columns = [
+                    "subject_id",
+                    pl.col("subject_id").alias("subject_id_right"),
+                    "event_id",
+                    "timestamp",
+                    "dynamic_indices_event_type",
+                    "dynamic_counts_event_type",
+                    "measurement_id"
+                ]
+
+                if "dynamic_indices_dynamic_indices" in split_cached_df.columns:
+                    select_columns.append(pl.col("dynamic_indices_dynamic_indices").alias("dynamic_indices"))
+                else:
+                    select_columns.append(pl.lit(None).alias("dynamic_indices"))
+
+                if "dynamic_counts_dynamic_indices" in split_cached_df.columns:
+                    select_columns.append(pl.col("dynamic_counts_dynamic_indices").alias("dynamic_counts"))
+                else:
+                    select_columns.append(pl.lit(None).alias("dynamic_counts"))
+
+                split_cached_df = split_cached_df.select(select_columns)
                 self._write_df(split_cached_df, fp, do_overwrite=do_overwrite)
 
     @property

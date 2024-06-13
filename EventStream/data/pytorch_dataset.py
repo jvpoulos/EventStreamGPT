@@ -3,12 +3,14 @@ from collections import defaultdict
 from pathlib import Path
 import pathlib
 import traceback
-
+import pandas as pd
 import numpy as np
 import polars as pl
 import torch
 from mixins import SaveableMixin, SeedableMixin, TimeableMixin
 from EventStream.data.dataset_config import DatasetConfig
+
+from datetime import datetime
 
 from .config import (
     MeasurementConfig,
@@ -134,12 +136,51 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
 
         raise TypeError(f"Can't process label of {dtype} type!")
 
-    def __init__(self, config: DatasetConfig, split: str, dl_reps_dir: str = None):
+    def __init__(self, config: PytorchDatasetConfig, split: str, task_df: pl.DataFrame = None, dl_reps_dir: Path = None):
         super().__init__()
-
+        self.split = split
+        config.save_dir = Path(config.save_dir)
+        self.dl_reps_dir = dl_reps_dir
+        self.load_cached_data()
         self.config = config
         self.task_types = {}
         self.task_vocabs = {}
+        self.cached_data = None  # Initialize self.cached_data as None
+
+        if task_df is not None:
+            self.task_df = task_df
+        elif self.config.task_df_name is not None:
+            if split == "train":
+                self.task_df = pl.read_parquet(self.config.save_dir / "task_dfs" / f"{self.config.task_df_name}.parquet")
+            elif split == "tuning":
+                self.task_df = pl.read_parquet(self.config.save_dir / "task_dfs" / f"{self.config.task_df_name}_val.parquet")
+            elif split == "held_out":
+                self.task_df = pl.read_parquet(self.config.save_dir / "task_dfs" / f"{self.config.task_df_name}_test.parquet")
+            else:
+                raise ValueError(f"Invalid split: {split}")
+        else:
+            self.task_df = None
+
+        self.load_cached_data()  # Load the cached data after initializing self.cached_data
+
+        if self.cached_data is None:
+            self.cached_data = pd.DataFrame()
+
+        # Check if the required columns exist in the cached data
+        if self.cached_data.empty:
+            raise ValueError(f"Cached data is empty for split '{split}'")
+
+        required_columns = ["subject_id", "dynamic_indices"]
+        missing_columns = [col for col in required_columns if col not in self.cached_data.columns]
+        if missing_columns:
+            raise ValueError(f"Required columns {missing_columns} are missing in the cached data for split '{split}'")
+
+            # Handle missing columns
+            if "subject_id" not in self.cached_data.columns:
+                self.cached_data["subject_id"] = np.arange(len(self.cached_data))
+
+            if "dynamic_indices" not in self.cached_data.columns:
+                self.cached_data["dynamic_indices"] = pd.Series([[]] * len(self.cached_data))
 
         self.vocabulary_config = VocabularyConfig.from_json_file(
             Path("data") / "vocabulary_config.json"
@@ -152,57 +193,47 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
         self.measurement_configs = {k: v for k, v in inferred_measurement_configs.items() if not v.is_dropped}
 
         self.split = split
+        config.save_dir = Path(config.save_dir)
+        self.dl_reps_dir = Path("./data/DL_reps")
+        print(f"dl_reps_dir: {self.dl_reps_dir}")
 
-        self.dl_reps_dir = Path(dl_reps_dir) if dl_reps_dir else None
+        parquet_files = list(self.dl_reps_dir.glob(f"{split}*.parquet"))
+        if parquet_files:
+            print(f"Loading parquet files for split '{split}': {parquet_files}")
 
-        self.config.save_dir = Path(self.config.save_dir)
+            # Read the Parquet files directly into a Pandas DataFrame
+            self.cached_data = pd.concat(
+                [pd.read_parquet(file) for file in parquet_files], ignore_index=True
+            )
 
-        if self.dl_reps_dir:
-            parquet_files = list(self.dl_reps_dir.glob(f"{split}*.parquet"))
-            if parquet_files:
-                print(f"Loading parquet files for split '{split}': {parquet_files}")
-                self.cached_data = pl.scan_parquet(self.dl_reps_dir / f"{split}*.parquet")
-                self.cached_data = self.cached_data.with_columns([
-                    pl.col(col_name).cast(pl.Int64)
-                    if col_name.endswith("_id") or col_name.endswith("_ids")
-                    else pl.col(col_name)
-                    for col_name in self.cached_data.columns
-                ])
-            else:
-                print(f"No parquet files found for split '{split}'")
-                self.cached_data = pl.DataFrame()
+            print(f"Initial cached data columns: {self.cached_data.columns}")
+
+            # Convert the data types of the required columns to Int64
+            int_cols = ['subject_id', 'subject_id_right', 'event_id', 'measurement_id']
+            for col in int_cols:
+                if col in self.cached_data.columns:
+                    # Replace non-finite values with 0 before converting to int64
+                    self.cached_data[col] = self.cached_data[col].fillna(0).astype('int64')
+
+            print(f"Cached data shape after transformations: {self.cached_data.shape}")
+            print(f"Cached data columns after transformations: {self.cached_data.columns}")
         else:
-            self.cached_data = pl.DataFrame()
+            print(f"No parquet files found for split '{split}', creating an empty DataFrame")
+            self.cached_data = pd.DataFrame()
+            
+        print(f"Cached data shape: {self.cached_data.shape}")
+        print(f"Cached data columns: {self.cached_data.columns}")
 
-        if isinstance(self.cached_data, pl.LazyFrame):
-            if "dynamic_indices" in self.cached_data.columns:
-                length_constraint = pl.col("dynamic_indices").list.lengths() >= config.min_seq_len
-                self.cached_data = self.cached_data.filter(length_constraint)
-            
-            if "subject_id" in self.cached_data.columns:
-                self.subject_ids = self.cached_data.select("subject_id").collect().to_series().to_list()
-                self.cached_data = self.cached_data.drop("subject_id")
-            else:
-                self.subject_ids = None
-            self.columns = self.cached_data.columns
-            self.cached_data = self.cached_data.collect().to_numpy()
-        
-        elif isinstance(self.cached_data, pl.DataFrame):
-            if not self.cached_data.is_empty() and "dynamic_indices" in self.cached_data.columns:
-                length_constraint = pl.col("dynamic_indices").list.lengths() >= config.min_seq_len
-                self.cached_data = self.cached_data.filter(length_constraint)
-            
-            if "subject_id" in self.cached_data.columns:
-                self.subject_ids = self.cached_data.select("subject_id").to_list()
-                self.cached_data = self.cached_data.drop("subject_id")
-            else:
-                self.subject_ids = None
-            self.columns = self.cached_data.columns
-            self.cached_data = self.cached_data.to_numpy()
+        # Check if the required columns exist in the cached data
+        required_columns = ["dynamic_indices"]
+        for col in required_columns:
+            if col not in self.cached_data.columns:
+                # If the required column is missing, add it as an empty column
+                self.cached_data[col] = None
 
         if self.config.task_df_name is not None:
             task_dir = self.config.save_dir / "DL_reps" / "for_task" / config.task_df_name
-            raw_task_df_fp = self.dl_reps_dir / f"{self.config.task_df_name}.parquet" if self.dl_reps_dir else None
+            raw_task_df_fp = self.config.save_dir / "task_dfs" / f"{self.config.task_df_name}.parquet"
             task_info_fp = task_dir / "task_info.json"
 
             self.has_task = True
@@ -265,7 +296,7 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
 
                 if self.split != "train":
                     print(f"WARNING: Constructing task-specific dataset on non-train split {self.split}!")
-                for cached_data_fp in Path(self.dl_reps_dir).glob(f"{split}*.parquet"):
+                for cached_data_fp in Path(self.config.save_dir / "DL_reps").glob(f"{split}*.parquet"):
                     task_df_fp = task_dir / cached_data_fp.name
                     if task_df_fp.is_file():
                         continue
@@ -284,7 +315,7 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
                     f"{config.task_df_name}!"
                 )
         else:
-            self.cached_data = pl.scan_parquet(self.dl_reps_dir / f"{split}*.parquet") if self.dl_reps_dir else pl.DataFrame()
+            self.cached_data = pl.scan_parquet(self.config.save_dir / "DL_reps" / f"{split}*.parquet")
             self.has_task = False
             self.tasks = None
             self.task_vocabs = None
@@ -293,8 +324,16 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
         self.seq_padding_side = config.seq_padding_side
         self.max_seq_len = config.max_seq_len
 
-        if "time_delta" not in self.cached_data.columns:
-            if "start_time" in self.cached_data.columns and "time" in self.cached_data.columns:
+        length_constraint = pl.col("dynamic_indices").list.lengths() >= config.min_seq_len
+        self.cached_data = self.cached_data.filter(length_constraint)
+
+        time_columns = ["start_time", "time", "time_delta"]
+        if any(col not in self.cached_data.columns for col in time_columns):
+            print("Warning: One or more time-related columns are missing in the cached data. Skipping time-related calculations.")
+            self.mean_log_inter_event_time_min = None
+            self.std_log_inter_event_time_min = None
+        else:
+            if "time_delta" not in self.cached_data.columns:
                 self.cached_data = self.cached_data.with_columns(
                     (pl.col("start_time") + pl.duration(minutes=pl.col("time").list.first())).alias("start_time"),
                     pl.col("time")
@@ -306,10 +345,7 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
                     )
                     .alias("time_delta"),
                 ).drop("time")
-            else:
-                print("Warning: 'start_time' or 'time' column not found in self.cached_data. Skipping 'time_delta' calculation.")
 
-        if "time_delta" in self.cached_data.columns:
             stats = (
                 self.cached_data.select(pl.col("time_delta").explode().drop_nulls().alias("inter_event_time"))
                 .select(
@@ -339,22 +375,61 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
 
                 self.cached_data = self.cached_data.filter(pl.col("time_delta").list.min() > 0)
 
-            self.mean_log_inter_event_time_min = stats["mean_log"].item()
-            self.std_log_inter_event_time_min = stats["std_log"].item()
-        else:
-            print("Warning: 'time_delta' column not found in self.cached_data. Skipping inter-event time statistics calculation.")
-            self.mean_log_inter_event_time_min = None
-            self.std_log_inter_event_time_min = None
+            self.mean_log_inter_event_time_min = stats.get("mean_log", None)
+            if self.mean_log_inter_event_time_min is not None:
+                self.mean_log_inter_event_time_min = self.mean_log_inter_event_time_min.item()
+
+            self.std_log_inter_event_time_min = stats.get("std_log", None)
+            if self.std_log_inter_event_time_min is not None:
+                self.std_log_inter_event_time_min = self.std_log_inter_event_time_min.item()
+
+        self.cached_data = self.cached_data.collect()
+
+        if self.config.train_subset_size not in (None, "FULL") and self.split == "train":
+            match self.config.train_subset_size:
+                case int() as n if n > 0:
+                    kwargs = {"n": n}
+                case float() as frac if 0 < frac < 1:
+                    kwargs = {"fraction": frac}
+                case _:
+                    raise TypeError(
+                        f"Can't process subset size of {type(self.config.train_subset_size)}, "
+                        f"{self.config.train_subset_size}"
+                    )
+
+            self.cached_data = self.cached_data.sample(seed=self.config.train_subset_seed, **kwargs)
 
         with self._time_as("convert_to_rows"):
-            if "subject_id" in self.cached_data.columns:
-                self.subject_ids = self.cached_data.select("subject_id").collect().to_series().to_list()
-                self.cached_data = self.cached_data.drop("subject_id")
-            else:
-                self.subject_ids = None
+            self.subject_ids = self.cached_data["subject_id"].to_list()
+            self.cached_data = self.cached_data.drop("subject_id")
             self.columns = self.cached_data.columns
-            self.cached_data = self.cached_data.collect().to_numpy()
+            self.cached_data = self.cached_data.rows()
+            print(f"Cached data after converting to rows: {self.cached_data}")
 
+            # Initialize out_batch here
+            self.out_batch = {}
+            if "dynamic_indices" in self.columns:
+                self.out_batch["dynamic_indices"] = torch.zeros(len(self.cached_data), len(self.columns), dtype=torch.long)
+            else:
+                if "event_mask" in self.columns:
+                    self.out_batch["event_mask"] = torch.zeros(len(self.cached_data), dtype=torch.bool)
+                    self.out_batch["dynamic_indices"] = torch.zeros_like(self.out_batch["event_mask"], dtype=torch.long)
+                else:
+                    self.out_batch["dynamic_indices"] = torch.zeros(len(self.cached_data), dtype=torch.long)
+    
+    def load_cached_data(self):
+        if self.dl_reps_dir is None:
+            raise ValueError("The 'dl_reps_dir' attribute must be set to a valid directory path.")
+
+        parquet_files = list(self.dl_reps_dir.glob(f"{self.split}*.parquet"))
+        if parquet_files:
+            print(f"Found {len(parquet_files)} Parquet files for split '{self.split}'")
+            self.cached_data = pd.concat(
+                [pd.read_parquet(file) for file in parquet_files], ignore_index=True
+            )
+        else:
+            print(f"No Parquet files found for split '{self.split}', creating an empty DataFrame")
+            self.cached_data = pd.DataFrame()
     @staticmethod
     def _build_task_cached_df(task_df: pl.LazyFrame, cached_data: pl.LazyFrame) -> pl.LazyFrame:
         """Restricts the data in a cached dataframe to only contain data for the passed task dataframe.
@@ -456,6 +531,21 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
         time_dep_cols = [c for c in ("time", "time_delta") if c in cached_data.columns]
         time_dep_cols.extend(["dynamic_indices", "dynamic_values", "dynamic_measurement_indices"])
 
+        if self.cached_data.empty:
+            self.out_batch["dynamic_indices"] = torch.zeros(0, dtype=torch.long)
+        else:
+            if "dynamic_indices" in self.columns:
+                self.out_batch["dynamic_indices"] = torch.zeros(len(self.cached_data), len(self.columns), dtype=torch.long)
+            else:
+                if "event_mask" in self.columns:
+                    self.out_batch["event_mask"] = torch.zeros(len(self.cached_data), dtype=torch.bool)
+                    self.out_batch["dynamic_indices"] = torch.zeros_like(self.out_batch["event_mask"], dtype=torch.long)
+                else:
+                    self.out_batch["dynamic_indices"] = torch.zeros(len(self.cached_data), dtype=torch.long)
+
+        if task_cached_data.collect().empty:
+            raise ValueError(f"Task-specific cached data is empty for split '{split}'")
+
         if "time" in cached_data.columns:
             time_col_expr = pl.col("time")
         elif "time_delta" in cached_data.columns:
@@ -487,46 +577,43 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
         return len(self.cached_data)
 
     def __getitem__(self, idx: int) -> dict[str, list]:
-        """Returns a Returns a dictionary corresponding to a single subject's data.
-
-        The output of this will not be tensorized as that work will need to be re-done in the collate function
-        regardless. The output will have structure:
-        ``
-        {
-            'time_delta': [seq_len],
-            'dynamic_indices': [seq_len, n_data_per_event] (ragged),
-            'dynamic_values': [seq_len, n_data_per_event] (ragged),
-            'dynamic_measurement_indices': [seq_len, n_data_per_event] (ragged),
-            'static_indices': [seq_len, n_data_per_event] (ragged),
-            'static_measurement_indices': [seq_len, n_data_per_event] (ragged),
-        }
-        ``
-
-        1. ``time_delta`` captures the time between each event and the subsequent event.
-        2. ``dynamic_indices`` captures the categorical metadata elements listed in `self.data_cols` in a
-           unified vocabulary space spanning all metadata vocabularies.
-        3. ``dynamic_values`` captures the numerical metadata elements listed in `self.data_cols`. If no
-           numerical elements are listed in `self.data_cols` for a given categorical column, the according
-           index in this output will be `np.NaN`.
-        4. ``dynamic_measurement_indices`` captures which measurement vocabulary was used to source a given
-           data element.
-        5. ``static_indices`` captures the categorical metadata elements listed in `self.static_cols` in a
-           unified vocabulary.
-        6. ``static_measurement_indices`` captures which measurement vocabulary was used to source a given
-           data element.
-        """
-        return self._seeded_getitem(idx)
+        print(f"Accessing cached data with index {idx}, shape: {self.cached_data.shape}")  # Add this line
+        try:
+            full_subj_data = {}
+            for col_name, col_data in zip(self.columns, self.cached_data.iloc[idx]):
+                if col_name == "dynamic_indices":
+                    if col_data is None or pd.isna(col_data):
+                        full_subj_data[col_name] = []  # Provide an empty list or a default value
+                    else:
+                        full_subj_data[col_name] = col_data if isinstance(col_data, list) else [col_data]
+                elif isinstance(col_data, float) and not pd.isna(col_data):
+                    full_subj_data[col_name] = [col_data]
+                elif isinstance(col_data, datetime):
+                    full_subj_data[col_name] = [col_data]
+                else:
+                    full_subj_data[col_name] = col_data if isinstance(col_data, list) else [col_data]
+            
+            # Handle missing 'dynamic_indices' column
+            if "dynamic_indices" not in full_subj_data:
+                full_subj_data["dynamic_indices"] = []
+            
+            return self._seeded_getitem(idx, full_subj_data)
+        
+        except (IndexError, KeyError, AttributeError) as e:
+            print(f"Error accessing cached data at index {idx}: {str(e)}")
+            print("Cached data length:", len(self.cached_data))
+            print("Cached data:", self.cached_data)
+            raise e
 
     @SeedableMixin.WithSeed
     @TimeableMixin.TimeAs
-    def _seeded_getitem(self, idx: int) -> dict[str, list]:
-        """Returns a Returns a dictionary corresponding to a single subject's data.
+    def _seeded_getitem(self, idx: int, full_subj_data: dict[str, list]) -> dict[str, list]:
+        """Returns a dictionary corresponding to a single subject's data.
 
         This function is automatically seeded for robustness. See `__getitem__` for a description of the
         output format.
         """
         try:
-            full_subj_data = {c: v for c, v in zip(self.columns, self.cached_data[idx])}
             for k in ["static_indices", "static_measurement_indices"]:
                 if full_subj_data.get(k) is None:
                     full_subj_data[k] = []
@@ -587,9 +674,9 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
             print("Cached data:", self.cached_data)
             raise e
 
-    def __static_and_dynamic_collate(self, batch: list[DATA_ITEM_T]) -> PytorchBatch:
+    def __static_and_dynamic_collate(self, batch: list[DATA_ITEM_T], device: torch.device) -> PytorchBatch:
         """An internal collate function for both static and dynamic data."""
-        out_batch = self.__dynamic_only_collate(batch)
+        out_batch = self.__dynamic_only_collate(batch, device)
 
         # Get the maximum number of static elements in the batch.
         max_n_static = max(len(e["static_indices"]) for e in batch)
@@ -603,12 +690,12 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
                 static_delta = max_n_static - n_static
                 out["static_indices"].append(
                     torch.nn.functional.pad(
-                        torch.Tensor(e["static_indices"]), (0, static_delta), value=np.NaN
+                        torch.Tensor(e["static_indices"]).to(device), (0, static_delta), value=np.NaN
                     )
                 )
                 out["static_measurement_indices"].append(
                     torch.nn.functional.pad(
-                        torch.Tensor(e["static_measurement_indices"]),
+                        torch.Tensor(e["static_measurement_indices"]).to(device),
                         (0, static_delta),
                         value=np.NaN,
                     )
@@ -617,102 +704,142 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
 
         self._register_start("collate_static_post_padding")
         # Unsqueeze the padded tensors into the batch dimension and combine them.
-        out = {k: torch.cat([T.unsqueeze(0) for T in Ts], dim=0) for k, Ts in out.items()}
+        out = {k: torch.cat([T.unsqueeze(0) for T in Ts], dim=0).to(device) for k, Ts in out.items()}
 
         # Convert to the right types and add to the batch.
-        out_batch["static_indices"] = torch.nan_to_num(out["static_indices"], nan=0).long()
+        out_batch["static_indices"] = torch.nan_to_num(out["static_indices"], nan=0).long().to(device)
         out_batch["static_measurement_indices"] = torch.nan_to_num(
             out["static_measurement_indices"], nan=0
-        ).long()
+        ).long().to(device)
         self._register_end("collate_static_post_padding")
 
         return out_batch
 
-    def __dynamic_only_collate(self, batch: list[DATA_ITEM_T]) -> PytorchBatch:
+    def __dynamic_only_collate(self, batch: list[DATA_ITEM_T], device: torch.device) -> PytorchBatch:
         """An internal collate function for dynamic data alone."""
         # Get the local max sequence length and n_data elements for padding.
-        max_seq_len = max(len(e["time_delta"]) for e in batch)
+        max_seq_len = max(len(e.get("time_delta", [])) for e in batch)
 
         max_n_data = 0
         for e in batch:
-            for v in e["dynamic_indices"]:
-                max_n_data = max(max_n_data, len(v))
-        if max_n_data == 0:
-            raise ValueError(f"Batch has no dynamic measurements! Got:\n{batch[0]}\n{batch[1]}\n...")
+            if "dynamic_indices" in e:
+                for v in e["dynamic_indices"]:
+                    if isinstance(v, (list, np.ndarray)):
+                        max_n_data = max(max_n_data, len(v))
+                    else:
+                        max_n_data = max(max_n_data, 1)
 
         # Walk through the batch and pad the associated tensors in all requisite dimensions.
         self._register_start("collate_dynamic_padding")
-        out = defaultdict(list)
+        out_numeric = defaultdict(list)
+        out_datetime = defaultdict(list)
+        out_object = defaultdict(list)
+
         for e in batch:
-            seq_len = len(e["time_delta"])
+            seq_len = len(e.get("time_delta", []))
             seq_delta = max_seq_len - seq_len
 
             if self.seq_padding_side == SeqPaddingSide.RIGHT:
-                out["time_delta"].append(
-                    torch.nn.functional.pad(torch.Tensor(e["time_delta"]), (0, seq_delta), value=np.NaN)
+                out_numeric["time_delta"].append(
+                    torch.nn.functional.pad(torch.Tensor(e.get("time_delta", [])).to(device), (0, seq_delta), value=np.NaN)
                 )
             else:
-                out["time_delta"].append(
-                    torch.nn.functional.pad(torch.Tensor(e["time_delta"]), (seq_delta, 0), value=np.NaN)
+                out_numeric["time_delta"].append(
+                    torch.nn.functional.pad(torch.Tensor(e.get("time_delta", [])).to(device), (seq_delta, 0), value=np.NaN)
                 )
 
-            data_elements = defaultdict(list)
+            data_elements_numeric = defaultdict(list)
+            data_elements_datetime = defaultdict(list)
+            data_elements_object = defaultdict(list)
+
             for k in ("dynamic_indices", "dynamic_values", "dynamic_measurement_indices"):
-                for vs in e[k]:
-                    if vs is None:
-                        vs = [np.NaN] * max_n_data
+                if k in e:
+                    for vs in e[k]:
+                        if isinstance(vs, (list, np.ndarray)):
+                            data_delta = max_n_data - len(vs)
+                            vs = [v if v is not None else np.NaN for v in vs]
+                        else:
+                            data_delta = max_n_data - 1
+                            vs = [vs if vs is not None else np.NaN]
 
-                    data_delta = max_n_data - len(vs)
-                    vs = [v if v is not None else np.NaN for v in vs]
+                        # Separate data elements based on data type
+                        if isinstance(vs[0], float):
+                            data_elements_numeric[k].append(
+                                torch.nn.functional.pad(torch.Tensor(vs).to(device), (0, data_delta), value=np.NaN)
+                            )
+                        elif isinstance(vs[0], datetime):
+                            data_elements_datetime[k].append(
+                                torch.nn.functional.pad(torch.Tensor([v.timestamp() for v in vs]).to(device), (0, data_delta), value=np.NaN)
+                            )
+                        else:
+                            data_elements_object[k].append(
+                                torch.nn.functional.pad(torch.Tensor([hash(str(v)) for v in vs]).to(device), (0, data_delta), value=np.NaN)
+                            )
 
-                    # We don't worry about seq_padding_side here as this is not the sequence dimension.
-                    data_elements[k].append(
-                        torch.nn.functional.pad(torch.Tensor(vs), (0, data_delta), value=np.NaN)
-                    )
+                    if self.seq_padding_side == SeqPaddingSide.RIGHT:
+                        for d_elem in (data_elements_numeric, data_elements_datetime, data_elements_object):
+                            for k in d_elem:
+                                d_elem[k] = torch.nn.functional.pad(
+                                    torch.cat([T.unsqueeze(0) for T in d_elem[k]]),
+                                    (0, 0, 0, seq_delta),
+                                    value=np.NaN,
+                                ).to(device)
+                    else:
+                        for d_elem in (data_elements_numeric, data_elements_datetime, data_elements_object):
+                            for k in d_elem:
+                                d_elem[k] = torch.nn.functional.pad(
+                                    torch.cat([T.unsqueeze(0) for T in d_elem[k]]),
+                                    (0, 0, seq_delta, 0),
+                                    value=np.NaN,
+                                ).to(device)
 
-                if len(data_elements[k]) == 0:
-                    raise ValueError(f"Batch element has no {k}! Got:\n{e}.")
+                    out_numeric.update(data_elements_numeric)
+                    out_datetime.update(data_elements_datetime)
+                    out_object.update(data_elements_object)
 
-                if self.seq_padding_side == SeqPaddingSide.RIGHT:
-                    data_elements[k] = torch.nn.functional.pad(
-                        torch.cat([T.unsqueeze(0) for T in data_elements[k]]),
-                        (0, 0, 0, seq_delta),
-                        value=np.NaN,
-                    )
-                else:
-                    data_elements[k] = torch.nn.functional.pad(
-                        torch.cat([T.unsqueeze(0) for T in data_elements[k]]),
-                        (0, 0, seq_delta, 0),
-                        value=np.NaN,
-                    )
-
-                out[k].append(data_elements[k])
         self._register_end("collate_dynamic_padding")
 
         self._register_start("collate_post_padding_processing")
         # Unsqueeze the padded tensors into the batch dimension and combine them.
-        out_batch = {k: torch.cat([T.unsqueeze(0) for T in Ts], dim=0) for k, Ts in out.items()}
+        out_batch = {
+            k: torch.cat([T.unsqueeze(0) for T in Ts], dim=0).to(device)
+            for k, Ts in (
+                (*out_numeric.items(), *out_datetime.items(), *out_object.items())
+            )
+        }
 
         # Add event and data masks on the basis of which elements are present, then convert the tensor
         # elements to the appropriate types.
         out_batch["event_mask"] = ~out_batch["time_delta"].isnan()
-        out_batch["dynamic_values_mask"] = ~out_batch["dynamic_values"].isnan()
 
-        out_batch["time_delta"] = torch.nan_to_num(out_batch["time_delta"], nan=0)
+        if "dynamic_values" in out_batch:
+            out_batch["dynamic_values_mask"] = ~out_batch["dynamic_values"].isnan()
+        else:
+            # Create a dynamic_values_mask with the correct dimensions
+            out_batch["dynamic_values_mask"] = torch.zeros(
+                (out_batch["event_mask"].shape[0], out_batch["event_mask"].shape[1], max_n_data),
+                dtype=torch.bool,
+                device=device
+            )
 
-        out_batch["dynamic_indices"] = torch.nan_to_num(out_batch["dynamic_indices"], nan=0).long()
-        out_batch["dynamic_measurement_indices"] = torch.nan_to_num(
-            out_batch["dynamic_measurement_indices"], nan=0
-        ).long()
-        out_batch["dynamic_values"] = torch.nan_to_num(out_batch["dynamic_values"], nan=0)
+        out_batch["time_delta"] = torch.nan_to_num(out_batch["time_delta"], nan=0).to(device)
+
+        if "dynamic_indices" in out_batch:
+            out_batch["dynamic_indices"] = torch.nan_to_num(out_batch["dynamic_indices"], nan=0).long().to(device)
+        if "dynamic_measurement_indices" in out_batch:
+            out_batch["dynamic_measurement_indices"] = torch.nan_to_num(
+                out_batch["dynamic_measurement_indices"], nan=0
+            ).long().to(device)
+        if "dynamic_values" in out_batch:
+            out_batch["dynamic_values"] = torch.nan_to_num(out_batch["dynamic_values"], nan=0).to(device)
 
         if self.config.do_include_start_time_min:
-            out_batch["start_time"] = torch.FloatTensor([e["start_time"] for e in batch])
+            out_batch["start_time"] = torch.FloatTensor([e["start_time"] for e in batch]).to(device)
         if self.config.do_include_subsequence_indices:
-            out_batch["start_idx"] = torch.LongTensor([e["start_idx"] for e in batch])
-            out_batch["end_idx"] = torch.LongTensor([e["end_idx"] for e in batch])
+            out_batch["start_idx"] = torch.LongTensor([e["start_idx"] for e in batch]).to(device)
+            out_batch["end_idx"] = torch.LongTensor([e["end_idx"] for e in batch]).to(device)
         if self.config.do_include_subject_id:
-            out_batch["subject_id"] = torch.LongTensor([e["subject_id"] for e in batch])
+            out_batch["subject_id"] = torch.LongTensor([e["subject_id"] for e in batch]).to(device)
 
         out_batch = PytorchBatch(**out_batch)
         self._register_end("collate_post_padding_processing")
@@ -728,15 +855,19 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
 
             out_labels[task] = []
             for e in batch:
-                out_labels[task].append(e[task])
+                if task in e:
+                    out_labels[task].append(e[task])
+                else:
+                    print(f"Warning: Label for task '{task}' missing in batch element: {e}")
+                    out_labels[task].append(None)
 
             match task_type:
                 case "multi_class_classification":
-                    out_labels[task] = torch.LongTensor(out_labels[task])
+                    out_labels[task] = torch.LongTensor([label for label in out_labels[task] if label is not None]).to(device)
                 case "binary_classification":
-                    out_labels[task] = torch.FloatTensor(out_labels[task])
+                    out_labels[task] = torch.FloatTensor([label for label in out_labels[task] if label is not None]).to(device)
                 case "regression":
-                    out_labels[task] = torch.FloatTensor(out_labels[task])
+                    out_labels[task] = torch.FloatTensor([label for label in out_labels[task] if label is not None]).to(device)
                 case _:
                     raise TypeError(f"Don't know how to tensorify task of type {task_type}!")
 
@@ -758,10 +889,15 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
         Returns:
             A fully collated, tensorized, and padded batch.
         """
+        print(f"Collating batch of size: {len(batch)}")
+        print(f"Batch before collation: {batch}")
+
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
         if self.do_produce_static_data:
-            out_batch = self.__static_and_dynamic_collate(batch)
+            out_batch = self.__static_and_dynamic_collate(batch, device)
         else:
-            out_batch = self.__dynamic_only_collate(batch)
+            out_batch = self.__dynamic_only_collate(batch, device)
 
         if not self.has_task:
             return out_batch
@@ -774,12 +910,33 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
             else:
                 print("Label missing")
 
+        if "dynamic_indices" not in out_batch:
+            out_batch["dynamic_indices"] = torch.zeros(len(batch), dtype=torch.long, device=device)
+
         # Modify the code in the `collate` function to handle missing labels
         a1c_labels = [e["A1cGreaterThan7"] for e in batch if "A1cGreaterThan7" in e]
         if not a1c_labels:
             print("Warning: 'A1cGreaterThan7' labels missing in the batch")  
-        out_labels["A1cGreaterThan7"] = torch.LongTensor(a1c_labels) if a1c_labels else None
-                
+        out_labels["A1cGreaterThan7"] = torch.LongTensor(a1c_labels).to(device) if a1c_labels else None
+        
+        if "dynamic_indices" in self.cached_data.columns:
+            # Handle the case where dynamic_indices is present
+            pass
+        else:
+            # Handle the case when dynamic_indices is missing or None
+            if self.cached_data.is_empty():
+                # If self.cached_data is empty, set dynamic_indices to an empty tensor
+                out_batch = {"dynamic_indices": torch.tensor([], dtype=torch.long, device=device)}
+            else:
+                # If self.cached_data is not empty
+                out_batch = {}
+                if "event_mask" in self.cached_data.columns:
+                    out_batch["event_mask"] = torch.from_numpy(self.cached_data["event_mask"].to_numpy()).to(device)
+                    out_batch["dynamic_indices"] = torch.zeros_like(out_batch["event_mask"], dtype=torch.long, device=device)
+                else:
+                    # If event_mask is also missing, create a tensor of zeros with the same length as self.cached_data
+                    out_batch["dynamic_indices"] = torch.zeros(len(self.cached_data), dtype=torch.long, device=device)
+
         self._register_start("collate_task_labels")
         out_labels = {}
 
@@ -796,11 +953,11 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
 
             match task_type:
                 case "multi_class_classification":
-                    out_labels[task] = torch.LongTensor([label for label in out_labels[task] if label is not None])
+                    out_labels[task] = torch.LongTensor([label for label in out_labels[task] if label is not None]).to(device)
                 case "binary_classification":
-                    out_labels[task] = torch.FloatTensor([label for label in out_labels[task] if label is not None])
+                    out_labels[task] = torch.FloatTensor([label for label in out_labels[task] if label is not None]).to(device)
                 case "regression":
-                    out_labels[task] = torch.FloatTensor([label for label in out_labels[task] if label is not None])
+                    out_labels[task] = torch.FloatTensor([label for label in out_labels[task] if label is not None]).to(device)
                 case _:
                     raise TypeError(f"Don't know how to tensorify task of type {task_type}!")
 
@@ -808,9 +965,10 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
         a1c_labels = [e["A1cGreaterThan7"] for e in batch if "A1cGreaterThan7" in e]
         if not a1c_labels:
             print("Warning: 'A1cGreaterThan7' labels missing in the batch")
-        out_labels["A1cGreaterThan7"] = torch.LongTensor(a1c_labels) if a1c_labels else None
+        out_labels["A1cGreaterThan7"] = torch.LongTensor(a1c_labels).to(device) if a1c_labels else None
         
         out_batch.stream_labels = out_labels
         self._register_end("collate_task_labels")
 
+        print(f"Collated batch: {out_batch}")
         return out_batch

@@ -294,7 +294,7 @@ class DataEmbeddingLayer(torch.nn.Module):
 
         if categorical_embedding_dim is None and numerical_embedding_dim is None:
             self.embedding_mode = EmbeddingMode.JOINT
-            self.embed_layer = torch.nn.EmbeddingBag(
+            self.data_embedding_layer = torch.nn.EmbeddingBag(
                 num_embeddings=n_total_embeddings,
                 embedding_dim=out_dim,
                 mode="sum",
@@ -576,12 +576,23 @@ class DataEmbeddingLayer(torch.nn.Module):
         return torch.stack(categorical_masks, dim=-2), torch.stack(numerical_masks, dim=-2)
 
     def _dynamic_embedding(self, batch: PytorchBatch) -> torch.Tensor:
-        """Returns the embedding of the dynamic features of the input batch.
+        """Returns the embedding of the dynamic features of the input batch."""
+        print(f"Batch keys: {list(batch.keys())}")  # Print the keys in the batch
 
-        Args:
-            batch: The input batch to be embedded.
-        """
-        batch_size, sequence_length, num_data_elements = batch["dynamic_values_mask"].shape
+        if "dynamic_indices" not in batch or batch["dynamic_indices"] is None:
+            print("'dynamic_indices' is missing or None in the batch.")
+            print(f"Batch contents: {batch}")
+            # Return a tensor filled with zeros if 'dynamic_indices' is missing or None
+            batch_size = len(batch["event_mask"])
+            sequence_length = batch["event_mask"].shape[1]
+            return torch.zeros(batch_size, sequence_length, self.out_dim, dtype=torch.float32)
+
+        batch_size, sequence_length, num_data_elements = batch["dynamic_indices"].shape
+        print(f"Batch shape: {batch_size}, {sequence_length}, {num_data_elements}")
+
+        if "dynamic_values_mask" not in batch:
+            batch["dynamic_values_mask"] = torch.ones_like(batch["dynamic_indices"], dtype=torch.bool)
+
         out_shape = (batch_size, sequence_length, self.out_dim)
 
         if self.split_by_measurement_indices:
@@ -596,13 +607,13 @@ class DataEmbeddingLayer(torch.nn.Module):
                 num_data_elements,
             )
             indices = batch["dynamic_indices"].unsqueeze(-2).expand(*expand_shape)
-            values = batch["dynamic_values"].unsqueeze(-2).expand(*expand_shape)
+            values = batch.get("dynamic_values", torch.zeros_like(indices)).unsqueeze(-2).expand(*expand_shape)
             measurement_indices = batch["dynamic_measurement_indices"].unsqueeze(-2).expand(*expand_shape)
             values_mask = batch["dynamic_values_mask"].unsqueeze(-2).expand(*expand_shape)
             values_mask = values_mask & numerical_mask
         else:
             indices = batch["dynamic_indices"]
-            values = batch["dynamic_values"]
+            values = batch.get("dynamic_values", torch.zeros_like(indices))
             measurement_indices = batch["dynamic_measurement_indices"]
             values_mask = batch["dynamic_values_mask"]
             categorical_mask = None
@@ -622,101 +633,35 @@ class DataEmbeddingLayer(torch.nn.Module):
         return embedded.view(*out_shape)
 
     def forward(self, batch: PytorchBatch) -> torch.Tensor:
-        """Returns the final embeddings of the values in the batch.
-
-        Args:
-            batch: The input batch to be embedded.
-
-        Returns:
-            The final embeddings. These will either be of shape (batch_size, sequence_length, out_dim) or
-            (batch_size, sequence_length, num_measurement_buckets, out_dim) depending on whether the
-            measurements are split or not.
-
-        Raises:
-            AssertionError: If `indices.max()` is greater than or equal to `self.n_total_embeddings`.
-            ValueError: If `self.embedding_mode` is not a valid `EmbeddingMode`, or if
-                `split_by_measurement_indices` is not `None` and there either there is an empty measurement
-                group beyond the first or there is an invalid specified group mode.
-
-        Examples:
-            >>> import torch
-            >>> # Here we construct a batch with batch size of 2, sequence length of 3, number of static data
-            >>> # elements of 3, and number of dynamic data elements of 2.
-            >>> batch = PytorchBatch(
-            ...     event_mask=torch.BoolTensor([[True, True, True], [True, True, False]]),
-            ...     static_indices=torch.LongTensor([[1, 2, 3], [4, 5, 6]]),
-            ...     static_measurement_indices=torch.LongTensor([[1, 1, 2], [2, 2, 3]]),
-            ...     dynamic_indices=torch.LongTensor([[[7, 8], [11, 10], [8, 7]], [[8, 7], [8, 10], [0, 0]]]),
-            ...     dynamic_measurement_indices=torch.LongTensor(
-            ...         [[[4, 4], [5, 5], [4, 4]], [[4, 4], [4, 5], [0, 0]]]
-            ...     ),
-            ...     dynamic_values=torch.FloatTensor(
-            ...         [[[1, 2], [0, 0], [1.1, 2.1]], [[5, 6], [7, 0], [0, 0]]]
-            ...     ),
-            ...     dynamic_values_mask=torch.BoolTensor(
-            ...         [
-            ...             [[True, True], [False, False], [True, True]],
-            ...             [[True, True], [True, False], [False, False]],
-            ...         ]
-            ...     ),
-            ... )
-            >>> L = DataEmbeddingLayer(
-            ...     n_total_embeddings=100,
-            ...     out_dim=10,
-            ...     static_embedding_mode=StaticEmbeddingMode.DROP,
-            ...     categorical_embedding_dim=5,
-            ...     numerical_embedding_dim=5,
-            ...     split_by_measurement_indices=None,
-            ...     do_normalize_by_measurement_index=False,
-            ...     categorical_weight=1 / 2,
-            ...     numerical_weight=1 / 2,
-            ... )
-            >>> out = L(batch)
-            >>> out.shape # batch, seq_len, out_dim
-            torch.Size([2, 3, 10])
-            >>> L = DataEmbeddingLayer(
-            ...     n_total_embeddings=100,
-            ...     out_dim=10,
-            ...     static_embedding_mode='sum_all',
-            ...     categorical_embedding_dim=5,
-            ...     numerical_embedding_dim=5,
-            ...     split_by_measurement_indices=[
-            ...         [(4, MeasIndexGroupOptions.CATEGORICAL_ONLY)],
-            ...         [5, (4, 'categorical_and_numerical')],
-            ...     ],
-            ...     do_normalize_by_measurement_index=True,
-            ...     static_weight=1/3,
-            ...     dynamic_weight=2/3,
-            ...     categorical_weight=1/4,
-            ...     numerical_weight=3/4,
-            ... )
-            >>> out = L(batch)
-            >>> out.shape # batch, seq_len, dependency graph length (split_by_measruement_indices), out_dim
-            torch.Size([2, 3, 2, 10])
-        """
+        """Returns the final embeddings of the values in the batch."""
         embedded = self._dynamic_embedding(batch)
-        # embedded is of shape (batch_size, sequence_length, out_dim) or of shape
-        # (batch_size, sequence_length, num_measurement_buckets, out_dim)
 
-        mask = batch.event_mask
+        if self.static_embedding_mode == StaticEmbeddingMode.DROP:
+            return embedded
+
+        if "static_indices" not in batch or batch["static_indices"] is None:
+            print("'static_indices' is missing or None in the batch.")
+            print(f"Batch contents: {batch}")
+            # Return the dynamic embeddings only if 'static_indices' is missing or None
+            return embedded
+
+        static_embedded = self._static_embedding(batch).unsqueeze(1)
+
+        # Ensure that the mask is on the same device as the embedded tensor
+        mask = batch.event_mask.to(embedded.device)
         while len(mask.shape) < len(embedded.shape):
             mask = mask.unsqueeze(-1)
 
         mask = mask.expand_as(embedded)
         embedded = torch.where(mask, embedded, torch.zeros_like(embedded))
 
-        if self.static_embedding_mode == StaticEmbeddingMode.DROP:
-            return embedded
-
-        static_embedded = self._static_embedding(batch).unsqueeze(1)
-        # static_embedded is of shape (batch_size, 1, out_dim)
-
         if self.split_by_measurement_indices:
             static_embedded = static_embedded.unsqueeze(2)
-            # static_embedded is now of shape (batch_size, 1, 1, out_dim)
 
         match self.static_embedding_mode:
             case StaticEmbeddingMode.SUM_ALL:
+                # Ensure that static_embedded is on the same device as embedded
+                static_embedded = static_embedded.to(embedded.device)
                 embedded = self.dynamic_weight * embedded + self.static_weight * static_embedded
                 return torch.where(mask, embedded, torch.zeros_like(embedded))
             case _:

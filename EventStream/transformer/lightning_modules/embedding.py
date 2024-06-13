@@ -103,9 +103,9 @@ def get_embeddings(cfg: FinetuneConfig):
 
     torch.multiprocessing.set_sharing_strategy("file_system")
 
-    train_pyd = PytorchDataset(cfg.data_config, split="train")
-    tuning_pyd = PytorchDataset(cfg.data_config, split="tuning")
-    held_out_pyd = PytorchDataset(cfg.data_config, split="held_out")
+    train_pyd = PytorchDataset(cfg.data_config, split="train", dl_reps_dir=Path("data/DL_reps"))
+    tuning_pyd = PytorchDataset(cfg.data_config, split="tuning", dl_reps_dir=Path("data/DL_reps"))
+    held_out_pyd = PytorchDataset(cfg.data_config, split="held_out", dl_reps_dir=Path("data/DL_reps"))
 
     config = cfg.config
     cfg.data_config

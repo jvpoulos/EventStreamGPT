@@ -236,10 +236,10 @@ class PytorchBatch:
                 if self.static_measurement_indices is None
                 else self.static_measurement_indices[batch_index]
             ),
-            dynamic_indices=self.dynamic_indices[batch_index, seq_index, meas_index],
-            dynamic_measurement_indices=self.dynamic_measurement_indices[batch_index, seq_index, meas_index],
-            dynamic_values=self.dynamic_values[batch_index, seq_index, meas_index],
-            dynamic_values_mask=self.dynamic_values_mask[batch_index, seq_index, meas_index],
+            dynamic_indices=None if self.dynamic_indices is None else self.dynamic_indices[batch_index, seq_index, meas_index],
+            dynamic_measurement_indices=None if self.dynamic_measurement_indices is None else self.dynamic_measurement_indices[batch_index, seq_index, meas_index],
+            dynamic_values=None if self.dynamic_values is None else self.dynamic_values[batch_index, seq_index, meas_index],
+            dynamic_values_mask=None if self.dynamic_values_mask is None else self.dynamic_values_mask[batch_index, seq_index, meas_index],
             start_time=None if self.start_time is None else self.start_time[batch_index],
             start_idx=None if self.start_idx is None else self.start_idx[batch_index],
             end_idx=None if self.end_idx is None else self.end_idx[batch_index],
