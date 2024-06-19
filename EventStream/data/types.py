@@ -1,9 +1,10 @@
 """A collection of objects and enumerations for better type support in data applications."""
 
 import dataclasses
+from dataclasses import dataclass
 import enum
 from collections import defaultdict
-from typing import Any, Union
+from typing import Any, Union, List, Optional
 
 import polars as pl
 import torch
@@ -129,6 +130,8 @@ class PytorchBatch:
             value was recorded for a given dynamic data element, the value in this tensor will be zero.
         dynamic_values_mask: A boolean tensor of shape (batch_size, sequence_length, n_data_elements)
             indicating which values in the `dynamic_values` tensor were actually observed.
+        dynamic_indices_event_type: A tensor of shape (batch_size, sequence_length) indicating the event types
+            for each dynamic index.
         start_time: A float tensor of shape (batch_size,) indicating the start time in minutes since the epoch
             of each subject's sequence in the batch. This is often unset, as it is only used in generation
             when we may need to know the actual time of day of any generated event.
@@ -159,6 +162,8 @@ class PytorchBatch:
     dynamic_values: torch.FloatTensor | None = None
     dynamic_values_mask: torch.BoolTensor | None = None
 
+    dynamic_indices_event_type: torch.Tensor | None = None
+
     start_time: torch.FloatTensor | None = None
     start_idx: torch.LongTensor | None = None
     end_idx: torch.LongTensor | None = None
@@ -172,7 +177,16 @@ class PytorchBatch:
 
         Assumes all elements of the batch are on the same device.
         """
-        return self.event_mask.device
+        for tensor in vars(self).values():
+            if isinstance(tensor, torch.Tensor):
+                return tensor.device
+        raise ValueError("No tensor found in PytorchBatch to determine device.")
+
+    def to(self, device: torch.device) -> "PytorchBatch":
+        for name, tensor in vars(self).items():
+            if isinstance(tensor, torch.Tensor):
+                setattr(self, name, tensor.to(device))
+        return self
 
     @property
     def batch_size(self) -> int:
@@ -207,8 +221,8 @@ class PytorchBatch:
         return self.static_indices.shape[1]
 
     def get(self, item: str, default: Any) -> Any:
-        """A dictionary like get method for this batch, by attribute name."""
-        return getattr(self, item) if item in self.keys() else default
+        """A dictionary-like get method for this batch, by attribute name."""
+        return getattr(self, item, default)
 
     def _slice(self, index: tuple[int | slice] | int | slice) -> "PytorchBatch":
         if not isinstance(index, tuple):
@@ -219,27 +233,29 @@ class PytorchBatch:
             raise ValueError(f"Invalid index {index} for PytorchBatch! Can only consist of ints and slices.")
 
         batch_index = index[0]
-        seq_index = slice(None)
-        meas_index = slice(None)
+        seq_index = slice(None) if len(index) < 2 else index[1]
+        meas_index = slice(None) if len(index) < 3 else index[2]
 
-        if len(index) > 1:
-            seq_index = index[1]
-        if len(index) > 2:
-            meas_index = index[2]
-
+    def _handle_slice(self, tensor, batch_index, seq_index, meas_index):
+        if isinstance(batch_index, slice) or isinstance(seq_index, slice) or isinstance(meas_index, slice):
+            return tensor[batch_index, seq_index, meas_index]
+        else:
+            return tensor[batch_index, seq_index, meas_index]
+        
         return PytorchBatch(
-            event_mask=self.event_mask[batch_index, seq_index],
-            time_delta=self.time_delta[batch_index, seq_index],
+            event_mask=self.event_mask[batch_index, seq_index] if self.event_mask is not None else None,
+            time_delta=self.time_delta[batch_index, seq_index] if self.time_delta is not None else None,
             static_indices=None if self.static_indices is None else self.static_indices[batch_index],
             static_measurement_indices=(
                 None
                 if self.static_measurement_indices is None
                 else self.static_measurement_indices[batch_index]
             ),
-            dynamic_indices=None if self.dynamic_indices is None else self.dynamic_indices[batch_index, seq_index, meas_index],
-            dynamic_measurement_indices=None if self.dynamic_measurement_indices is None else self.dynamic_measurement_indices[batch_index, seq_index, meas_index],
-            dynamic_values=None if self.dynamic_values is None else self.dynamic_values[batch_index, seq_index, meas_index],
-            dynamic_values_mask=None if self.dynamic_values_mask is None else self.dynamic_values_mask[batch_index, seq_index, meas_index],
+            dynamic_indices=None if self.dynamic_indices is None else self._handle_slice(self.dynamic_indices, batch_index, seq_index, meas_index),
+            dynamic_measurement_indices=None if self.dynamic_measurement_indices is None else self._handle_slice(self.dynamic_measurement_indices, batch_index, seq_index, meas_index),
+            dynamic_values=None if self.dynamic_values is None else self._handle_slice(self.dynamic_values, batch_index, seq_index, meas_index),
+            dynamic_values_mask=None if self.dynamic_values_mask is None else self._handle_slice(self.dynamic_values_mask, batch_index, seq_index, meas_index),
+            dynamic_indices_event_type=None if self.dynamic_indices_event_type is None else self.dynamic_indices_event_type[batch_index, seq_index],
             start_time=None if self.start_time is None else self.start_time[batch_index],
             start_idx=None if self.start_idx is None else self.start_idx[batch_index],
             end_idx=None if self.end_idx is None else self.end_idx[batch_index],

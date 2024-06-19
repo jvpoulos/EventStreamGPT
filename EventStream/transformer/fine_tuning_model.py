@@ -8,42 +8,48 @@ from .transformer import (
     ConditionallyIndependentPointProcessTransformer,
     NestedAttentionPointProcessTransformer,
     StructuredTransformerPreTrainedModel,
+    ConditionallyIndependentPointProcessInputLayer
 )
 from .utils import safe_masked_max, safe_weighted_avg
 
 
 from ..data.vocabulary import VocabularyConfig
 
+import logging
+
+logger = logging.getLogger(__name__)
+
+class CustomConditionallyIndependentPointProcessTransformer(ConditionallyIndependentPointProcessTransformer):
+    def __init__(self, config: StructuredTransformerConfig, vocabulary_config: VocabularyConfig):
+        oov_index = max(vocabulary_config.vocab_sizes_by_measurement.values()) + 1
+        print(f"CustomConditionallyIndependentPointProcessTransformer: oov_index = {oov_index}")
+        super().__init__(config, vocabulary_config, oov_index=oov_index)
+
+        self.input_layer = ConditionallyIndependentPointProcessInputLayer(
+            config,
+            vocabulary_config.vocab_sizes_by_measurement,
+            oov_index=oov_index,
+            do_use_sinusoidal=config.do_use_sinusoidal  # Pass the attribute here
+        )
+
 class ESTForStreamClassification(StructuredTransformerPreTrainedModel):
-    """A model for fine-tuning on classification tasks."""
-
-    def __init__(
-        self,
-        config: StructuredTransformerConfig,
-        vocabulary_config: VocabularyConfig,
-    ):
+    def __init__(self, config: StructuredTransformerConfig, vocabulary_config: VocabularyConfig):
         super().__init__(config)
-
-        self.task = config.finetuning_task
-        print(f"self.task type: {type(self.task)}")
-        print(f"self.task value: {self.task}")
 
         if self._uses_dep_graph:
             self.encoder = NestedAttentionPointProcessTransformer(config)
         else:
-            self.encoder = ConditionallyIndependentPointProcessTransformer(
-                config, vocabulary_config=vocabulary_config  # Pass the vocabulary_config argument
-            )
+            self.encoder = CustomConditionallyIndependentPointProcessTransformer(config, vocabulary_config)
 
         self.pooling_method = config.task_specific_params["pooling_method"]
 
         is_binary = config.id2label == {0: False, 1: True}
         if is_binary:
             assert config.num_labels == 2
-            self.logit_layer = torch.nn.Linear(config.hidden_size, 1)
+            self.logit_layer = torch.nn.Linear(config.hidden_size, 1).to(config.device)
             self.criteria = torch.nn.BCEWithLogitsLoss()
         else:
-            self.logit_layer = torch.nn.Linear(config.hidden_size, config.num_labels)
+            self.logit_layer = torch.nn.Linear(config.hidden_size, config.num_labels).to(config.device)
             self.criteria = torch.nn.CrossEntropyLoss()
 
         # Initialize weights and apply final processing
@@ -53,62 +59,55 @@ class ESTForStreamClassification(StructuredTransformerPreTrainedModel):
     def _uses_dep_graph(self):
         return self.config.structured_event_processing_mode == StructuredEventProcessingMode.NESTED_ATTENTION
 
-    def forward(self, batch: PytorchBatch, **kwargs) -> StreamClassificationModelOutput:
+    def forward(self, dynamic_indices_event_type, dynamic_counts_event_type, dynamic_indices, dynamic_counts, labels=None, **kwargs) -> StreamClassificationModelOutput:
         """Runs the forward pass through the fine-tuning label prediction.
 
         Args:
-            batch: The batch of data to model.
+            dynamic_indices_event_type: The dynamic indices for event types.
+            dynamic_counts_event_type: The dynamic counts for event types.
+            dynamic_indices: The dynamic indices for measurements.
+            dynamic_counts: The dynamic counts for measurements.
+            labels: The labels for the fine-tuning task.
 
         Returns:
             A `StreamClassificationModelOutput` object capturing loss, predictions, and labels for the
             fine-tuning task in question.
         """
-        encoded = self.encoder(batch, **kwargs).last_hidden_state
+        # Check if the input tensors are valid PyTorch tensors
+        if not isinstance(dynamic_indices_event_type, torch.Tensor):
+            raise TypeError("Input 'dynamic_indices_event_type' should be a PyTorch tensor.")
+        if not isinstance(dynamic_counts_event_type, torch.Tensor):
+            raise TypeError("Input 'dynamic_counts_event_type' should be a PyTorch tensor.")
+        if not isinstance(dynamic_indices, torch.Tensor):
+            raise TypeError("Input 'dynamic_indices' should be a PyTorch tensor.")
+        if not isinstance(dynamic_counts, torch.Tensor):
+            raise TypeError("Input 'dynamic_counts' should be a PyTorch tensor.")
+
+        device = self.logit_layer.weight.device
+
+        # Move the input tensors to the same device as the model
+        dynamic_indices_event_type = dynamic_indices_event_type.to(device)
+        dynamic_counts_event_type = dynamic_counts_event_type.to(device)
+        dynamic_indices = dynamic_indices.to(device)
+        dynamic_counts = dynamic_counts.to(device)
+
+        encoded = self.encoder(
+            dynamic_indices_event_type=dynamic_indices_event_type,
+            dynamic_counts_event_type=dynamic_counts_event_type,
+            dynamic_indices=dynamic_indices,
+            dynamic_counts=dynamic_counts,
+            **kwargs
+        ).last_hidden_state
+
         event_encoded = encoded[:, :, -1, :] if self._uses_dep_graph else encoded
 
-        # `event_encoded` is of shape [batch X seq X hidden_dim]. For pooling, I want to put the sequence
-        # dimension as last, so we'll transpose.
-        event_encoded = event_encoded.transpose(1, 2)
+        # Rest of the code...
 
-        match self.pooling_method:
-            case "cls":
-                stream_encoded = event_encoded[:, :, 0]
-            case "last":
-                stream_encoded = event_encoded[:, :, -1]
-            case "max":
-                stream_encoded = safe_masked_max(event_encoded, batch["event_mask"])
-            case "mean":
-                stream_encoded, _ = safe_weighted_avg(event_encoded, batch["event_mask"])
-            case _:
-                raise ValueError(f"{self.pooling_method} is not a supported pooling method.")
-
-        logits = self.logit_layer(stream_encoded).squeeze(-1)
-
-        if "stream_labels" not in batch or batch["stream_labels"] is None:
-            # Labels are missing
-            return StreamClassificationModelOutput(
-                loss=None,
-                preds=logits,
-                labels=None,
-            )
-        
-        if isinstance(self.task, str):
-            labels = batch["stream_labels"].get(self.task)
+        if labels is not None:
+            labels = labels.to(logits.device)
+            loss = self.criteria(logits, labels)
         else:
-            labels = batch["stream_labels"]
-
-        print("Labels in the forward pass:")
-        print(batch["stream_labels"])
-
-        if labels is None:
-            # Labels for the specific task are missing
-            return StreamClassificationModelOutput(
-                loss=None,
-                preds=logits,
-                labels=None,
-            )
-
-        loss = self.criteria(logits, labels)
+            loss = None
 
         return StreamClassificationModelOutput(
             loss=loss,

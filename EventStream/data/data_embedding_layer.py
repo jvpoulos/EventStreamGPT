@@ -202,6 +202,7 @@ class DataEmbeddingLayer(torch.nn.Module):
         n_total_embeddings: int,
         out_dim: int,
         static_embedding_mode: StaticEmbeddingMode,
+        oov_index: int,  # Add this parameter
         categorical_embedding_dim: int | None = None,
         numerical_embedding_dim: int | None = None,
         split_by_measurement_indices: list[list[MEAS_INDEX_GROUP_T]] | None = None,
@@ -211,7 +212,6 @@ class DataEmbeddingLayer(torch.nn.Module):
         categorical_weight: float = 1 / 2,
         numerical_weight: float = 1 / 2,
     ):
-        """Initializes the layer."""
         super().__init__()
 
         if type(out_dim) is not int:
@@ -299,7 +299,9 @@ class DataEmbeddingLayer(torch.nn.Module):
                 embedding_dim=out_dim,
                 mode="sum",
                 padding_idx=0,
+                sparse=True,
             )
+            self.data_embedding_layer.weight.data[self.oov_index] = 0  # Set OOV embedding to zero
         else:
             self.embedding_mode = EmbeddingMode.SPLIT_CATEGORICAL_NUMERICAL
             if (categorical_embedding_dim is None) or (numerical_embedding_dim is None):
@@ -312,14 +314,19 @@ class DataEmbeddingLayer(torch.nn.Module):
                 embedding_dim=categorical_embedding_dim,
                 mode="sum",
                 padding_idx=0,
+                sparse=True,
             )
+            self.oov_index = oov_index  # Assign the oov_index to self.oov_index
+            self.categorical_embed_layer.weight.data[self.oov_index] = 0  # Set OOV embedding to zero
             self.cat_proj = torch.nn.Linear(categorical_embedding_dim, out_dim)
             self.numerical_embed_layer = torch.nn.EmbeddingBag(
                 num_embeddings=n_total_embeddings,
                 embedding_dim=numerical_embedding_dim,
                 mode="sum",
                 padding_idx=0,
+                sparse=True,
             )
+            self.numerical_embed_layer.weight.data[self.oov_index] = 0  # Set OOV embedding to zero
             self.num_proj = torch.nn.Linear(numerical_embedding_dim, out_dim)
 
     @staticmethod
@@ -406,40 +413,6 @@ class DataEmbeddingLayer(torch.nn.Module):
         values_mask: torch.Tensor | None = None,
         cat_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Returns a weighted sum of categorical and numerical embeddings of the input indices and values.
-
-        This follows (roughly) the embedding strategy of :footcite:t:`gorishniy2021revisiting` (`link`_) for
-        joint embedding of categorical and multi-variate numerical features. In particular, given categorical
-        indices and associated continuous values, it produces a categorical embedding of the indices first,
-        then (with a separate embedding layer) re-embeds those categorical indices that have associated values
-        observed, this time weighted by the associated numerical values, then outputs a weighted sum of the
-        two embeddings. In the case that numerical and categorical output embeddings are distinct, both are
-        projected into the output dimensionality through additional linear layers prior to the final
-        summation.
-
-        .. _link: https://openreview.net/pdf?id=i_Q1yrOegLY
-
-        .. footbibliography::
-
-        Args:
-            indices: A tensor of shape ``(batch_size, num_measurements)`` that contains the indices of the
-                observations in the batch. Zero indicates padding.
-            measurement_indices: A tensor of shape ``(batch_size, num_measurements)`` that contains the
-                indices of the measurements in each batch element. Zero indicates padding.
-            values: A tensor of shape ``(batch_size, num_measurements)`` that contains any continuous values
-                associated with the observations in the batch. If values are not present for an observation,
-                the value in this tensor will be zero; however, a zero value itself does not indicate a value
-                wasn't present for the observation.
-            values_mask: A boolean tensor of shape ``(batch_size, num_measurements)`` that contains a mask
-                indicating whether or not a given index, value pair should be included in the numerical
-                embedding.
-            cat_mask: A boolean tensor of shape ``(batch_size, num_measurements)`` that contains a mask
-                indicating whether or not a given index should be included in the categorical embedding.
-
-        Returns:
-            A tensor of shape ``(batch_size, out_dim)`` that contains the final, combined embedding of the
-            input, in line with the description above.
-        """
         cat_values = torch.ones_like(indices, dtype=torch.float32)
         if cat_mask is not None:
             cat_values = torch.where(cat_mask, cat_values, 0)
@@ -456,7 +429,12 @@ class DataEmbeddingLayer(torch.nn.Module):
         if self.do_normalize_by_measurement_index:
             num_values *= meas_norm
 
-        num_embeds = self.num_proj(self.numerical_embed_layer(indices, per_sample_weights=num_values))
+        # Check if num_values is empty
+        if num_values.numel() == 0:
+            num_embeds = torch.zeros_like(cat_embeds)
+        else:
+            num_values = num_values.view(indices.shape)
+            num_embeds = self.num_proj(self.numerical_embed_layer(indices, per_sample_weights=num_values))
 
         return self.categorical_weight * cat_embeds + self.numerical_weight * num_embeds
 
@@ -468,6 +446,8 @@ class DataEmbeddingLayer(torch.nn.Module):
         values_mask: torch.Tensor | None = None,
         cat_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # Map OOV indices to the special OOV token index
+        indices = torch.where(indices >= self.n_total_embeddings, self.oov_index, indices)
         torch._assert(
             indices.max() < self.n_total_embeddings,
             f"Invalid embedding! {indices.max()} >= {self.n_total_embeddings}",
@@ -587,7 +567,15 @@ class DataEmbeddingLayer(torch.nn.Module):
             sequence_length = batch["event_mask"].shape[1]
             return torch.zeros(batch_size, sequence_length, self.out_dim, dtype=torch.float32)
 
-        batch_size, sequence_length, num_data_elements = batch["dynamic_indices"].shape
+        dynamic_indices_shape = batch["dynamic_indices"].shape
+        if len(dynamic_indices_shape) == 2:
+            batch_size, sequence_length = dynamic_indices_shape
+            num_data_elements = 1
+        elif len(dynamic_indices_shape) == 3:
+            batch_size, sequence_length, num_data_elements = dynamic_indices_shape
+        else:
+            raise ValueError(f"Unexpected shape for 'dynamic_indices': {dynamic_indices_shape}")
+
         print(f"Batch shape: {batch_size}, {sequence_length}, {num_data_elements}")
 
         if "dynamic_values_mask" not in batch:
@@ -607,14 +595,26 @@ class DataEmbeddingLayer(torch.nn.Module):
                 num_data_elements,
             )
             indices = batch["dynamic_indices"].unsqueeze(-2).expand(*expand_shape)
-            values = batch.get("dynamic_values", torch.zeros_like(indices)).unsqueeze(-2).expand(*expand_shape)
-            measurement_indices = batch["dynamic_measurement_indices"].unsqueeze(-2).expand(*expand_shape)
+            values = batch.get("dynamic_values")
+            if values is None:
+                values = torch.zeros_like(indices)
+            else:
+                values = values.unsqueeze(-2).expand(*expand_shape)
+            measurement_indices = batch.get("dynamic_measurement_indices")
+            if measurement_indices is None:
+                measurement_indices = torch.zeros_like(indices, dtype=torch.long)
+            else:
+                measurement_indices = measurement_indices.unsqueeze(-2).expand(*expand_shape)
             values_mask = batch["dynamic_values_mask"].unsqueeze(-2).expand(*expand_shape)
             values_mask = values_mask & numerical_mask
         else:
             indices = batch["dynamic_indices"]
-            values = batch.get("dynamic_values", torch.zeros_like(indices))
-            measurement_indices = batch["dynamic_measurement_indices"]
+            values = batch.get("dynamic_values")
+            if values is None:
+                values = torch.zeros_like(indices)
+            measurement_indices = batch.get("dynamic_measurement_indices")
+            if measurement_indices is None:
+                measurement_indices = torch.zeros_like(indices, dtype=torch.long)
             values_mask = batch["dynamic_values_mask"]
             categorical_mask = None
 

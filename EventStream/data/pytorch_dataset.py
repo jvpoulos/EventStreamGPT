@@ -418,18 +418,52 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
                     self.out_batch["dynamic_indices"] = torch.zeros(len(self.cached_data), dtype=torch.long)
     
     def load_cached_data(self):
-        if self.dl_reps_dir is None:
+        if not self.dl_reps_dir:
             raise ValueError("The 'dl_reps_dir' attribute must be set to a valid directory path.")
 
-        parquet_files = list(self.dl_reps_dir.glob(f"{self.split}*.parquet"))
-        if parquet_files:
-            print(f"Found {len(parquet_files)} Parquet files for split '{self.split}'")
-            self.cached_data = pd.concat(
-                [pd.read_parquet(file) for file in parquet_files], ignore_index=True
-            )
+        cached_path = self.dl_reps_dir / f"{self.split}*.parquet"
+        parquet_files = list(cached_path.parent.glob(cached_path.name))
+
+        if not parquet_files:
+            raise FileNotFoundError(f"No Parquet files found for split '{self.split}' in directory '{self.dl_reps_dir}'")
+
+        print(f"Loading Parquet files for split '{self.split}':")
+        cached_data_list = []
+        for parquet_file in parquet_files:
+            print(f"File: {parquet_file}")
+            try:
+                df = pd.read_parquet(parquet_file)
+                cached_data_list.append(df)
+            except Exception as e:
+                print(f"Error reading Parquet file: {parquet_file}")
+                print(f"Error message: {str(e)}")
+                continue
+
+        self.cached_data = pd.concat(cached_data_list, ignore_index=True)
+
+        # Handle dynamic_indices_event_type separately
+        if 'dynamic_indices_event_type' in self.cached_data.columns:
+            self.cached_data['dynamic_indices_event_type'] = self.cached_data['dynamic_indices_event_type'].apply(lambda x: [int(i) for i in x])
+            dynamic_indices_event_type = self.cached_data['dynamic_indices_event_type']
+            self.cached_data = self.cached_data.drop('dynamic_indices_event_type', axis=1)
         else:
-            print(f"No Parquet files found for split '{self.split}', creating an empty DataFrame")
-            self.cached_data = pd.DataFrame()
+            dynamic_indices_event_type = None
+
+        # Convert the numeric columns to a PyTorch tensor
+        numeric_columns = self.cached_data.select_dtypes(include=[np.number]).columns
+        self.cached_data_tensor = torch.from_numpy(self.cached_data[numeric_columns].values)
+
+        # Move the cached data tensor to the specified device
+        if self.device is not None:
+            self.cached_data_tensor = self.cached_data_tensor.to(self.device)
+
+        # Store dynamic_indices_event_type separately
+        if dynamic_indices_event_type is not None:
+            self.dynamic_indices_event_type = dynamic_indices_event_type.tolist()
+
+        print(f"Loaded cached data from {self.dl_reps_dir} for split '{self.split}'.")
+        print(f"Cached data tensor shape: {self.cached_data_tensor.shape}")
+            
     @staticmethod
     def _build_task_cached_df(task_df: pl.LazyFrame, cached_data: pl.LazyFrame) -> pl.LazyFrame:
         """Restricts the data in a cached dataframe to only contain data for the passed task dataframe.
@@ -546,6 +580,11 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
         if task_cached_data.collect().empty:
             raise ValueError(f"Task-specific cached data is empty for split '{split}'")
 
+        # Handle missing columns
+        missing_cols = [col for col in time_dep_cols if col not in cached_data.columns]
+        for col in missing_cols:
+            cached_data = cached_data.with_column(pl.lit(None).alias(col))
+
         if "time" in cached_data.columns:
             time_col_expr = pl.col("time")
         elif "time_delta" in cached_data.columns:
@@ -593,9 +632,9 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
                 else:
                     full_subj_data[col_name] = col_data if isinstance(col_data, list) else [col_data]
             
-            # Handle missing 'dynamic_indices' column
-            if "dynamic_indices" not in full_subj_data:
-                full_subj_data["dynamic_indices"] = []
+            for col in self.columns:
+                if col not in full_subj_data:
+                    full_subj_data[col] = [] if col in ['dynamic_indices', 'dynamic_values', 'dynamic_measurement_indices'] else [0.0]
             
             return self._seeded_getitem(idx, full_subj_data)
         
@@ -674,28 +713,30 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
             print("Cached data:", self.cached_data)
             raise e
 
-    def __static_and_dynamic_collate(self, batch: list[DATA_ITEM_T], device: torch.device) -> PytorchBatch:
+    def __static_and_dynamic_collate(self, batch: list[DATA_ITEM_T], device: torch.device) -> dict:
         """An internal collate function for both static and dynamic data."""
         out_batch = self.__dynamic_only_collate(batch, device)
 
         # Get the maximum number of static elements in the batch.
-        max_n_static = max(len(e["static_indices"]) for e in batch)
+        max_n_static = max(len(e.get("static_indices", [])) for e in batch)
 
         # Walk through the batch and pad the associated tensors in all requisite dimensions.
         self._register_start("collate_static_padding")
         out = defaultdict(list)
         for e in batch:
             if self.do_produce_static_data:
-                n_static = len(e["static_indices"])
+                n_static = len(e.get("static_indices", []))
                 static_delta = max_n_static - n_static
                 out["static_indices"].append(
                     torch.nn.functional.pad(
-                        torch.Tensor(e["static_indices"]).to(device), (0, static_delta), value=np.NaN
+                        torch.Tensor(e.get("static_indices", [])).to(device),
+                        (0, static_delta),
+                        value=np.NaN,
                     )
                 )
                 out["static_measurement_indices"].append(
                     torch.nn.functional.pad(
-                        torch.Tensor(e["static_measurement_indices"]).to(device),
+                        torch.Tensor(e.get("static_measurement_indices", [])).to(device),
                         (0, static_delta),
                         value=np.NaN,
                     )
@@ -704,30 +745,28 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
 
         self._register_start("collate_static_post_padding")
         # Unsqueeze the padded tensors into the batch dimension and combine them.
-        out = {k: torch.cat([T.unsqueeze(0) for T in Ts], dim=0).to(device) for k, Ts in out.items()}
+        out = {
+            k: torch.cat([T.unsqueeze(0) for T in Ts], dim=0).to(device)
+            for k, Ts in out.items()
+        }
 
         # Convert to the right types and add to the batch.
         out_batch["static_indices"] = torch.nan_to_num(out["static_indices"], nan=0).long().to(device)
-        out_batch["static_measurement_indices"] = torch.nan_to_num(
-            out["static_measurement_indices"], nan=0
-        ).long().to(device)
+        out_batch["static_measurement_indices"] = torch.nan_to_num(out["static_measurement_indices"], nan=0).long().to(device)
         self._register_end("collate_static_post_padding")
 
         return out_batch
 
-    def __dynamic_only_collate(self, batch: list[DATA_ITEM_T], device: torch.device) -> PytorchBatch:
+    def __dynamic_only_collate(self, batch: list[DATA_ITEM_T], device: torch.device) -> dict:
         """An internal collate function for dynamic data alone."""
         # Get the local max sequence length and n_data elements for padding.
         max_seq_len = max(len(e.get("time_delta", [])) for e in batch)
 
         max_n_data = 0
         for e in batch:
-            if "dynamic_indices" in e:
-                for v in e["dynamic_indices"]:
-                    if isinstance(v, (list, np.ndarray)):
-                        max_n_data = max(max_n_data, len(v))
-                    else:
-                        max_n_data = max(max_n_data, 1)
+            max_n_data = max(max_n_data, max(len(v) for v in e.get("dynamic_indices", [])))
+        if max_n_data == 0:
+            raise ValueError(f"Batch has no dynamic measurements! Got:\n{batch[0]}\n{batch[1]}\n...")
 
         # Walk through the batch and pad the associated tensors in all requisite dimensions.
         self._register_start("collate_dynamic_padding")
@@ -741,61 +780,110 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
 
             if self.seq_padding_side == SeqPaddingSide.RIGHT:
                 out_numeric["time_delta"].append(
-                    torch.nn.functional.pad(torch.Tensor(e.get("time_delta", [])).to(device), (0, seq_delta), value=np.NaN)
+                    torch.nn.functional.pad(
+                        torch.Tensor(e.get("time_delta", [])).to(device),
+                        (0, seq_delta),
+                        value=np.NaN,
+                    )
                 )
             else:
                 out_numeric["time_delta"].append(
-                    torch.nn.functional.pad(torch.Tensor(e.get("time_delta", [])).to(device), (seq_delta, 0), value=np.NaN)
+                    torch.nn.functional.pad(
+                        torch.Tensor(e.get("time_delta", [])).to(device),
+                        (seq_delta, 0),
+                        value=np.NaN,
+                    )
                 )
 
             data_elements_numeric = defaultdict(list)
             data_elements_datetime = defaultdict(list)
             data_elements_object = defaultdict(list)
 
-            for k in ("dynamic_indices", "dynamic_values", "dynamic_measurement_indices"):
-                if k in e:
-                    for vs in e[k]:
-                        if isinstance(vs, (list, np.ndarray)):
-                            data_delta = max_n_data - len(vs)
-                            vs = [v if v is not None else np.NaN for v in vs]
+            for k in ("dynamic_counts_event_type", "dynamic_indices", "dynamic_counts"):
+                values = e.get(k, [])
+                if not values:
+                    continue
+
+                if isinstance(values[0], (list, np.ndarray)):
+                    values = [[v if v is not None else np.NaN for v in value] for value in values]
+                    data_delta = max_n_data - max(len(v) for v in values)
+                else:
+                    values = [[v if v is not None else np.NaN] for v in values]
+                    data_delta = max_n_data - 1
+
+                # Separate data elements based on data type
+                if isinstance(values[0][0], float):
+                    data_elements_numeric[k].extend(
+                        [
+                            torch.nn.functional.pad(
+                                torch.Tensor(value).to(device),
+                                (0, data_delta),
+                                value=np.NaN,
+                            )
+                            for value in values
+                        ]
+                    )
+                elif isinstance(values[0][0], datetime):
+                    data_elements_datetime[k].extend(
+                        [
+                            torch.nn.functional.pad(
+                                torch.Tensor([v.timestamp() for v in value]).to(device),
+                                (0, data_delta),
+                                value=np.NaN,
+                            )
+                            for value in values
+                        ]
+                    )
+                else:
+                    data_elements_object[k].extend(
+                        [
+                            torch.nn.functional.pad(
+                                torch.Tensor([hash(str(v)) for v in value]).to(device),
+                                (0, data_delta),
+                                value=np.NaN,
+                            )
+                            for value in values
+                        ]
+                    )
+
+            if self.seq_padding_side == SeqPaddingSide.RIGHT:
+                for d_elem in (data_elements_numeric, data_elements_datetime, data_elements_object):
+                    for k, values in d_elem.items():
+                        if not values:
+                            d_elem[k] = torch.tensor([], device=device)
+                        elif isinstance(values[0], torch.Tensor):
+                            d_elem[k] = torch.nn.functional.pad(
+                                torch.stack(values),
+                                (0, 0, 0, seq_delta),
+                                value=np.NaN,
+                            ).to(device)
                         else:
-                            data_delta = max_n_data - 1
-                            vs = [vs if vs is not None else np.NaN]
-
-                        # Separate data elements based on data type
-                        if isinstance(vs[0], float):
-                            data_elements_numeric[k].append(
-                                torch.nn.functional.pad(torch.Tensor(vs).to(device), (0, data_delta), value=np.NaN)
-                            )
-                        elif isinstance(vs[0], datetime):
-                            data_elements_datetime[k].append(
-                                torch.nn.functional.pad(torch.Tensor([v.timestamp() for v in vs]).to(device), (0, data_delta), value=np.NaN)
-                            )
+                            d_elem[k] = torch.nn.functional.pad(
+                                torch.stack([v.unsqueeze(0) for v in values]),
+                                (0, 0, 0, seq_delta),
+                                value=np.NaN,
+                            ).to(device)
+            else:
+                for d_elem in (data_elements_numeric, data_elements_datetime, data_elements_object):
+                    for k, values in d_elem.items():
+                        if not values:
+                            d_elem[k] = torch.tensor([], device=device)
+                        elif isinstance(values[0], torch.Tensor):
+                            d_elem[k] = torch.nn.functional.pad(
+                                torch.stack(values),
+                                (0, 0, seq_delta, 0),
+                                value=np.NaN,
+                            ).to(device)
                         else:
-                            data_elements_object[k].append(
-                                torch.nn.functional.pad(torch.Tensor([hash(str(v)) for v in vs]).to(device), (0, data_delta), value=np.NaN)
-                            )
+                            d_elem[k] = torch.nn.functional.pad(
+                                torch.stack([v.unsqueeze(0) for v in values]),
+                                (0, 0, seq_delta, 0),
+                                value=np.NaN,
+                            ).to(device)
 
-                    if self.seq_padding_side == SeqPaddingSide.RIGHT:
-                        for d_elem in (data_elements_numeric, data_elements_datetime, data_elements_object):
-                            for k in d_elem:
-                                d_elem[k] = torch.nn.functional.pad(
-                                    torch.cat([T.unsqueeze(0) for T in d_elem[k]]),
-                                    (0, 0, 0, seq_delta),
-                                    value=np.NaN,
-                                ).to(device)
-                    else:
-                        for d_elem in (data_elements_numeric, data_elements_datetime, data_elements_object):
-                            for k in d_elem:
-                                d_elem[k] = torch.nn.functional.pad(
-                                    torch.cat([T.unsqueeze(0) for T in d_elem[k]]),
-                                    (0, 0, seq_delta, 0),
-                                    value=np.NaN,
-                                ).to(device)
-
-                    out_numeric.update(data_elements_numeric)
-                    out_datetime.update(data_elements_datetime)
-                    out_object.update(data_elements_object)
+            out_numeric.update(data_elements_numeric)
+            out_datetime.update(data_elements_datetime)
+            out_object.update(data_elements_object)
 
         self._register_end("collate_dynamic_padding")
 
@@ -810,7 +898,7 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
 
         # Add event and data masks on the basis of which elements are present, then convert the tensor
         # elements to the appropriate types.
-        out_batch["event_mask"] = ~out_batch["time_delta"].isnan()
+        out_batch["event_mask"] = ~out_batch.get("time_delta", torch.zeros_like(out_batch["dynamic_indices"])).isnan()
 
         if "dynamic_values" in out_batch:
             out_batch["dynamic_values_mask"] = ~out_batch["dynamic_values"].isnan()
@@ -819,124 +907,74 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
             out_batch["dynamic_values_mask"] = torch.zeros(
                 (out_batch["event_mask"].shape[0], out_batch["event_mask"].shape[1], max_n_data),
                 dtype=torch.bool,
-                device=device
+                device=device,
             )
 
-        out_batch["time_delta"] = torch.nan_to_num(out_batch["time_delta"], nan=0).to(device)
+        out_batch["time_delta"] = torch.nan_to_num(
+            out_batch.get("time_delta", torch.zeros_like(out_batch["dynamic_indices"])), nan=0
+        ).to(device)
 
-        if "dynamic_indices" in out_batch:
-            out_batch["dynamic_indices"] = torch.nan_to_num(out_batch["dynamic_indices"], nan=0).long().to(device)
+        out_batch["dynamic_indices"] = torch.nan_to_num(
+            out_batch.get("dynamic_indices", torch.zeros(len(batch), dtype=torch.long)), nan=0
+        ).long().to(device)
+
         if "dynamic_measurement_indices" in out_batch:
             out_batch["dynamic_measurement_indices"] = torch.nan_to_num(
                 out_batch["dynamic_measurement_indices"], nan=0
             ).long().to(device)
+
         if "dynamic_values" in out_batch:
             out_batch["dynamic_values"] = torch.nan_to_num(out_batch["dynamic_values"], nan=0).to(device)
 
         if self.config.do_include_start_time_min:
-            out_batch["start_time"] = torch.FloatTensor([e["start_time"] for e in batch]).to(device)
+            out_batch["start_time"] = torch.FloatTensor(
+                [e.get("start_time", 0.0) for e in batch]
+            ).to(device)
+
         if self.config.do_include_subsequence_indices:
-            out_batch["start_idx"] = torch.LongTensor([e["start_idx"] for e in batch]).to(device)
-            out_batch["end_idx"] = torch.LongTensor([e["end_idx"] for e in batch]).to(device)
+            out_batch["start_idx"] = torch.LongTensor(
+                [e.get("start_idx", 0) for e in batch]
+            ).to(device)
+            out_batch["end_idx"] = torch.LongTensor([e.get("end_idx", 0) for e in batch]).to(
+                device
+            )
+
         if self.config.do_include_subject_id:
-            out_batch["subject_id"] = torch.LongTensor([e["subject_id"] for e in batch]).to(device)
+            out_batch["subject_id"] = torch.LongTensor([e.get("subject_id", 0) for e in batch]).to(
+                device
+            )
 
-        out_batch = PytorchBatch(**out_batch)
         self._register_end("collate_post_padding_processing")
-
-        if not self.has_task:
-            return out_batch
-
-        self._register_start("collate_task_labels")
-        out_labels = {}
-
-        for task in self.tasks:
-            task_type = self.task_types[task]
-
-            out_labels[task] = []
-            for e in batch:
-                if task in e:
-                    out_labels[task].append(e[task])
-                else:
-                    print(f"Warning: Label for task '{task}' missing in batch element: {e}")
-                    out_labels[task].append(None)
-
-            match task_type:
-                case "multi_class_classification":
-                    out_labels[task] = torch.LongTensor([label for label in out_labels[task] if label is not None]).to(device)
-                case "binary_classification":
-                    out_labels[task] = torch.FloatTensor([label for label in out_labels[task] if label is not None]).to(device)
-                case "regression":
-                    out_labels[task] = torch.FloatTensor([label for label in out_labels[task] if label is not None]).to(device)
-                case _:
-                    raise TypeError(f"Don't know how to tensorify task of type {task_type}!")
-
-        out_batch.stream_labels = out_labels
-        self._register_end("collate_task_labels")
 
         return out_batch
 
     @TimeableMixin.TimeAs
     def collate(self, batch: list[DATA_ITEM_T]) -> PytorchBatch:
-        """Combines the ragged dictionaries produced by `__getitem__` into a tensorized batch.
-
-        This function handles conversion of arrays to tensors and padding of elements within the batch across
-        static data elements, sequence events, and dynamic data elements.
-
-        Args:
-            batch: A list of `__getitem__` format output dictionaries.
-
-        Returns:
-            A fully collated, tensorized, and padded batch.
-        """
         print(f"Collating batch of size: {len(batch)}")
         print(f"Batch before collation: {batch}")
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # Handle missing data
+        for col in ['dynamic_indices', 'dynamic_values', 'dynamic_measurement_indices']:
+            if col not in out_batch:
+                out_batch[col] = torch.zeros((len(batch), max_seq_len, max_n_data), dtype=torch.float32)
 
+        # Collate static and dynamic data if applicable
         if self.do_produce_static_data:
             out_batch = self.__static_and_dynamic_collate(batch, device)
         else:
             out_batch = self.__dynamic_only_collate(batch, device)
 
         if not self.has_task:
-            return out_batch
+            return PytorchBatch(**out_batch).to(device)
 
-        print("Batch size:", len(batch))
-        print("Labels in the batch:")
-        for e in batch:
-            if "A1cGreaterThan7" in e:
-                print(e["A1cGreaterThan7"])
-            else:
-                print("Label missing")
-
-        if "dynamic_indices" not in out_batch:
-            out_batch["dynamic_indices"] = torch.zeros(len(batch), dtype=torch.long, device=device)
-
-        # Modify the code in the `collate` function to handle missing labels
-        a1c_labels = [e["A1cGreaterThan7"] for e in batch if "A1cGreaterThan7" in e]
-        if not a1c_labels:
-            print("Warning: 'A1cGreaterThan7' labels missing in the batch")  
-        out_labels["A1cGreaterThan7"] = torch.LongTensor(a1c_labels).to(device) if a1c_labels else None
-        
-        if "dynamic_indices" in self.cached_data.columns:
-            # Handle the case where dynamic_indices is present
-            pass
-        else:
-            # Handle the case when dynamic_indices is missing or None
-            if self.cached_data.is_empty():
-                # If self.cached_data is empty, set dynamic_indices to an empty tensor
-                out_batch = {"dynamic_indices": torch.tensor([], dtype=torch.long, device=device)}
-            else:
-                # If self.cached_data is not empty
-                out_batch = {}
-                if "event_mask" in self.cached_data.columns:
-                    out_batch["event_mask"] = torch.from_numpy(self.cached_data["event_mask"].to_numpy()).to(device)
-                    out_batch["dynamic_indices"] = torch.zeros_like(out_batch["event_mask"], dtype=torch.long, device=device)
-                else:
-                    # If event_mask is also missing, create a tensor of zeros with the same length as self.cached_data
-                    out_batch["dynamic_indices"] = torch.zeros(len(self.cached_data), dtype=torch.long, device=device)
-
+        print(f"Batch after collation: {out_batch}")
+        print(f"Tensor shapes and types:")
+        for key, value in out_batch.items():
+            if isinstance(value, torch.Tensor):
+                print(f"{key}: {value.shape}, {value.dtype}")
+            
+        # Process task-specific labels
         self._register_start("collate_task_labels")
         out_labels = {}
 
@@ -945,30 +983,34 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
 
             out_labels[task] = []
             for e in batch:
-                if task in e:
+                if task in e and e[task] is not None:
                     out_labels[task].append(e[task])
                 else:
-                    print(f"Warning: Label for task '{task}' missing in batch element: {e}")
                     out_labels[task].append(None)
 
-            match task_type:
-                case "multi_class_classification":
-                    out_labels[task] = torch.LongTensor([label for label in out_labels[task] if label is not None]).to(device)
-                case "binary_classification":
-                    out_labels[task] = torch.FloatTensor([label for label in out_labels[task] if label is not None]).to(device)
-                case "regression":
-                    out_labels[task] = torch.FloatTensor([label for label in out_labels[task] if label is not None]).to(device)
-                case _:
-                    raise TypeError(f"Don't know how to tensorify task of type {task_type}!")
+            # Filter out None values before creating the tensor
+            valid_labels = [label for label in out_labels[task] if label is not None]
 
-        # Include the 'A1cGreaterThan7' labels in out_labels                
-        a1c_labels = [e["A1cGreaterThan7"] for e in batch if "A1cGreaterThan7" in e]
-        if not a1c_labels:
-            print("Warning: 'A1cGreaterThan7' labels missing in the batch")
-        out_labels["A1cGreaterThan7"] = torch.LongTensor(a1c_labels).to(device) if a1c_labels else None
-        
-        out_batch.stream_labels = out_labels
+            if valid_labels:
+                match task_type:
+                    case "multi_class_classification":
+                        out_labels[task] = torch.LongTensor(valid_labels).to(device)
+                    case "binary_classification":
+                        out_labels[task] = torch.FloatTensor(valid_labels).to(device)
+                    case "regression":
+                        out_labels[task] = torch.FloatTensor(valid_labels).to(device)
+                    case _:
+                        raise TypeError(f"Don't know how to tensorify task of type {task_type}!")
+            else:
+                out_labels[task] = None
+
+        out_batch['stream_labels'] = out_labels
         self._register_end("collate_task_labels")
 
-        print(f"Collated batch: {out_batch}")
-        return out_batch
+        # Ensure only valid keyword arguments are passed to PytorchBatch
+        valid_keys = PytorchBatch.__annotations__.keys()
+        out_batch_filtered = {k: v for k, v in out_batch.items() if k in valid_keys}
+
+        return PytorchBatch(**out_batch_filtered).to(device)
+
+

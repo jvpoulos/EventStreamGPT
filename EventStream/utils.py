@@ -14,6 +14,7 @@ from collections.abc import Callable
 from importlib.util import find_spec
 from pathlib import Path
 from typing import Any, TypeVar, Union
+import torch
 
 import hydra
 import polars as pl
@@ -22,7 +23,12 @@ PROPORTION = float
 COUNT_OR_PROPORTION = Union[int, PROPORTION]
 WHOLE = Union[int, pl.Expr]
 
-
+class CustomJSONEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, torch.device):
+            return str(obj)
+        return super().default(obj)
+        
 def count_or_proportion(N: WHOLE | None, cnt_or_prop: COUNT_OR_PROPORTION) -> int:
     """Returns `cnt_or_prop` if it is an integer or `int(N*cnt_or_prop)` if it is a float.
 

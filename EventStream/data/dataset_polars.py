@@ -183,6 +183,11 @@ class Dataset(DatasetBase):
                 ...
             ValueError: Value is too large to be expressed as an int!
         """
+        if isinstance(num, pl.DataFrame) or isinstance(num, pl.LazyFrame):
+            if num.is_empty():
+                return pl.UInt8  # or any other default dtype
+            num = num.max().collect()[0]
+
         if num >= (2**64) - 1:
             raise ValueError("Value is too large to be expressed as an int!")
         if num >= (2**32) - 1:
@@ -555,7 +560,7 @@ class Dataset(DatasetBase):
             expr = expr.when(cond).then(val)
         return expr.otherwise(col)
 
-    def _validate_id_col(self, id_col: pl.Series) -> tuple[pl.Series, pl.datatypes.DataTypeClass]:
+    def _validate_id_col(self, id_col: pl.Expr) -> tuple[pl.Series, pl.datatypes.DataTypeClass]:
         """Validate the given ID column.
 
         This validates that the ID column is unique, integral, strictly positive, and returns it converted to
@@ -571,48 +576,86 @@ class Dataset(DatasetBase):
             ValueError: If the ID column is not unique.
         """
 
-        if not id_col.is_unique().all():
-            raise ValueError(f"ID column {id_col.name} is not unique!")
-        match id_col.dtype:
-            case pl.Float32 | pl.Float64:
-                if not (id_col == id_col.round(0)).all() and (id_col >= 0).all():
-                    raise ValueError(f"ID column {id_col.name} is not a non-negative integer type!")
-            case pl.Int8 | pl.Int16 | pl.Int32 | pl.Int64:
-                if not (id_col >= 0).all():
-                    raise ValueError(f"ID column {id_col.name} is not a non-negative integer type!")
-            case pl.UInt8 | pl.UInt16 | pl.UInt32 | pl.UInt64:
-                pass
-            case _:
-                raise ValueError(f"ID column {id_col.name} is not a non-negative integer type!")
+        if isinstance(id_col, pl.LazyFrame):
+            unique_count = id_col.select(pl.col(id_col.columns[0])).unique().count().collect()[0, 0]
+            total_count = id_col.select(pl.col(id_col.columns[0])).count().collect()[0, 0]
+            is_unique = unique_count == total_count
+        else:
+            unique_count = id_col.unique().shape[0]
+            total_count = id_col.shape[0]
+            is_unique = unique_count == total_count
 
-        max_val = id_col.max()
+        if not is_unique:
+            raise ValueError(f"ID column {id_col.columns[0]} is not unique!")
+
+        dtypes = id_col.dtypes
+        if dtypes[0] in (pl.Float32, pl.Float64):
+            if isinstance(id_col, pl.LazyFrame):
+                if not ((id_col == id_col.round(0)).all().collect()[0, 0] & (id_col >= 0).all().collect()[0, 0]):
+                    raise ValueError(f"ID column {id_col.columns[0]} is not a non-negative integer type!")
+            else:
+                if not ((id_col == id_col.round(0)).all() & (id_col >= 0).all()):
+                    raise ValueError(f"ID column {id_col.columns[0]} is not a non-negative integer type!")
+        elif dtypes[0] in (pl.Int8, pl.Int16, pl.Int32, pl.Int64):
+            if isinstance(id_col, pl.LazyFrame):
+                if not (id_col >= 0).all().collect()[0, 0]:
+                    raise ValueError(f"ID column {id_col.columns[0]} is not a non-negative integer type!")
+            else:
+                if not (id_col >= 0).all():
+                    raise ValueError(f"ID column {id_col.columns[0]} is not a non-negative integer type!")
+        elif dtypes[0] in (pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64):
+            pass
+        else:
+            raise ValueError(f"ID column {id_col.columns[0]} is not a non-negative integer type!")
+
+        if isinstance(id_col, pl.LazyFrame):
+            max_val = id_col.max().collect()[id_col.columns[0]][0]
+        else:
+            max_val = id_col.max()[0]
+
         dt = Dataset.get_smallest_valid_uint_type(max_val)
 
-        id_col = id_col.cast(dt)
+        if isinstance(id_col, pl.LazyFrame):
+            id_col = id_col.select(pl.col(id_col.columns[0]).cast(dt))
+        else:
+            id_col = id_col.select(pl.col(id_col.columns[0]).cast(dt))
 
         return id_col, dt
 
     def _validate_initial_df(
         self,
-        source_df: pl.DataFrame | None,
+        source_df: pl.DataFrame | pl.LazyFrame | None,
         id_col_name: str,
         valid_temporality_type: str,
         linked_id_cols: dict[str, pl.datatypes.DataType] | None = None,
-    ) -> tuple[pl.DataFrame | None, pl.datatypes.DataType]:
+    ) -> tuple[pl.DataFrame | pl.LazyFrame | None, pl.datatypes.DataType]:
         if source_df is None:
             return None, None
 
         if linked_id_cols:
             for id_col, id_col_dt in linked_id_cols.items():
-                if id_col not in source_df:
+                if id_col not in source_df.columns:
                     raise ValueError(f"Missing mandatory linkage col {id_col}")
                 source_df = source_df.with_columns(pl.col(id_col).cast(id_col_dt))
 
-        if id_col_name not in source_df:
+        if id_col_name not in source_df.columns:
             source_df = source_df.with_row_count(name=id_col_name)
 
-        id_col, id_col_dt = self._validate_id_col(source_df[id_col_name])
-        source_df = source_df.with_columns(id_col)
+        id_col, id_col_dt = self._validate_id_col(source_df.select(id_col_name))
+
+        if isinstance(id_col, pl.LazyFrame):
+            id_col = id_col.collect()
+
+        if id_col_name not in source_df.columns:
+            source_df = source_df.with_row_count(name=id_col_name)
+
+        id_col, id_col_dt = self._validate_id_col(source_df.select(id_col_name))
+
+        if isinstance(id_col, pl.LazyFrame):
+            id_col = id_col.collect()
+
+        old_id_col_name = id_col.columns[0]  # Get the current name of the ID column
+        source_df = source_df.rename({old_id_col_name: id_col_name})
 
         for col, cfg in self.config.measurement_configs.items():
             match cfg.modality:
@@ -625,13 +668,13 @@ class Dataset(DatasetBase):
                 case _:
                     cat_col, val_col = col, None
 
-            if cat_col is not None and cat_col in source_df:
+            if cat_col is not None and cat_col in source_df.columns:
                 if cfg.temporality != valid_temporality_type:
                     raise ValueError(f"Column {cat_col} found in dataframe of wrong temporality")
 
                 source_df = source_df.with_columns(pl.col(cat_col).cast(pl.Utf8).cast(pl.Categorical))
 
-            if val_col is not None and val_col in source_df:
+            if val_col is not None and val_col in source_df.columns:
                 if cfg.temporality != valid_temporality_type:
                     raise ValueError(f"Column {val_col} found in dataframe of wrong temporality")
 
@@ -644,10 +687,10 @@ class Dataset(DatasetBase):
 
     def _validate_initial_dfs(
         self,
-        subjects_df: DF_T | None,
-        events_df: DF_T | None,
-        dynamic_measurements_df: DF_T | None,
-    ) -> tuple[DF_T | None, DF_T | None, DF_T | None]:
+        subjects_df: pl.DataFrame | pl.LazyFrame | None,
+        events_df: pl.DataFrame | pl.LazyFrame | None,
+        dynamic_measurements_df: pl.DataFrame | pl.LazyFrame | None,
+    ) -> tuple[pl.DataFrame | pl.LazyFrame | None, pl.DataFrame | pl.LazyFrame | None, pl.DataFrame | pl.LazyFrame | None]:
         """Validate and preprocess the given subjects, events, and dynamic_measurements dataframes.
 
         For each dataframe, this method checks for the presence of specific columns and unique IDs.
@@ -676,11 +719,11 @@ class Dataset(DatasetBase):
             {"subject_id": subjects_id_type} if subjects_df is not None else None,
         )
         if events_df is not None:
-            if "event_type" not in events_df:
+            if "event_type" not in events_df.columns:
                 raise ValueError("Missing event_type column!")
             events_df = events_df.with_columns(pl.col("event_type").cast(pl.Categorical))
 
-            if "timestamp" not in events_df or events_df["timestamp"].dtype != pl.Datetime:
+            if "timestamp" not in events_df.columns or events_df.select("timestamp").dtypes[0] != pl.Datetime:
                 raise ValueError("Malformed timestamp column!")
 
         if dynamic_measurements_df is not None:

@@ -412,6 +412,11 @@ class InnerBlock(nn.Module):
         super().__init__()
         self.attn = InnerAttention(config, layer_id, is_seq)
         self.layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+
+        # Move the weight and bias parameters of the LayerNorm module to the same device
+        self.layer_norm.weight.data = self.layer_norm.weight.data.to(config.device)
+        self.layer_norm.bias.data = self.layer_norm.bias.data.to(config.device)
+
         self.mlp = InnerMLP(config)
 
     def forward(
@@ -457,17 +462,20 @@ class InnerBlock(nn.Module):
 
         # residual connection
         hidden_states = attn_output + residual
-
+        
+        # Move hidden_states to the same device as the LayerNorm weights
+        hidden_states = hidden_states.to(self.layer_norm.weight.device)
+        
         residual = hidden_states
         hidden_states = self.layer_norm(hidden_states)
         feed_forward_hidden_states = self.mlp(hidden_states)
+
         # residual connection
         hidden_states = residual + feed_forward_hidden_states
 
         if not use_cache:
             outputs.pop("present_key_value")
         return hidden_states, outputs
-
 
 class StructuredTransformerBlock(nn.Module):
     """A block for structured attention with both sequential and dependency graph modules.
@@ -494,6 +502,8 @@ class StructuredTransformerBlock(nn.Module):
             seq_module=seq_block,
             dep_graph_module=dep_graph_block,
         )
+        self.layer_norm.weight.data = self.layer_norm.weight.data.to(config.device)
+        self.layer_norm.bias.data = self.layer_norm.bias.data.to(config.device)
 
     def forward(
         self, *args, **kwargs
@@ -561,6 +571,9 @@ def time_from_deltas(batch: PytorchBatch) -> torch.Tensor:
         tensor([[0.0000, 1.0000, 4.2000],
                 [0.0000, 1.4000, 1.4000]])
     """
+    if not isinstance(batch, PytorchBatch):
+        raise TypeError("Input 'batch' should be a PytorchBatch object.")
+
     t_deltas = batch["time_delta"]
 
     if batch.event_mask is not None:
@@ -698,16 +711,22 @@ class ConditionallyIndependentPointProcessInputLayer(torch.nn.Module):
     def __init__(
         self,
         config: StructuredTransformerConfig,
-        vocab_sizes_by_measurement: dict[str, int],  # Add this parameter
+        vocab_sizes_by_measurement: dict[str, int],
+        oov_index: int,
+        do_use_sinusoidal: bool,  # Add this parameter
     ):
         super().__init__()
+
+        print(f"ConditionallyIndependentPointProcessInputLayer: oov_index = {oov_index}")
 
         print("Initializing DataEmbeddingLayer with the following parameters:")
         print(f"n_total_embeddings: {max(vocab_sizes_by_measurement.values()) + 125}")
         print(f"vocab_sizes_by_measurement: {vocab_sizes_by_measurement}")
+
         self.config = config
+
         self.data_embedding_layer = DataEmbeddingLayer(
-            n_total_embeddings=max(vocab_sizes_by_measurement.values()) + 125,  # Use vocab_sizes_by_measurement
+            n_total_embeddings=max(vocab_sizes_by_measurement.values()) + 125,
             out_dim=config.hidden_size,
             categorical_embedding_dim=config.categorical_embedding_dim,
             numerical_embedding_dim=config.numerical_embedding_dim,
@@ -718,57 +737,59 @@ class ConditionallyIndependentPointProcessInputLayer(torch.nn.Module):
             dynamic_weight=config.dynamic_embedding_weight,
             categorical_weight=config.categorical_embedding_weight,
             numerical_weight=config.numerical_embedding_weight,
+            oov_index=oov_index,
         )
-        if config.do_use_learnable_sinusoidal_ATE:
+        self.data_embedding_layer.to(config.device)
+
+        if do_use_sinusoidal:
+            self.time_embedding_layer = TemporalPositionEncoding(embedding_dim=config.hidden_size)
+        else:
             self.time_embedding_layer = LearnableFrequencySinusoidalTemporalPositionEncoding(
                 embedding_dim=config.hidden_size
             )
-        else:
-            self.time_embedding_layer = TemporalPositionEncoding(embedding_dim=config.hidden_size)
+
         self.embedding_dropout = torch.nn.Dropout(p=config.input_dropout)
 
     def forward(self, batch: PytorchBatch) -> torch.Tensor:
-        data_embed = self.data_embedding_layer(batch)
+        if not isinstance(batch, PytorchBatch):
+            raise TypeError("Input 'batch' should be a PytorchBatch object.")
+
+        data_embed: torch.Tensor = self.data_embedding_layer(batch)
         
         if "time_delta" not in batch or batch["time_delta"] is None:
             print("'time_delta' is missing or None in the batch.")
             print(f"Batch contents: {batch}")
-            # Return the data embeddings only if 'time_delta' is missing or None
             return data_embed
-        
-        if self.do_use_sinusoidal:
-            time_embed = self.time_embedding_layer_sinusoidal(batch["time_delta"])
-        else:
-            if "time" not in batch or batch["time"] is None:
-                print("'time' is missing or None in the batch.")
-                print(f"Batch contents: {batch}")
-                # Return the data embeddings only if 'time' is missing or None
-                return data_embed
-            
-            # Ensure 'time' is on the same device as 'data_embed'
-            time = batch["time"].to(data_embed.device)
-            time_embed = self.time_embedding_layer(time)
 
-        # Ensure 'data_embed' and 'time_embed' are on the same device before addition
-        data_embed = data_embed.to(time_embed.device)
+        time_embed = self.time_embedding_layer(batch)
+
+        data_embed = data_embed.to(time_embed.device)  # Move data_embed to the same device as time_embed
         embed = data_embed + time_embed
 
-        mask = batch.event_mask.unsqueeze(-1)
-        mask = mask.expand_as(embed)
-        embed = torch.where(mask, embed, torch.zeros_like(embed))
+        if batch.event_mask is not None:
+            mask = batch.event_mask.unsqueeze(-1)
+            mask = mask.expand_as(embed)
+            embed = torch.where(mask, embed, torch.zeros_like(embed))
 
         return embed
-
+        
 class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTrainedModel):
-    def __init__(self, config: StructuredTransformerConfig, vocabulary_config: VocabularyConfig):
-        super().__init__(config)
+    def __init__(self, config: StructuredTransformerConfig, vocabulary_config: VocabularyConfig, oov_index: int):
+        super().__init__(config)  # Pass the config argument here
 
+        print(f"ConditionallyIndependentPointProcessInputLayer: Initializing with oov_index = {oov_index}")
+        print(f"ConditionallyIndependentPointProcessInputLayer: vocab_sizes_by_measurement = {vocabulary_config.vocab_sizes_by_measurement}")    
+        
         config.vocab_sizes_by_measurement = vocabulary_config.vocab_sizes_by_measurement
 
         self.embed_dim = config.hidden_size
 
-        # Initialize the input layer
-        self.input_layer = ConditionallyIndependentPointProcessInputLayer(config, vocabulary_config.vocab_sizes_by_measurement)
+        self.input_layer = ConditionallyIndependentPointProcessInputLayer(
+            config,
+            vocabulary_config.vocab_sizes_by_measurement,
+            oov_index=oov_index,
+            do_use_sinusoidal=config.do_use_sinusoidal,  # Pass the attribute here
+        )
 
         # TODO(mmd): Replace this with InnerBlock for a non-structured version.
         if config.structured_event_processing_mode != StructuredEventProcessingMode.CONDITIONALLY_INDEPENDENT:
@@ -785,6 +806,10 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
 
     def forward(
         self,
+        dynamic_indices_event_type: torch.Tensor | None = None,
+        dynamic_counts_event_type: torch.Tensor | None = None,
+        dynamic_indices: torch.Tensor | None = None,
+        dynamic_counts: torch.Tensor | None = None,
         batch: PytorchBatch | None = None,
         input_embeds: torch.Tensor | None = None,
         past: tuple[torch.FloatTensor] | None = None,
@@ -825,17 +850,20 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
             past = tuple([None] * len(self.h))
 
         if input_embeds is None:
-            assert batch is not None
-
-            input_embeds = self.input_layer(batch)
-        else:
-            assert batch is None, "Can't specify both input_embeds and batch."
+            if batch is None:
+                raise ValueError("batch cannot be None if input_embeds is None")
+            elif isinstance(batch, PytorchBatch):
+                input_embeds = self.input_layer(batch)
+            elif isinstance(batch, dict):
+                input_embeds = self.input_layer(PytorchBatch(**batch))
+            else:
+                raise TypeError(f"batch must be an instance of PytorchBatch or a dictionary, got {type(batch)} instead")
 
         torch._assert(
             ~torch.isnan(input_embeds).any(), f"{torch.isnan(input_embeds).sum()} NaNs in input_embeds"
         )
 
-        if seq_attention_mask is None and batch is not None and batch.get("event_mask", None) is not None:
+        if batch is not None and "event_mask" in batch and batch["event_mask"] is not None:
             seq_attention_mask = expand_mask(batch["event_mask"], input_embeds.dtype)
 
         # Prepare head mask if needed
@@ -940,6 +968,7 @@ class NestedAttentionPointProcessInputLayer(torch.nn.Module):
     def __init__(
         self,
         config: StructuredTransformerConfig,
+        oov_index: int,  # Add this parameter
     ):
         super().__init__()
 
@@ -974,7 +1003,10 @@ class NestedAttentionPointProcessInputLayer(torch.nn.Module):
             dynamic_weight=config.dynamic_embedding_weight,
             categorical_weight=config.categorical_embedding_weight,
             numerical_weight=config.numerical_embedding_weight,
+            oov_index=oov_index,  # Pass the oov_index
         )
+        self.data_embedding_layer.to(config.device)
+
         if config.do_use_learnable_sinusoidal_ATE:
             self.time_embedding_layer = LearnableFrequencySinusoidalTemporalPositionEncoding(
                 embedding_dim=config.hidden_size
@@ -992,6 +1024,9 @@ class NestedAttentionPointProcessInputLayer(torch.nn.Module):
 
         embed = self.data_embedding_layer(batch)
         # `data_embed` is of shape (batch_size, sequence_length, dep_graph_len, config.hidden_size).
+
+        if not isinstance(batch, PytorchBatch):
+            raise TypeError("Input 'batch' should be a PytorchBatch object.")
 
         time_embed = self.time_embedding_layer(batch)
         # `time_embed` is of shape (batch_size, sequence_length, config.hidden_size).
@@ -1042,7 +1077,10 @@ class NestedAttentionPointProcessTransformer(StructuredTransformerPreTrainedMode
             raise ValueError(f"{config.structured_event_processing_mode} invalid for this model!")
 
         self.embed_dim = config.hidden_size
-        self.input_layer = NestedAttentionPointProcessInputLayer(config)
+        self.input_layer = NestedAttentionPointProcessInputLayer(
+            config,
+            oov_index=max(config.vocab_sizes_by_measurement.values()) + 1,
+        )
         self.structured_event_processing_mode = config.structured_event_processing_mode
 
         self.h = nn.ModuleList(

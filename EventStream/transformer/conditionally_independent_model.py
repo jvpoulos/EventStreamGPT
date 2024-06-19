@@ -101,15 +101,13 @@ class ConditionallyIndependentGenerativeOutputLayer(GenerativeOutputLayerBase):
         print("Shape of for_event_contents_prediction:", for_event_contents_prediction.shape)
         print("Shape of self.ClassificationLayer(for_event_contents_prediction):", self.ClassificationLayer(for_event_contents_prediction).shape)
 
-        if not is_generation and hasattr(batch, "stream_labels") and batch.stream_labels is not None:
-            if "A1cGreaterThan7" in batch.stream_labels:
-                a1c_greater_than_7_labels = batch.stream_labels["A1cGreaterThan7"]
-                if len(a1c_greater_than_7_labels) > 0:
+        if not is_generation and "stream_labels" in batch and batch["stream_labels"] is not None:
+            if "A1cGreaterThan7" in batch["stream_labels"]:
+                a1c_greater_than_7_labels = batch["stream_labels"]["A1cGreaterThan7"]
+                if a1c_greater_than_7_labels is not None:
                     classification_labels_by_measurement["A1cGreaterThan7"] = a1c_greater_than_7_labels
-                else:
-                    classification_labels_by_measurement["A1cGreaterThan7"] = None
             else:
-                classification_labels_by_measurement["A1cGreaterThan7"] = None
+                print("Warning: 'A1cGreaterThan7' labels not found in the batch['stream_labels'].")
 
         regression_out = self.get_regression_outputs(
             batch,

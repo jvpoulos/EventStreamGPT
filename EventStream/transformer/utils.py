@@ -1,12 +1,12 @@
 import inspect
 from collections.abc import Sequence
 from typing import Union
+import json
 
 import torch
 
 VALID_INDEX_T = Union[int, slice, type(Ellipsis)]
-INDEX_SELECT_T = Union[VALID_INDEX_T, Sequence[VALID_INDEX_T]]
-
+INDEX_SELECT_T = Union[int, slice, list[int], tuple[int], torch.LongTensor]
 
 def str_summary(T: torch.Tensor):
     """Returns a string summary of a tensor for debugging purposes.

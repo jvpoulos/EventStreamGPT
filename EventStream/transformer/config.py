@@ -9,8 +9,10 @@ from dataclasses import dataclass, field
 import enum
 import itertools
 import math
+import torch
 from collections.abc import Hashable
 from typing import Any, Union
+import json
 
 from transformers import PretrainedConfig
 
@@ -18,7 +20,7 @@ from ..data.config import MeasurementConfig
 from ..data.data_embedding_layer import MeasIndexGroupOptions, StaticEmbeddingMode
 from ..data.pytorch_dataset import PytorchDataset
 from ..data.types import DataModality
-from ..utils import JSONableMixin, StrEnum, hydra_dataclass
+from ..utils import JSONableMixin, StrEnum, hydra_dataclass, CustomJSONEncoder
 
 MEAS_INDEX_GROUP_T = Union[str, tuple[str, MeasIndexGroupOptions]]
 
@@ -477,6 +479,7 @@ class StructuredTransformerConfig(PretrainedConfig):
     def __init__(
         self,
         # Data configuration
+        do_use_sinusoidal: bool = False,  # Add this line to the configuration class
         num_labels: int | None = None,
         problem_type: str = "single_label_classification",
         vocab_sizes_by_measurement: dict[str, int] | None = None,
@@ -527,7 +530,10 @@ class StructuredTransformerConfig(PretrainedConfig):
         use_cache: bool = True,
         **kwargs,
     ):
+        # Set the device attribute based on the availability of a GPU
+        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.problem_type = problem_type
+        self.do_use_sinusoidal = do_use_sinusoidal  # Initialize the attribute here
         self.do_use_learnable_sinusoidal_ATE = do_use_learnable_sinusoidal_ATE
         # Resetting default values to appropriate types
         if vocab_sizes_by_measurement is None:
@@ -956,7 +962,7 @@ class StructuredTransformerConfig(PretrainedConfig):
             for k, v in as_dict["measurement_configs"].items():
                 new_meas_configs[k] = v if isinstance(v, dict) else v.to_dict()
             as_dict["measurement_configs"] = new_meas_configs
-        return as_dict
+        return json.loads(json.dumps(as_dict, cls=CustomJSONEncoder))
 
     @classmethod
     def from_dict(cls, *args, **kwargs) -> "StructuredTransformerConfig":
@@ -966,3 +972,4 @@ class StructuredTransformerConfig(PretrainedConfig):
             for k, v in raw_from_dict.measurement_configs.items():
                 new_meas_configs[k] = MeasurementConfig.from_dict(v)
             raw_from_dict.measurement_configs = new_meas_configs
+        return json.loads(json.dumps(raw_from_dict, cls=CustomJSONEncoder), object_hook=cls.from_dict)
