@@ -757,8 +757,7 @@ class ConditionallyIndependentPointProcessInputLayer(torch.nn.Module):
         data_embed: torch.Tensor = self.data_embedding_layer(batch)
         
         if "time_delta" not in batch or batch["time_delta"] is None:
-            print("'time_delta' is missing or None in the batch.")
-            print(f"Batch contents: {batch}")
+            logger.warning("'time_delta' is missing or None in the batch. Skipping time embedding.")
             return data_embed
 
         time_embed = self.time_embedding_layer(batch)

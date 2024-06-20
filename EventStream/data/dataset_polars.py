@@ -158,47 +158,16 @@ class Dataset(DatasetBase):
     """Execute any lazy query in streaming mode."""
 
     @staticmethod
-    def get_smallest_valid_uint_type(num: int | float | pl.Expr) -> pl.DataType:
-        """Returns the smallest valid unsigned integral type for an ID variable with `num` unique options.
-
-        Args:
-            num: The number of IDs that must be uniquely expressed.
-
-        Raises:
-            ValueError: If there is no unsigned int type big enough to express the passed number of ID
-                variables.
-
-        Examples:
-            >>> import polars as pl
-            >>> Dataset.get_smallest_valid_uint_type(num=1)
-            UInt8
-            >>> Dataset.get_smallest_valid_uint_type(num=2**8-1)
-            UInt16
-            >>> Dataset.get_smallest_valid_uint_type(num=2**16-1)
-            UInt32
-            >>> Dataset.get_smallest_valid_uint_type(num=2**32-1)
-            UInt64
-            >>> Dataset.get_smallest_valid_uint_type(num=2**64-1)
-            Traceback (most recent call last):
-                ...
-            ValueError: Value is too large to be expressed as an int!
-        """
-        if isinstance(num, pl.DataFrame) or isinstance(num, pl.LazyFrame):
-            if num.is_empty():
-                return pl.UInt8  # or any other default dtype
-            num = num.max().collect()[0]
-
-        if num >= (2**64) - 1:
-            raise ValueError("Value is too large to be expressed as an int!")
-        if num >= (2**32) - 1:
-            return pl.UInt64
-        elif num >= (2**16) - 1:
-            return pl.UInt32
-        elif num >= (2**8) - 1:
-            return pl.UInt16
-        else:
+    def get_smallest_valid_uint_type(num: Union[int, float]) -> pl.DataType:
+        if num <= 255:
             return pl.UInt8
-
+        elif num <= 65535:
+            return pl.UInt16
+        elif num <= 4294967295:
+            return pl.UInt32
+        else:
+            return pl.UInt64
+            
     @classmethod
     def _load_input_df(
         cls,
@@ -560,67 +529,53 @@ class Dataset(DatasetBase):
             expr = expr.when(cond).then(val)
         return expr.otherwise(col)
 
-    def _validate_id_col(self, id_col: pl.Expr) -> tuple[pl.Series, pl.datatypes.DataTypeClass]:
-        """Validate the given ID column.
+    def _validate_id_col(self, id_col: Union[pl.DataFrame, pl.LazyFrame]) -> tuple[pl.Series, pl.datatypes.DataTypeClass]:
+        is_lazy = isinstance(id_col, pl.LazyFrame)
+        col_name = id_col.columns[0]
 
-        This validates that the ID column is unique, integral, strictly positive, and returns it converted to
-        the smallest valid dtype.
-
-        Args:
-            id_col (pl.Expr): The ID column to validate.
-
-        Returns:
-            pl.Expr: The validated ID column.
-
-        Raises:
-            ValueError: If the ID column is not unique.
-        """
-
-        if isinstance(id_col, pl.LazyFrame):
-            unique_count = id_col.select(pl.col(id_col.columns[0])).unique().count().collect()[0, 0]
-            total_count = id_col.select(pl.col(id_col.columns[0])).count().collect()[0, 0]
-            is_unique = unique_count == total_count
+        # Check uniqueness
+        if is_lazy:
+            unique_count = id_col.select(pl.col(col_name)).unique().count().collect()[0, 0]
+            total_count = id_col.select(pl.col(col_name)).count().collect()[0, 0]
         else:
-            unique_count = id_col.unique().shape[0]
+            unique_count = id_col[col_name].n_unique()
             total_count = id_col.shape[0]
-            is_unique = unique_count == total_count
+        
+        if unique_count != total_count:
+            raise ValueError(f"ID column {col_name} is not unique!")
 
-        if not is_unique:
-            raise ValueError(f"ID column {id_col.columns[0]} is not unique!")
-
-        dtypes = id_col.dtypes
-        if dtypes[0] in (pl.Float32, pl.Float64):
-            if isinstance(id_col, pl.LazyFrame):
-                if not ((id_col == id_col.round(0)).all().collect()[0, 0] & (id_col >= 0).all().collect()[0, 0]):
-                    raise ValueError(f"ID column {id_col.columns[0]} is not a non-negative integer type!")
-            else:
-                if not ((id_col == id_col.round(0)).all() & (id_col >= 0).all()):
-                    raise ValueError(f"ID column {id_col.columns[0]} is not a non-negative integer type!")
-        elif dtypes[0] in (pl.Int8, pl.Int16, pl.Int32, pl.Int64):
-            if isinstance(id_col, pl.LazyFrame):
-                if not (id_col >= 0).all().collect()[0, 0]:
-                    raise ValueError(f"ID column {id_col.columns[0]} is not a non-negative integer type!")
-            else:
-                if not (id_col >= 0).all():
-                    raise ValueError(f"ID column {id_col.columns[0]} is not a non-negative integer type!")
-        elif dtypes[0] in (pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64):
-            pass
+        # Check data type and non-negativity
+        dtype = id_col.dtypes[0]
+        if dtype in (pl.Float32, pl.Float64):
+            check_expr = (pl.col(col_name) == pl.col(col_name).round(0)) & (pl.col(col_name) >= 0)
+        elif dtype in (pl.Int8, pl.Int16, pl.Int32, pl.Int64):
+            check_expr = pl.col(col_name) >= 0
+        elif dtype in (pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64):
+            check_expr = pl.lit(True)
         else:
-            raise ValueError(f"ID column {id_col.columns[0]} is not a non-negative integer type!")
+            raise ValueError(f"ID column {col_name} is not a non-negative integer type!")
 
-        if isinstance(id_col, pl.LazyFrame):
-            max_val = id_col.max().collect()[id_col.columns[0]][0]
+        if is_lazy:
+            is_valid = id_col.select(check_expr.all()).collect()[0, 0]
         else:
-            max_val = id_col.max()[0]
+            is_valid = id_col.select(check_expr.all()).item()
 
-        dt = Dataset.get_smallest_valid_uint_type(max_val)
+        if not is_valid:
+            raise ValueError(f"ID column {col_name} is not a non-negative integer type!")
 
-        if isinstance(id_col, pl.LazyFrame):
-            id_col = id_col.select(pl.col(id_col.columns[0]).cast(dt))
+        # Get max value and determine smallest valid uint type
+        if is_lazy:
+            max_val = id_col.select(pl.col(col_name).max()).collect()[0, 0]
         else:
-            id_col = id_col.select(pl.col(id_col.columns[0]).cast(dt))
+            max_val = id_col[col_name].max()
 
-        return id_col, dt
+        dt = self.get_smallest_valid_uint_type(max_val)
+
+        # Cast to the appropriate type and return as a Series
+        if is_lazy:
+            return id_col.select(pl.col(col_name).cast(dt)).collect()[col_name], dt
+        else:
+            return id_col.select(pl.col(col_name).cast(dt))[col_name], dt
 
     def _validate_initial_df(
         self,
@@ -643,19 +598,9 @@ class Dataset(DatasetBase):
 
         id_col, id_col_dt = self._validate_id_col(source_df.select(id_col_name))
 
-        if isinstance(id_col, pl.LazyFrame):
-            id_col = id_col.collect()
-
-        if id_col_name not in source_df.columns:
-            source_df = source_df.with_row_count(name=id_col_name)
-
-        id_col, id_col_dt = self._validate_id_col(source_df.select(id_col_name))
-
-        if isinstance(id_col, pl.LazyFrame):
-            id_col = id_col.collect()
-
-        old_id_col_name = id_col.columns[0]  # Get the current name of the ID column
-        source_df = source_df.rename({old_id_col_name: id_col_name})
+        # Use the name of the Series directly
+        if id_col_name != id_col.name:
+            source_df = source_df.rename({id_col.name: id_col_name})
 
         for col, cfg in self.config.measurement_configs.items():
             match cfg.modality:

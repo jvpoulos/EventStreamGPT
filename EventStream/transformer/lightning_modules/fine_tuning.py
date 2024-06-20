@@ -251,7 +251,18 @@ class ESTForStreamClassificationLM(L.LightningModule):
     def forward(self, batch, **kwargs):
         if not isinstance(batch, PytorchBatch):
             raise TypeError("Input 'batch' should be a PytorchBatch object.")
-        encoded = self.encoder(batch, **kwargs).last_hidden_state
+
+        dynamic_indices_event_type = batch.get("dynamic_indices_event_type", None)
+        dynamic_counts_event_type = batch.get("dynamic_counts_event_type", None)
+
+        encoded = self.model(
+            dynamic_indices_event_type=dynamic_indices_event_type,
+            dynamic_counts_event_type=dynamic_counts_event_type,
+            dynamic_indices=batch["dynamic_indices"],
+            dynamic_counts=batch["dynamic_counts"],
+            **kwargs
+        ).last_hidden_state
+
         return encoded
 
     def configure_optimizers(self):
@@ -540,6 +551,7 @@ def train(cfg: FinetuneConfig, train_pyd: PytorchDataset, tuning_pyd: PytorchDat
         num_workers=optimization_config['num_dataloader_workers'],
         collate_fn=collate_fn,
         shuffle=True,
+        persistent_workers=True,
     )
 
     tuning_dataloader = torch.utils.data.DataLoader(
