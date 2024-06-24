@@ -55,53 +55,22 @@ class ESTForStreamClassification(StructuredTransformerPreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
-    @property
-    def _uses_dep_graph(self):
-        return self.config.structured_event_processing_mode == StructuredEventProcessingMode.NESTED_ATTENTION
-
-    def forward(self, dynamic_indices_event_type, dynamic_counts_event_type, dynamic_indices, dynamic_counts, labels=None, **kwargs) -> StreamClassificationModelOutput:
-        """Runs the forward pass through the fine-tuning label prediction.
-
-        Args:
-            dynamic_indices_event_type: The dynamic indices for event types.
-            dynamic_counts_event_type: The dynamic counts for event types.
-            dynamic_indices: The dynamic indices for measurements.
-            dynamic_counts: The dynamic counts for measurements.
-            labels: The labels for the fine-tuning task.
-
-        Returns:
-            A `StreamClassificationModelOutput` object capturing loss, predictions, and labels for the
-            fine-tuning task in question.
-        """
-        # Check if the input tensors are valid PyTorch tensors
-        if not isinstance(dynamic_indices_event_type, torch.Tensor):
-            raise TypeError("Input 'dynamic_indices_event_type' should be a PyTorch tensor.")
-        if not isinstance(dynamic_counts_event_type, torch.Tensor):
-            raise TypeError("Input 'dynamic_counts_event_type' should be a PyTorch tensor.")
-        if not isinstance(dynamic_indices, torch.Tensor):
-            raise TypeError("Input 'dynamic_indices' should be a PyTorch tensor.")
-        if not isinstance(dynamic_counts, torch.Tensor):
-            raise TypeError("Input 'dynamic_counts' should be a PyTorch tensor.")
-
+    def forward(self, batch: dict, labels=None):
         device = self.logit_layer.weight.device
-
-        # Move the input tensors to the same device as the model
-        dynamic_indices_event_type = dynamic_indices_event_type.to(device)
-        dynamic_counts_event_type = dynamic_counts_event_type.to(device)
-        dynamic_indices = dynamic_indices.to(device)
-        dynamic_counts = dynamic_counts.to(device)
-
-        encoded = self.encoder(
-            dynamic_indices_event_type=dynamic_indices_event_type,
-            dynamic_counts_event_type=dynamic_counts_event_type,
+        
+        dynamic_indices = batch['dynamic_indices'].to(device)
+        dynamic_counts = batch['dynamic_counts'].to(device)
+        
+        pytorch_batch = PytorchBatch(
             dynamic_indices=dynamic_indices,
-            dynamic_counts=dynamic_counts,
-            **kwargs
-        ).last_hidden_state
+            dynamic_counts=dynamic_counts
+        )
+
+        encoded = self.encoder(batch=pytorch_batch).last_hidden_state
 
         event_encoded = encoded[:, :, -1, :] if self._uses_dep_graph else encoded
 
-        # Rest of the code...
+        logits = self.logit_layer(event_encoded.mean(dim=1))
 
         if labels is not None:
             labels = labels.to(logits.device)
@@ -114,3 +83,7 @@ class ESTForStreamClassification(StructuredTransformerPreTrainedModel):
             preds=logits,
             labels=labels,
         )
+        
+    @property
+    def _uses_dep_graph(self):
+        return self.config.structured_event_processing_mode == StructuredEventProcessingMode.NESTED_ATTENTION

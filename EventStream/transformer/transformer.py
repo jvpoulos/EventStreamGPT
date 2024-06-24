@@ -708,13 +708,7 @@ class TemporalPositionEncoding(torch.nn.Module):
 
 
 class ConditionallyIndependentPointProcessInputLayer(torch.nn.Module):
-    def __init__(
-        self,
-        config: StructuredTransformerConfig,
-        vocab_sizes_by_measurement: dict[str, int],
-        oov_index: int,
-        do_use_sinusoidal: bool,  # Add this parameter
-    ):
+    def __init__(self, config: StructuredTransformerConfig, vocab_sizes_by_measurement: dict[str, int], oov_index: int, do_use_sinusoidal: bool):
         super().__init__()
 
         print(f"ConditionallyIndependentPointProcessInputLayer: oov_index = {oov_index}")
@@ -754,18 +748,43 @@ class ConditionallyIndependentPointProcessInputLayer(torch.nn.Module):
         if not isinstance(batch, PytorchBatch):
             raise TypeError("Input 'batch' should be a PytorchBatch object.")
 
-        data_embed: torch.Tensor = self.data_embedding_layer(batch)
+        # Handle cases where dynamic_indices or dynamic_counts might not be tensors
+        dynamic_indices = batch.dynamic_indices
+        if isinstance(dynamic_indices, PytorchBatch):
+            dynamic_indices = dynamic_indices.dynamic_indices
+        if not isinstance(dynamic_indices, torch.Tensor):
+            dynamic_indices = torch.tensor(dynamic_indices, dtype=torch.long)
         
-        if "time_delta" not in batch or batch["time_delta"] is None:
+        dynamic_counts = getattr(batch, 'dynamic_counts', None)
+        if dynamic_counts is None:
+            dynamic_counts = torch.ones_like(dynamic_indices, dtype=torch.float32)
+        elif isinstance(dynamic_counts, PytorchBatch):
+            dynamic_counts = dynamic_counts.dynamic_counts
+        elif not isinstance(dynamic_counts, torch.Tensor):
+            dynamic_counts = torch.tensor(dynamic_counts, dtype=torch.float32)
+        
+        # Create a new batch with the processed data
+        processed_batch = PytorchBatch(
+            dynamic_indices=dynamic_indices,
+            dynamic_counts=dynamic_counts,
+        )
+
+        # Add event_type if it's present in the original batch
+        if hasattr(batch, 'event_type'):
+            processed_batch.event_type = batch.event_type
+
+        data_embed: torch.Tensor = self.data_embedding_layer(processed_batch)
+        
+        if not hasattr(batch, 'time_delta') or batch.time_delta is None:
             logger.warning("'time_delta' is missing or None in the batch. Skipping time embedding.")
             return data_embed
 
         time_embed = self.time_embedding_layer(batch)
 
-        data_embed = data_embed.to(time_embed.device)  # Move data_embed to the same device as time_embed
+        data_embed = data_embed.to(time_embed.device)
         embed = data_embed + time_embed
 
-        if batch.event_mask is not None:
+        if hasattr(batch, 'event_mask') and batch.event_mask is not None:
             mask = batch.event_mask.unsqueeze(-1)
             mask = mask.expand_as(embed)
             embed = torch.where(mask, embed, torch.zeros_like(embed))
@@ -774,10 +793,9 @@ class ConditionallyIndependentPointProcessInputLayer(torch.nn.Module):
         
 class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTrainedModel):
     def __init__(self, config: StructuredTransformerConfig, vocabulary_config: VocabularyConfig, oov_index: int):
-        super().__init__(config)  # Pass the config argument here
+        super().__init__(config)
 
-        print(f"ConditionallyIndependentPointProcessInputLayer: Initializing with oov_index = {oov_index}")
-        print(f"ConditionallyIndependentPointProcessInputLayer: vocab_sizes_by_measurement = {vocabulary_config.vocab_sizes_by_measurement}")    
+        print(f"ConditionallyIndependentPointProcessTransformer: oov_index = {oov_index}")
         
         config.vocab_sizes_by_measurement = vocabulary_config.vocab_sizes_by_measurement
 
@@ -787,12 +805,9 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
             config,
             vocabulary_config.vocab_sizes_by_measurement,
             oov_index=oov_index,
-            do_use_sinusoidal=config.do_use_sinusoidal,  # Pass the attribute here
+            do_use_sinusoidal=config.do_use_sinusoidal,
         )
 
-        # TODO(mmd): Replace this with InnerBlock for a non-structured version.
-        if config.structured_event_processing_mode != StructuredEventProcessingMode.CONDITIONALLY_INDEPENDENT:
-            raise ValueError(f"{config.structured_event_processing_mode} invalid!")
         self.h = nn.ModuleList(
             [InnerBlock(config, layer_id=i, is_seq=True) for i in range(config.num_hidden_layers)]
         )
@@ -805,10 +820,6 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
 
     def forward(
         self,
-        dynamic_indices_event_type: torch.Tensor | None = None,
-        dynamic_counts_event_type: torch.Tensor | None = None,
-        dynamic_indices: torch.Tensor | None = None,
-        dynamic_counts: torch.Tensor | None = None,
         batch: PytorchBatch | None = None,
         input_embeds: torch.Tensor | None = None,
         past: tuple[torch.FloatTensor] | None = None,
@@ -819,29 +830,8 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
         output_hidden_states: bool | None = None,
         return_dict: bool | None = None,
     ) -> tuple[torch.Tensor] | TransformerOutputWithPast:
-        """Performs a forward pass on the transformer model.
-
-        Args:
-            batch: A PytorchBatch instance containing input data.
-            input_embeds: Precomputed embeddings for the input data. Currently unused.
-            past: Past hidden states for more efficient decoding.
-            seq_attention_mask: Mask for the sequential attention mechanism.
-            head_mask: Mask to nullify selected heads of the self-attention module.
-            use_cache: Specifies whether caching should be used.
-            output_attentions: Specifies whether attention probabilities should be returned in the output.
-            output_hidden_states: Specifies whether hidden states should be returned in the output.
-            return_dict: Specifies whether the output should be an object with key names (True) or a tuple.
-
-        Returns:
-            A tuple containing hidden states, or a TransformerOutputWithPast object if return_dict is True.
-        """
-
-        output_attentions = (
-            output_attentions if output_attentions is not None else self.config.output_attentions
-        )
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -850,25 +840,17 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
 
         if input_embeds is None:
             if batch is None:
-                raise ValueError("batch cannot be None if input_embeds is None")
-            elif isinstance(batch, PytorchBatch):
-                input_embeds = self.input_layer(batch)
-            elif isinstance(batch, dict):
-                input_embeds = self.input_layer(PytorchBatch(**batch))
-            else:
-                raise TypeError(f"batch must be an instance of PytorchBatch or a dictionary, got {type(batch)} instead")
+                raise ValueError("Either batch or input_embeds must be provided")
+            input_embeds = self.input_layer(batch)
 
         torch._assert(
             ~torch.isnan(input_embeds).any(), f"{torch.isnan(input_embeds).sum()} NaNs in input_embeds"
         )
 
-        if batch is not None and "event_mask" in batch and batch["event_mask"] is not None:
-            seq_attention_mask = expand_mask(batch["event_mask"], input_embeds.dtype)
+        if batch is not None and hasattr(batch, 'event_mask') and batch.event_mask is not None:
+            seq_attention_mask = expand_mask(batch.event_mask, input_embeds.dtype)
 
         # Prepare head mask if needed
-        # 1.0 in head_mask indicate we keep the head
-        # attention_probs has shape bsz x num_heads x N x N
-        # head_mask has shape n_layer x batch x num_heads x N x N
         head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
 
         hidden_states = input_embeds
@@ -895,8 +877,6 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
 
                     return custom_forward
 
-                # We do this twice because the checkpointed process can't take keyword args, which is safer
-                # and cleaner, in my opinion.
                 args = (
                     hidden_states,
                     seq_attention_mask,
@@ -920,7 +900,7 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
 
             hidden_states, extra_return_info = outputs
 
-            if batch is not None and batch.event_mask is not None:
+            if batch is not None and hasattr(batch, 'event_mask') and batch.event_mask is not None:
                 hidden_states = torch.where(
                     batch.event_mask.unsqueeze(-1).expand_as(hidden_states),
                     hidden_states,
@@ -951,8 +931,7 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
             hidden_states=all_hidden_states,
             attentions=all_self_attentions,
         )
-
-
+        
 class NestedAttentionPointProcessInputLayer(torch.nn.Module):
     """Processes input batch and produces input dependency graph element embeddings.
 

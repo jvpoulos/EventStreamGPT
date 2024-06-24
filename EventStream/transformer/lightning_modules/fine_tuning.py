@@ -45,7 +45,40 @@ from ...data.vocabulary import VocabularyConfig
 from ...data.types import PytorchBatch
 from pytorch_lightning.loggers import WandbLogger
 
+import time
+import torch.multiprocessing as mp
+
 import logging
+
+import numpy as np
+
+# Configure the logger
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
+class TimeoutDataLoader(torch.utils.data.DataLoader):
+    def __init__(self, *args, **kwargs):
+        self.timeout = kwargs.pop('timeout', 60)  # Default timeout of 60 seconds
+        super().__init__(*args, **kwargs)
+
+    def __iter__(self):
+        return TimeoutDataLoaderIter(super().__iter__(), self.timeout)
+
+class TimeoutDataLoaderIter:
+    def __init__(self, iterator, timeout):
+        self.iterator = iterator
+        self.timeout = timeout
+
+    def __next__(self):
+        start = time.time()
+        while True:
+            try:
+                return next(self.iterator)
+            except StopIteration:
+                raise
+            except Exception as e:
+                if time.time() - start > self.timeout:
+                    raise TimeoutError(f"DataLoader timed out after {self.timeout} seconds") from e
 
 class ESTForStreamClassificationLM(L.LightningModule):
     """A PyTorch Lightning Module for a `ESTForStreamClassification` model."""
@@ -61,9 +94,6 @@ class ESTForStreamClassificationLM(L.LightningModule):
     ):
         """Initializes the Lightning Module."""
         super().__init__()
-
-        # Initialize the logger with a different attribute name
-        self._logger = logging.getLogger(__name__)
 
         if isinstance(config, dict):
             config = StructuredTransformerConfig(**config)
@@ -206,57 +236,65 @@ class ESTForStreamClassificationLM(L.LightningModule):
             self.log(f"{prefix}_loss", results.loss)
 
     def training_step(self, batch, batch_idx):
-        outputs = self.model(
-            dynamic_indices_event_type=batch["dynamic_indices_event_type"],
-            dynamic_counts_event_type=batch["dynamic_counts_event_type"],
-            dynamic_indices=batch["dynamic_indices"],
-            dynamic_counts=batch["dynamic_counts"],
-            labels=batch["labels"]
-        )
+        logger.debug(f"Training step - Batch keys: {batch.keys()}")
+        if batch is None:
+            self.log('train_loss', None)
+            return None
+
+        outputs = self.model(batch, labels=batch['labels'])
         loss = outputs.loss
-        self.log('train_loss', loss)
+        
+        if loss is not None:
+            self.log('train_loss', loss)
+        else:
+            self.log('train_loss', torch.tensor(float('inf')))
+        
         return loss
 
     def validation_step(self, batch, batch_idx):
-        outputs = self.model(
-            dynamic_indices_event_type=batch["dynamic_indices_event_type"],
-            dynamic_counts_event_type=batch["dynamic_counts_event_type"],
-            dynamic_indices=batch["dynamic_indices"],
-            dynamic_counts=batch["dynamic_counts"],
-            labels=batch["labels"]
-        )
+        logger.debug(f"Validation step - Batch keys: {batch.keys()}")
+        if batch is None:
+            self.log('val_loss', None)
+            return None
+        
+        outputs = self.model(batch, labels=batch['labels'])
         loss = outputs.loss
         self.log('val_loss', loss)
         return loss
 
     def test_step(self, batch, batch_idx):
-        outputs = self.model(
-            dynamic_indices_event_type=batch["dynamic_indices_event_type"],
-            dynamic_counts_event_type=batch["dynamic_counts_event_type"],
-            dynamic_indices=batch["dynamic_indices"],
-            dynamic_counts=batch["dynamic_counts"],
-            labels=batch["labels"]
-        )
+        logger.debug(f"Test step - Batch keys: {batch.keys()}")
+        if batch is None:
+            self.log('test_loss', None)
+            return None
+        
+        outputs = self.model(batch, labels=batch['labels'])
         loss = outputs.loss
-        self.log('test_loss', loss)
+        
+        if loss is not None:
+            self.log('test_loss', loss)
+        else:
+            self.log('test_loss', torch.tensor(float('inf')))
+        
         return loss
 
     def forward(self, batch, **kwargs):
-        if not isinstance(batch, PytorchBatch):
-            raise TypeError("Input 'batch' should be a PytorchBatch object.")
-
-        dynamic_indices_event_type = batch.get("dynamic_indices_event_type", None)
-        dynamic_counts_event_type = batch.get("dynamic_counts_event_type", None)
-
-        encoded = self.model(
-            dynamic_indices_event_type=dynamic_indices_event_type,
-            dynamic_counts_event_type=dynamic_counts_event_type,
-            dynamic_indices=batch["dynamic_indices"],
-            dynamic_counts=batch["dynamic_counts"],
+        if not isinstance(batch, dict):
+            raise TypeError("Input 'batch' should be a dictionary.")
+        
+        dynamic_indices = batch.get("dynamic_indices")
+        dynamic_counts = batch.get("dynamic_counts")
+        
+        if dynamic_indices is None:
+            raise ValueError("'dynamic_indices' must be provided in the batch.")
+        
+        outputs = self.model(
+            dynamic_indices=dynamic_indices,
+            dynamic_counts=dynamic_counts,
             **kwargs
-        ).last_hidden_state
-
-        return encoded
+        )
+        
+        return outputs.last_hidden_state if hasattr(outputs, 'last_hidden_state') else outputs
 
     def configure_optimizers(self):
         """Configures optimizer and learning rate scheduler."""
@@ -456,68 +494,44 @@ class FinetuneConfig:
 
 
 def collate_fn(batch):
-    # Filter out items with None labels
+    if batch is None or len(batch) == 0:
+        return None
+
     valid_items = [item for item in batch if item["labels"] is not None]
 
     if not valid_items:
-        # If all items have None labels, return None
         return None
 
-    dynamic_indices_event_type = torch.stack([item["dynamic_indices_event_type"] for item in valid_items])
-    dynamic_counts_event_type = torch.stack([item["dynamic_counts_event_type"] for item in valid_items])
-    dynamic_indices = torch.stack([item["dynamic_indices"] for item in valid_items])
-    dynamic_counts = torch.stack([item["dynamic_counts"] for item in valid_items])
-    labels = torch.stack([item["labels"] for item in valid_items])
-    
-    return {
-        "dynamic_indices_event_type": dynamic_indices_event_type,
-        "dynamic_counts_event_type": dynamic_counts_event_type,
-        "dynamic_indices": dynamic_indices,
-        "dynamic_counts": dynamic_counts,
-        "labels": labels
-    }
-    
+    required_keys = ['dynamic_indices', 'dynamic_counts', 'labels']
+    collated_batch = {}
+
+    for key in required_keys:
+        if key == 'labels':
+            collated_batch[key] = torch.stack([item[key] for item in valid_items]).float()
+        else:
+            collated_batch[key] = torch.stack([item[key] for item in valid_items])
+
+    return collated_batch
+
+def worker_init_fn(worker_id):
+    np.random.seed(worker_id)
+    random.seed(worker_id)
+
 @task_wrapper
 def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, wandb_logger: WandbLogger | None = None):
-    logging.basicConfig(level=logging.DEBUG)    
+    logging.basicConfig(level=logging.DEBUG)
 
     L.seed_everything(cfg.seed)
     if cfg.do_use_filesystem_sharing:
         torch.multiprocessing.set_sharing_strategy("file_system")
 
-    print(f"Train dataset length: {len(train_pyd)}")
-    print(f"Tuning dataset length: {len(tuning_pyd)}")
-    print(f"Held-out dataset length: {len(held_out_pyd)}")
-
     config = cfg.config
     data_config = cfg.data_config
     optimization_config = cfg.optimization_config
 
-    if os.environ.get("LOCAL_RANK", "0") == "0":
-        pathlib.Path(cfg.save_dir).mkdir(parents=True, exist_ok=True)
-        print("Saving config files...")
-        config_fp = cfg.save_dir / "config.json"
-        if config_fp.exists() and not cfg.do_overwrite:
-            raise FileExistsError(f"{config_fp} already exists!")
-        else:
-            print(f"Writing to {config_fp}")
-            config.to_json_file(config_fp)
-
-        data_config_dict = cfg.data_config.to_dict()
-        data_config_dict["save_dir"] = str(data_config_dict["save_dir"])
-        data_config_dict["dl_reps_dir"] = str(data_config_dict["dl_reps_dir"])
-        with open(cfg.save_dir / "data_config.json", "w") as f:
-            json.dump(data_config_dict, f, indent=2)
-
-        optimization_config_dict = cfg.optimization_config
-        with open(cfg.save_dir / "optimization_config.json", "w") as f:
-            json.dump(optimization_config_dict, f, indent=2)
-
-        if cfg.wandb_experiment_config_kwargs:
-            wandb_logger.experiment.config.update(cfg.wandb_experiment_config_kwargs)
-
-    if not config.problem_type:
-        config.problem_type = 'single_label_classification'
+    # Ensure problem_type is set
+    if not hasattr(config, 'problem_type') or config.problem_type is None:
+        config.problem_type = "single_label_classification"
 
     model_params = dict()
     if cfg.pretrained_weights_fp is not None:
@@ -530,27 +544,36 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, wandb_logger
         train_pyd,
         batch_size=optimization_config['batch_size'],
         num_workers=optimization_config['num_dataloader_workers'],
-        collate_fn=train_pyd.collate_fn,
+        collate_fn=collate_fn,
         shuffle=True,
         persistent_workers=True,
+        prefetch_factor=4,  # Adjust the prefetch factor based on your system
+        pin_memory=True,  # If you are using a GPU, pinning memory can be beneficial
+        worker_init_fn=worker_init_fn,
     )
 
     tuning_dataloader = torch.utils.data.DataLoader(
         tuning_pyd,
         batch_size=optimization_config['validation_batch_size'],
         num_workers=optimization_config['num_dataloader_workers'],
-        collate_fn=tuning_pyd.collate_fn,
+        collate_fn=collate_fn,
         shuffle=False,
         persistent_workers=True,
+        prefetch_factor=4,
+        pin_memory=True,
+        worker_init_fn=worker_init_fn,
     )
 
     held_out_dataloader = torch.utils.data.DataLoader(
         held_out_pyd,
         batch_size=optimization_config['validation_batch_size'],
         num_workers=optimization_config['num_dataloader_workers'],
-        collate_fn=held_out_pyd.collate_fn,
+        collate_fn=collate_fn,
         shuffle=False,
         persistent_workers=True,
+        prefetch_factor=4,
+        pin_memory=True,
+        worker_init_fn=worker_init_fn,
     )
 
     checkpoint_callback = ModelCheckpoint(
@@ -580,28 +603,6 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, wandb_logger
         logger=wandb_logger,
     )
 
-    if cfg.wandb_logger_kwargs.get("name", None):
-        if "do_log_graph" in cfg.wandb_logger_kwargs:
-            do_log_graph = cfg.wandb_logger_kwargs.pop("do_log_graph")
-        else:
-            do_log_graph = False
-
-        wandb.finish()
-
-        wandb_logger = WandbLogger(
-            **{k: v for k, v in cfg.wandb_logger_kwargs.items() if v is not None},
-            save_dir=cfg.save_dir,
-        )
-
-        if os.environ.get("LOCAL_RANK", "0") == "0":
-            if do_log_graph:
-                wandb_logger.watch(LM, log="all", log_graph=True)
-
-            if cfg.wandb_experiment_config_kwargs:
-                wandb_logger.experiment.config.update(cfg.wandb_experiment_config_kwargs)
-
-        trainer_kwargs["logger"] = wandb_logger
-
     trainer_kwargs["max_epochs"] = optimization_config['max_epochs']
 
     if (optimization_config.get('gradient_accumulation') is not None) and (
@@ -609,52 +610,21 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, wandb_logger
     ):
         trainer_kwargs["accumulate_grad_batches"] = optimization_config['gradient_accumulation']
 
-    checkpoints_dir = cfg.save_dir / "model_checkpoints"
-    checkpoints_dir.mkdir(parents=True, exist_ok=True)
-
     trainer = L.Trainer(**trainer_kwargs)
 
     trainer.fit(model=LM, train_dataloaders=train_dataloader, val_dataloaders=tuning_dataloader)
 
     if len(tuning_pyd) == 0:
-        print("Warning: Tuning dataset is empty. Skipping tuning evaluation.")
         tuning_metrics = None
     else:
         tuning_metrics = trainer.validate(model=LM, dataloaders=tuning_dataloader, ckpt_path="best")
 
     if len(held_out_pyd) == 0:
-        print("Warning: Held-out dataset is empty. Skipping held-out evaluation.")
         held_out_metrics = None
     else:
         held_out_metrics = trainer.test(model=LM, dataloaders=held_out_dataloader, ckpt_path="best")
 
-    # Save predictions and metrics
-    output_dir = Path(cfg.save_dir) / "predictions"
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    tuning_outputs = trainer.predict(model=LM, dataloaders=tuning_dataloader, ckpt_path="best")
-    with open(output_dir / "tuning_predictions.json", "w") as f:
-        json.dump(tuning_outputs, f)
-
-    held_out_outputs = trainer.predict(model=LM, dataloaders=held_out_dataloader, ckpt_path="best")
-    with open(output_dir / "held_out_predictions.json", "w") as f:
-        json.dump(held_out_outputs, f)
-
-    if os.environ.get("LOCAL_RANK", "0") == "0":
-        print("Saving final metrics...")
-
-        if tuning_metrics is not None:
-            with open(cfg.save_dir / "tuning_metrics.json", mode="w") as f:
-                json.dump(tuning_metrics, f)
-        else:
-            print("No tuning metrics to save.")
-
-        if held_out_metrics is not None:
-            with open(cfg.save_dir / "held_out_metrics.json", mode="w") as f:
-                json.dump(held_out_metrics, f)
-        else:
-            print("No held-out metrics to save.")
-
     return None, tuning_metrics, held_out_metrics
-    
+
+
 __all__ = ['FinetuneConfig', 'train']

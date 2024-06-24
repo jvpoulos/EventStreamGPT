@@ -234,53 +234,55 @@ class CIPPTForGenerativeSequenceModeling(StructuredGenerationMixin, StructuredTr
             "past": past,
         }
         
-    def forward(
-        self,
-        batch: PytorchBatch,
-        is_generation: bool = False,
-        **kwargs,
-    ) -> GenerativeSequenceModelOutput:
-        """This runs the full forward pass of the model."""
+def forward(
+    self,
+    dynamic_indices: torch.Tensor,
+    dynamic_counts: torch.Tensor | None = None,
+    batch: PytorchBatch | None = None,
+    input_embeds: torch.Tensor | None = None,
+    past: tuple[torch.FloatTensor] | None = None,
+    seq_attention_mask: torch.Tensor | None = None,
+    head_mask: torch.Tensor | None = None,
+    use_cache: bool | None = None,
+    output_attentions: bool | None = None,
+    output_hidden_states: bool | None = None,
+    return_dict: bool | None = None,
+    is_generation: bool = False,
+) -> GenerativeSequenceModelOutput:
+    output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+    output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+    use_cache = use_cache if use_cache is not None else self.config.use_cache
+    return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        classification_labels_by_measurement = None if is_generation else {}
+    if batch is None:
+        batch = PytorchBatch(
+            dynamic_indices=dynamic_indices,
+            dynamic_counts=dynamic_counts,
+        )
 
-        if not is_generation and hasattr(batch, "stream_labels") and batch.stream_labels is not None:
-            print("Available labels in batch.stream_labels:", batch.stream_labels.keys())
-            if "A1cGreaterThan7" in batch.stream_labels:
-                a1c_greater_than_7_labels = batch.stream_labels["A1cGreaterThan7"]
-                classification_labels_by_measurement["A1cGreaterThan7"] = a1c_greater_than_7_labels
-                print("Assigned A1cGreaterThan7 labels to the model.")
-            else:
-                print("Warning: 'A1cGreaterThan7' labels not found in the batch.")
-        else:
-            print("Warning: 'stream_labels' not found in the batch.")
+    if input_embeds is None:
+        input_embeds = self.encoder.input_layer(batch)
 
-        use_cache = kwargs.get("use_cache", False)
-        output_attentions = kwargs.get("output_attentions", False)
-        output_hidden_states = kwargs.get("output_hidden_states", False)
+    encoded = self.encoder(
+        batch=batch,
+        input_embeds=input_embeds,
+        past=past,
+        seq_attention_mask=seq_attention_mask,
+        head_mask=head_mask,
+        use_cache=use_cache,
+        output_attentions=output_attentions,
+        output_hidden_states=output_hidden_states,
+    )
 
-        encoded = self.encoder(batch, **kwargs)
+    output = self.output_layer(batch, encoded.last_hidden_state, is_generation=is_generation)
 
-        output = self.output_layer(batch, encoded.last_hidden_state, is_generation=is_generation)
-        
-        # Add the next_event_time and next_event_measurements predictions
-        output["preds"]["regression"]["next_event_time"] = output["preds"]["regression"].get("next_event_time", None)
-        output["preds"]["classification"]["next_event_measurements"] = output["preds"]["classification"].get("next_event_measurements", None)
+    if use_cache:
+        output['past_key_values'] = encoded.past_key_values
 
-        # Set the 'A1cGreaterThan7' key to None in the output if it's not found
-        if "A1cGreaterThan7" not in output["preds"]["classification"]:
-            output["preds"]["classification"]["A1cGreaterThan7"] = (None, None)
+    if output_attentions:
+        output['attentions'] = encoded.attentions
 
-        if not is_generation:
-            output["labels"]["classification"] = classification_labels_by_measurement
+    if output_hidden_states:
+        output['hidden_states'] = encoded.hidden_states
 
-        if use_cache:
-            output["past_key_values"] = encoded.past_key_values
-
-        if output_attentions:
-            output["attentions"] = encoded.attentions
-
-        if output_hidden_states:
-            output["hidden_states"] = encoded.hidden_states
-
-        return output
+    return output

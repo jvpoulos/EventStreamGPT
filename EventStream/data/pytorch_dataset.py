@@ -140,7 +140,7 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
         super().__init__()
         self.split = split
         config.save_dir = Path(config.save_dir)
-        self.dl_reps_dir = dl_reps_dir or config.save_dir / "DL_reps"  # Default to "DL_reps" directory if dl_reps_dir is None
+        self.dl_reps_dir = dl_reps_dir or config.save_dir / "DL_reps"
         self.load_cached_data()
         self.config = config
         self.task_types = {}
@@ -169,17 +169,17 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
         if self.cached_data.empty:
             raise ValueError(f"Cached data is empty for split '{split}'")
 
-        required_columns = ["subject_id", "dynamic_indices", "dynamic_counts", "dynamic_indices_event_type", "dynamic_counts_event_type"]
+        required_columns = ["subject_id", "dynamic_indices", "dynamic_counts"]
         missing_columns = [col for col in required_columns if col not in self.cached_data.columns]
         if missing_columns:
             raise ValueError(f"Required columns {missing_columns} are missing in the cached data for split '{split}'")
 
-            # Handle missing columns
-            for col in missing_columns:
-                if col == "subject_id":
-                    self.cached_data["subject_id"] = np.arange(len(self.cached_data))
-                else:
-                    self.cached_data[col] = pd.Series([[]] * len(self.cached_data))
+        # Handle missing columns
+        for col in missing_columns:
+            if col == "subject_id":
+                self.cached_data["subject_id"] = np.arange(len(self.cached_data))
+            else:
+                self.cached_data[col] = pd.Series([[]] * len(self.cached_data))
 
         self.vocabulary_config = VocabularyConfig.from_json_file(
             Path("data") / "vocabulary_config.json"
@@ -819,24 +819,18 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
         max_seq_len = max(len(item["dynamic_indices"]) for item in valid_items)
 
         # Initialize the tensors with the correct shape
-        dynamic_indices_event_type = torch.zeros((len(valid_items), max_seq_len), dtype=torch.long, device=device)
-        dynamic_counts_event_type = torch.zeros((len(valid_items), max_seq_len), dtype=torch.long, device=device)
         dynamic_indices = torch.zeros((len(valid_items), max_seq_len), dtype=torch.long, device=device)
-        dynamic_counts = torch.zeros((len(valid_items), max_seq_len), dtype=torch.long, device=device)
+        dynamic_counts = torch.zeros((len(valid_items), max_seq_len), dtype=torch.float, device=device)
         labels = torch.zeros((len(valid_items),), dtype=torch.bool, device=device)
 
         # Populate the tensors with the data from valid items
         for i, item in enumerate(valid_items):
             seq_len = len(item["dynamic_indices"])
-            dynamic_indices_event_type[i, :seq_len] = torch.tensor(item["dynamic_indices_event_type"][:seq_len], dtype=torch.long)
-            dynamic_counts_event_type[i, :seq_len] = torch.tensor(item["dynamic_counts_event_type"][:seq_len], dtype=torch.long)
             dynamic_indices[i, :seq_len] = torch.tensor(item["dynamic_indices"][:seq_len], dtype=torch.long)
-            dynamic_counts[i, :seq_len] = torch.tensor(item["dynamic_counts"][:seq_len], dtype=torch.long)
+            dynamic_counts[i, :seq_len] = torch.tensor(item["dynamic_counts"][:seq_len], dtype=torch.float)
             labels[i] = item["labels"]
 
         out_batch = {
-            "dynamic_indices_event_type": dynamic_indices_event_type,
-            "dynamic_counts_event_type": dynamic_counts_event_type,
             "dynamic_indices": dynamic_indices,
             "dynamic_counts": dynamic_counts,
             "labels": labels

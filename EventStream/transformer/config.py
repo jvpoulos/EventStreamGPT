@@ -614,8 +614,8 @@ class StructuredTransformerConfig(PretrainedConfig):
                     f"do_split_embeddings={do_split_embeddings}. Setting numerical_embedding_dim to None."
                 )
                 numerical_embedding_dim = None
-        self.do_split_embeddings = do_split_embeddings
 
+        self.do_split_embeddings = do_split_embeddings
         self.categorical_embedding_dim = categorical_embedding_dim
         self.numerical_embedding_dim = numerical_embedding_dim
         self.static_embedding_mode = static_embedding_mode
@@ -624,6 +624,7 @@ class StructuredTransformerConfig(PretrainedConfig):
         self.categorical_embedding_weight = categorical_embedding_weight
         self.numerical_embedding_weight = numerical_embedding_weight
         self.do_normalize_by_measurement_index = do_normalize_by_measurement_index
+        self.do_use_learnable_sinusoidal_ATE = do_use_learnable_sinusoidal_ATE
 
         missing_param_err_tmpl = f"For a {structured_event_processing_mode} model, {{}} should not be None"
         extra_param_err_tmpl = (
