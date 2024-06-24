@@ -92,25 +92,23 @@ class Query:
 INPUT_DF_T = Union[Path, pd.DataFrame, pl.DataFrame, Query]
 
 class Dataset(DatasetBase):
-    def __init__(self, config=None, subjects_df=None, events_df=None, dynamic_measurements_df=None, **kwargs):
+    def __init__(self, config=None, subjects_df=None, events_df=None, dynamic_measurements_df=None, code_mapping=None, **kwargs):
         if config is None:
             config = DatasetConfig()
-        else:
-            # If config is a dictionary, convert it to a DatasetConfig object
-            if isinstance(config, dict):
-                config = DatasetConfig.from_dict(config)
+        elif isinstance(config, dict):
+            config = DatasetConfig.from_dict(config)
 
         self.config = config
+        self.code_mapping = code_mapping
 
-        # Check if the necessary attributes exist in the loaded object
-        if hasattr(self, 'subjects_df') and hasattr(self, 'events_df') and hasattr(self, 'dynamic_measurements_df'):
-            super().__init__(config, subjects_df, events_df, dynamic_measurements_df, **kwargs)
-        else:
-            # Initialize the necessary attributes with default values
-            self.subjects_df = None
-            self.events_df = None
-            self.dynamic_measurements_df = None
-            super().__init__(config, **kwargs)
+        # Initialize the necessary attributes
+        self.subjects_df = subjects_df
+        self.events_df = events_df
+        self.dynamic_measurements_df = dynamic_measurements_df
+
+        # Call the parent class constructor
+        super().__init__(config, subjects_df, events_df, dynamic_measurements_df, **kwargs)
+
     """The polars specific implementation of the dataset.
 
     Args:
@@ -339,20 +337,11 @@ class Dataset(DatasetBase):
         event_type: str,
         columns_schema: dict[str, tuple[str, InputDataType]],
     ) -> tuple[DF_T, DF_T | None]:
-        """Performs the following pre-processing steps on an input events and measurements
-        dataframe:
-
-        1. Adds a categorical event type column with value `event_type`.
-        2. Extracts and renames the columns present in `columns_schema`.
-        3. Adds an integer `event_id` column.
-        4. Splits the dataframe into an events dataframe, storing `event_id`, `subject_id`, `event_type`,
-           and `timestamp`, and a `measurements` dataframe, storing `event_id` and all other data columns.
-        """
-
         cols_select_exprs = [
-            "timestamp",
-            "subject_id",
+            pl.col("Date").alias("timestamp"),
+            pl.col("EMPI").alias("subject_id"),
         ]
+        
         if event_type.startswith("COL:"):
             event_type_col = event_type[len("COL:") :]
             cols_select_exprs.append(pl.col(event_type_col).cast(pl.Categorical).alias("event_type"))
@@ -363,18 +352,24 @@ class Dataset(DatasetBase):
             cols_select_exprs.append(pl.col(in_col).alias(out_col))
 
         df = (
-            df.filter(pl.col("timestamp").is_not_null() & pl.col("subject_id").is_not_null())
+            df.filter(pl.col("Date").is_not_null() & pl.col("EMPI").is_not_null())
             .select(cols_select_exprs)
             .unique()
             .with_row_count("event_id")
         )
 
         events_df = df.select("event_id", "subject_id", "timestamp", "event_type")
-
-        if len(df.columns) > 4:
-            dynamic_measurements_df = df.drop("subject_id", "timestamp", "event_type")
-        else:
-            dynamic_measurements_df = None
+        dynamic_measurements_df = df.select("event_id", "subject_id", "timestamp", "CodeWithType")
+        
+        print(f"Before processing: {dynamic_measurements_df.filter(pl.col('CodeWithType').is_null()).shape[0]} null CodeWithType values")
+        
+        # Ensure CodeWithType is not null and is a string
+        dynamic_measurements_df = dynamic_measurements_df.with_columns([
+            pl.col("CodeWithType").cast(pl.Utf8).alias("dynamic_indices")
+        ])
+        
+        print(f"After processing: {dynamic_measurements_df.filter(pl.col('dynamic_indices').is_null()).shape[0]} null dynamic_indices values")
+        print(f"Sample of dynamic_measurements_df:\n{dynamic_measurements_df.head()}")
 
         return events_df, dynamic_measurements_df
 
@@ -614,13 +609,13 @@ class Dataset(DatasetBase):
                     cat_col, val_col = col, None
 
             if cat_col is not None and cat_col in source_df.columns:
-                if cfg.temporality != valid_temporality_type:
+                if cfg.temporality != valid_temporality_type and cat_col != 'dynamic_indices':
                     raise ValueError(f"Column {cat_col} found in dataframe of wrong temporality")
 
                 source_df = source_df.with_columns(pl.col(cat_col).cast(pl.Utf8).cast(pl.Categorical))
 
             if val_col is not None and val_col in source_df.columns:
-                if cfg.temporality != valid_temporality_type:
+                if cfg.temporality != valid_temporality_type and val_col != 'dynamic_indices':
                     raise ValueError(f"Column {val_col} found in dataframe of wrong temporality")
 
                 if val_col == "SDI_score":  # Special case for SDI_score column
@@ -636,24 +631,6 @@ class Dataset(DatasetBase):
         events_df: pl.DataFrame | pl.LazyFrame | None,
         dynamic_measurements_df: pl.DataFrame | pl.LazyFrame | None,
     ) -> tuple[pl.DataFrame | pl.LazyFrame | None, pl.DataFrame | pl.LazyFrame | None, pl.DataFrame | pl.LazyFrame | None]:
-        """Validate and preprocess the given subjects, events, and dynamic_measurements dataframes.
-
-        For each dataframe, this method checks for the presence of specific columns and unique IDs.
-        It also casts certain columns to appropriate data types and performs necessary joins.
-
-        Args:
-            subjects_df: A dataframe containing subjects information, with an optional 'subject_id' column.
-            events_df: A dataframe containing events information, with optional 'event_id', 'event_type', and
-                'subject_id' columns.
-            dynamic_measurements_df: A dataframe containing dynamic measurements information, with an optional
-                'dynamic_measurement_id' column and other measurement-specific columns.
-
-        Returns:
-            A tuple containing the preprocessed subjects, events, and dynamic_measurements dataframes.
-
-        Raises:
-            ValuesError: If any of the required columns are missing or invalid.
-        """
         subjects_df, subjects_id_type = self._validate_initial_df(
             subjects_df, "subject_id", TemporalityType.STATIC
         )
@@ -679,6 +656,10 @@ class Dataset(DatasetBase):
             dynamic_measurements_df, dynamic_measurement_id_types = self._validate_initial_df(
                 dynamic_measurements_df, "measurement_id", TemporalityType.DYNAMIC, linked_ids
             )
+
+            # Ensure 'dynamic_indices' is in dynamic_measurements_df
+            if 'dynamic_indices' not in dynamic_measurements_df.columns:
+                raise ValueError("'dynamic_indices' column not found in dynamic_measurements_df")
 
         return subjects_df, events_df, dynamic_measurements_df
 
@@ -1124,8 +1105,74 @@ class Dataset(DatasetBase):
         else:
             return measurement_metadata
 
+    def preprocess(self):
+        print("Starting preprocessing...")
+        self._filter_subjects()
+        print("Finished filtering subjects.")
+        self._add_time_dependent_measurements()
+        print("Finished adding time-dependent measurements.")
+        
+        if not hasattr(self, 'code_mapping') or self.code_mapping is None:
+            print("Warning: code_mapping is not available. inverse_mapping will not be created.")
+        else:
+            self.inverse_mapping = {idx: code for code, idx in self.code_mapping.items()}
+        
+        self.fit_measurements()
+        print("Finished fitting measurements.")
+        self.transform_measurements()
+        print("Finished transforming measurements.")
+        print("Preprocessing completed successfully.")
+
     @TimeableMixin.TimeAs
     def _fit_vocabulary(self, measure: str, config: MeasurementConfig, source_df: DF_T) -> Vocabulary:
+        if measure == 'dynamic_indices':
+            print(f"Fitting vocabulary for {measure}")
+            print(f"Source dataframe shape: {source_df.shape}")
+            print(f"Source dataframe columns: {source_df.columns}")
+            print(f"Sample of source dataframe:\n{source_df.head()}")
+            
+            # Ensure 'dynamic_indices' column exists
+            if 'dynamic_indices' not in source_df.columns:
+                raise ValueError("'dynamic_indices' column not found in source dataframe")
+            
+            # Convert to polars DataFrame if it's a LazyFrame
+            if isinstance(source_df, pl.LazyFrame):
+                source_df = source_df.collect()
+            
+            # Get unique codes from the dynamic_indices column
+            unique_codes = source_df['dynamic_indices'].unique().sort()
+            
+            # Create vocab_elements and el_counts
+            vocab_elements = unique_codes.to_list()
+            el_counts = source_df.groupby('dynamic_indices').count().sort('dynamic_indices')['count'].to_list()
+            
+            print(f"Number of unique codes: {len(vocab_elements)}")
+            print(f"Number of element counts: {len(el_counts)}")
+            print(f"Sample of vocab_elements: {vocab_elements[:5]}")
+            print(f"Sample of el_counts: {el_counts[:5]}")
+            
+            return Vocabulary(vocabulary=vocab_elements, obs_frequencies=el_counts)
+        
+        elif config.modality == DataModality.MULTI_LABEL_CLASSIFICATION:
+            observations = source_df.get_column(measure).cast(pl.Utf8)
+            observations = observations.apply(lambda s: s.split("|") if s is not None else [], return_dtype=pl.List(pl.Utf8))
+            observations = observations.explode()
+        else:
+            observations = source_df.get_column(measure)
+
+        observations = observations.drop_nulls()
+        N = len(observations)
+        if N == 0:
+            return None
+
+        try:
+            value_counts = observations.value_counts().sort(by="count", descending=True)
+            vocab_elements = value_counts[measure].to_list()
+            el_counts = value_counts["count"].to_list()
+            return Vocabulary(vocabulary=vocab_elements, obs_frequencies=el_counts)
+        except AssertionError as e:
+            raise AssertionError(f"Failed to build vocabulary for {measure}") from e
+    
         if config.modality == DataModality.MULTIVARIATE_REGRESSION:
             val_types = pl.from_pandas(
                 config.measurement_metadata[["value_type"]], include_index=True
@@ -1167,59 +1214,70 @@ class Dataset(DatasetBase):
                 case _:
                     return
         elif config.modality == DataModality.MULTI_LABEL_CLASSIFICATION:
-            # Handle multi-label classification measurements
             observations = source_df.get_column(measure).cast(pl.Utf8)
             observations = observations.apply(lambda s: s.split("|") if s is not None else [], return_dtype=pl.List(pl.Utf8))
             observations = observations.explode()
-            observations = observations.drop_nulls()
-            N = len(observations)
-            if N == 0:
-                return
-
-            try:
-                value_counts = observations.value_counts()
-                vocab_elements = value_counts[measure].to_list()
-                el_counts = value_counts["count"].to_list()
-                return Vocabulary(vocabulary=vocab_elements, obs_frequencies=el_counts)
-            except AssertionError as e:
-                raise AssertionError(f"Failed to build vocabulary for {measure}") from e
         else:
             observations = source_df.get_column(measure)
 
-        # 1. Set the overall observation frequency for the column.
         observations = observations.drop_nulls()
         N = len(observations)
         if N == 0:
             return
 
-        # 2. Fit metadata vocabularies on the training set.
-        if config.vocabulary is None:
-            try:
-                value_counts = observations.value_counts()
-                vocab_elements = value_counts[measure].to_list()
-                el_counts = value_counts["count"].to_list()
-                return Vocabulary(vocabulary=vocab_elements, obs_frequencies=el_counts)
-            except AssertionError as e:
-                raise AssertionError(f"Failed to build vocabulary for {measure}") from e
+        try:
+            unique_values = observations.unique().sort()
+            vocab_elements = unique_values.to_list()
+            
+            # Use 'count' instead of 'counts' and handle potential column name differences
+            value_counts = observations.value_counts().sort(by=measure)
+            count_column = 'count' if 'count' in value_counts.columns else 'counts'
+            if count_column not in value_counts.columns:
+                print(f"Warning: Count column not found. Available columns: {value_counts.columns}")
+                el_counts = [1] * len(vocab_elements)  # Fallback to assigning count of 1 to each element
+            else:
+                el_counts = value_counts[count_column].to_list()
+            
+            return Vocabulary(vocabulary=vocab_elements, obs_frequencies=el_counts)
+        except AssertionError as e:
+            raise AssertionError(f"Failed to build vocabulary for {measure}") from e
 
     @TimeableMixin.TimeAs
     def _transform_multi_label_classification(self, measure, config, source_df):
-        # Convert the dynamic_indices column to string type
-        source_df = source_df.with_columns(pl.col(measure).cast(str))
+        if measure == 'dynamic_indices':
+            # Ensure no null or empty values
+            source_df = source_df.filter(
+                (pl.col('dynamic_indices').is_not_null()) & (pl.col('dynamic_indices') != '')
+            )
+            
+            # Create a list column of dynamic_indices
+            source_df = source_df.with_columns(
+                pl.col('dynamic_indices').apply(lambda x: [x]).alias('dynamic_indices_list')
+            )
+            
+            # Count the occurrences
+            source_df = source_df.with_columns(
+                pl.col('dynamic_indices_list').apply(len).alias('dynamic_counts')
+            )
+            
+            return source_df
+               
+            # Convert the dynamic_indices column to string type
+            source_df = source_df.with_columns(pl.col(measure).cast(str))
 
-        # Split the dynamic_indices column into a list
-        source_df = source_df.with_columns(
-            pl.col(measure).map_elements(lambda x: [x], return_dtype=pl.List(pl.Utf8)).alias(f"{measure}_list")
-        )
+            # Split the dynamic_indices column into a list
+            source_df = source_df.with_columns(
+                pl.col(measure).map_elements(lambda x: [x], return_dtype=pl.List(pl.Utf8)).alias(f"{measure}_list")
+            )
 
-        # Explode the dynamic_indices_list column and count the occurrences
-        transformed_df = source_df.with_columns(
-            pl.col(f"{measure}_list").explode().alias(measure)
-        ).with_columns(
-            pl.col(f"{measure}_list").map_elements(len, return_dtype=pl.UInt32).alias(f"{measure}_counts")
-        )
+            # Explode the dynamic_indices_list column and count the occurrences
+            transformed_df = source_df.with_columns(
+                pl.col(f"{measure}_list").explode().alias(measure)
+            ).with_columns(
+                pl.col(f"{measure}_list").map_elements(len, return_dtype=pl.UInt32).alias(f"{measure}_counts")
+            )
 
-        return transformed_df
+            return transformed_df
      
     @TimeableMixin.TimeAs
     def _transform_numerical_measurement(
@@ -1335,9 +1393,6 @@ class Dataset(DatasetBase):
         self, measure: str, config: MeasurementConfig, source_df: DF_T
     ) -> DF_T:
         print(f"Transforming categorical measurement: {measure}")
-        print(f"Source DataFrame columns: {source_df.columns}")
-        print(f"Config vocabulary: {config.vocabulary}")
-        print(f"Config measurement metadata: {config.measurement_metadata}")
         if measure not in source_df.columns:
             print(f"Warning: Measure {measure} not found in the source DataFrame.")
             return source_df
@@ -1345,85 +1400,22 @@ class Dataset(DatasetBase):
             print(f"Warning: Vocabulary is None for measure {measure}. Skipping transformation.")
             return source_df
 
-        if config.measurement_metadata is None:
-            print(f"Warning: Measurement metadata is None for measure {measure}. Skipping transformation.")
-            return source_df
-        if config.modality == DataModality.UNIVARIATE_REGRESSION:
-            if config.measurement_metadata.value_type in (
-                NumericDataModalitySubtype.CATEGORICAL_INTEGER,
-                NumericDataModalitySubtype.CATEGORICAL_FLOAT,
-            ):
-                # Handle categorical columns
-                transform_expr = []
-                vocab_el_col = pl.col("const_key")
-                vocab_lit = pl.lit(config.vocabulary.vocabulary).cast(pl.Categorical)
-                transform_expr.append(
-                    pl.when(vocab_el_col.is_null())
-                    .then(None)
-                    .when(~vocab_el_col.is_in(vocab_lit))
-                    .then(pl.lit("UNK"))
-                    .otherwise(vocab_el_col)
-                    .cast(pl.Categorical)
-                    .alias(measure)
-                )
-                return source_df.with_columns(transform_expr)
-            else:
-                # Handle numerical columns
-                return source_df
-        elif config.modality == DataModality.MULTI_LABEL_CLASSIFICATION:
-            # Handle multi-label classification measurements
-            if config.vocabulary is None:
-                print(f"Warning: Vocabulary is None for measure {measure}")
-                return source_df
+        vocab_el_col = pl.col(measure)
+        vocab_lit = pl.Series(config.vocabulary.vocabulary).cast(pl.Categorical)
 
-            vocab_col = config.vocabulary.vocabulary
-            vocab_lit = pl.Series(vocab_col).cast(pl.Categorical)
-            vocab_el_col = pl.col(measure)
-
-            print(f"Measure: {measure}")
-            print(f"Vocab col: {vocab_col}")
-            print(f"Vocab lit: {vocab_lit}")
-            print(f"Vocab el col: {vocab_el_col}")
-            print(f"Source DataFrame schema: {source_df.schema}")
-
+        if measure == 'dynamic_indices':
+            # For dynamic_indices, we don't need to transform it as it's already in the correct format
+            transform_expr = [vocab_el_col.alias(measure)]
+        else:
             transform_expr = [
                 pl.when(vocab_el_col.is_null())
                 .then(None)
-                .when(~vocab_el_col.cast(pl.Utf8).is_in(vocab_lit))
-                .then(pl.lit("UNK"))
+                .when(~vocab_el_col.is_in(vocab_lit))
+                .then(None)
                 .otherwise(vocab_el_col)
+                .cast(pl.Categorical)
                 .alias(measure)
             ]
-            return source_df.with_columns(transform_expr)
-
-        # Handle other modalities
-        if config.vocabulary is None:
-            print(f"Warning: Vocabulary is None for measure {measure}")
-            return source_df
-
-        transform_expr = []
-        if config.modality == DataModality.MULTIVARIATE_REGRESSION:
-            vocab_lit = pl.Series(config.vocabulary.vocabulary).cast(pl.Categorical)
-            transform_expr.append(
-                pl.when(~pl.col(measure).is_in(vocab_lit))
-                .then(np.NaN)
-                .otherwise(pl.col(config.values_column))
-                .alias(config.values_column)
-            )
-            vocab_el_col = pl.col(measure)
-        else:
-            vocab_el_col = pl.col(measure)
-            vocab_lit = pl.Series(config.vocabulary.vocabulary).cast(pl.Categorical)
-
-        transform_expr.append(
-            pl.when(vocab_el_col.is_null())
-            .then(None)
-            .when(~vocab_el_col.cast(pl.Utf8).is_in(vocab_lit))
-            .then(pl.lit("UNK"))
-            .otherwise(vocab_el_col)
-            .cast(pl.Categorical)
-            .alias(measure)
-        )
 
         return source_df.with_columns(transform_expr)
 
@@ -1437,53 +1429,26 @@ class Dataset(DatasetBase):
         setattr(self, attr, old_df.update(new_df, on=id_col))
 
     def _melt_df(self, source_df: DF_T, id_cols: Sequence[str], measures: list[str]) -> pl.Expr:
-        """Re-formats `source_df` into the desired deep-learning output format."""
         exprs = []
         value_var_names = []
         total_vocab_size = self.vocabulary_config.total_vocab_size
         idx_dt = self.get_smallest_valid_uint_type(total_vocab_size)
 
-        # List of columns to exclude from processing
-        exclude_columns = ["A1cGreaterThan7", "event_type"]
-
         for m in measures:
-            if m not in source_df.columns or m in exclude_columns:
-                continue  # Skip the measurement if it doesn't exist in the source DataFrame or is in the exclusion list
+            if m not in source_df.columns:
+                continue
 
             if m in self.measurement_vocabs:
-                idx_present_expr = (pl.col(m).is_not_null() & pl.col(m).is_in(self.measurement_vocabs[m])).alias(f"{m}_present")
-                idx_value_expr = pl.col(m).map_dict(self.unified_vocabulary_idxmap[m], return_dtype=idx_dt).alias(f"{m}_index")
+                idx_present_expr = (pl.col(m).is_not_null()).alias(f"{m}_present")
+                idx_value_expr = pl.col(m).map_dict(self.unified_vocabulary_idxmap[m], default=0).cast(idx_dt).alias(f"{m}_index")
             else:
                 idx_present_expr = pl.col(m).is_not_null().alias(f"{m}_present")
                 idx_value_expr = pl.lit(self.unified_vocabulary_idxmap[m][m]).cast(idx_dt).alias(f"{m}_index")
 
-            if self.measurement_configs[m].modality == DataModality.UNIVARIATE_REGRESSION:
-                val_expr = pl.col(m).alias(f"{m}_value")
-            elif self.measurement_configs[m].modality == DataModality.MULTIVARIATE_REGRESSION:
-                val_expr = pl.col(self.measurement_configs[m].values_column).alias(f"{m}_value")
-            else:
-                val_expr = pl.lit(None).cast(pl.Float64).alias(f"{m}_value")
-
-            exprs.extend([idx_present_expr, idx_value_expr, val_expr])
-            value_var_names.extend([f"{m}_present", f"{m}_index", f"{m}_value"])
+            exprs.extend([idx_present_expr, idx_value_expr])
+            value_var_names.extend([f"{m}_present", f"{m}_index"])
 
         measurements_idx_dt = self.get_smallest_valid_uint_type(len(self.unified_measurements_idxmap))
-
-        if not exprs:
-            # If there are no expressions, return an empty DataFrame with the specified columns
-            return pl.DataFrame({col: [] for col in id_cols + ["measurement_index", "index", "value"]})
-
-        # Ensure only existing columns are selected
-        available_columns = source_df.columns
-        value_var_names = [col for col in value_var_names if col in available_columns]
-
-        # Print columns for debugging
-        print("Available columns in source_df:", available_columns)
-        print("Selected value_var_names:", value_var_names)
-
-        if not value_var_names:
-            # If there are no valid value_var_names, return an empty DataFrame with the specified columns
-            return pl.DataFrame({col: [] for col in id_cols + ["measurement_index", "index", "value"]})
 
         melted_df = (
             source_df.select(*id_cols, *value_var_names)
@@ -1494,10 +1459,9 @@ class Dataset(DatasetBase):
                 value_name="value",
             )
             .with_columns(
-                pl.col("variable").str.replace_all(r"_present$", "").alias("measurement"),
+                pl.col("variable").str.replace_all(r"_present$|_index$", "").alias("measurement"),
                 pl.col("variable").str.contains("_present$").alias("is_present"),
                 pl.col("variable").str.contains("_index$").alias("is_index"),
-                pl.col("variable").str.contains("_value$").alias("is_value"),
             )
         )
 
@@ -1511,14 +1475,12 @@ class Dataset(DatasetBase):
         )
 
         melted_df_index = melted_df.filter(pl.col("is_index")).select(*id_cols, "measurement", pl.col("value").alias("index"))
-        melted_df_value = melted_df.filter(pl.col("is_value")).select(*id_cols, "measurement", pl.col("value").alias("value"))
 
         melted_df = (
             melted_df_present
             .join(melted_df_index, on=id_cols + ["measurement"], how="left")
-            .join(melted_df_value, on=id_cols + ["measurement"], how="left")
             .filter(pl.col("present"))
-            .select(*id_cols, "measurement_index", "index", "value")
+            .select(*id_cols, "measurement_index", "index")
         )
 
         return melted_df
@@ -1526,8 +1488,8 @@ class Dataset(DatasetBase):
     def build_DL_cached_representation(
         self, subject_ids: list[int] | None = None, do_sort_outputs: bool = False
     ) -> DF_T:
-        # Identify the measurements sourced from each dataframe:
-        subject_measures, event_measures, dynamic_measures = [], ["event_type"], ["next_event_measurements"]
+        print("Starting build_DL_cached_representation")
+        subject_measures, event_measures, dynamic_measures = [], ["event_type"], ["dynamic_indices"]
         for m in self.unified_measurements_vocab[1:]:
             temporality = self.measurement_configs[m].temporality
             match temporality:
@@ -1540,11 +1502,18 @@ class Dataset(DatasetBase):
                 case _:
                     raise ValueError(f"Unknown temporality type {temporality} for {m}")
 
-        # 1. Process subject data into the right format.
         if subject_ids:
             subjects_df = self._filter_col_inclusion(self.subjects_df, {"subject_id": subject_ids})
+            events_df = self._filter_col_inclusion(self.events_df, {"subject_id": subject_ids})
+            dynamic_measurements_df = self._filter_col_inclusion(self.dynamic_measurements_df, {"subject_id": subject_ids})
         else:
             subjects_df = self.subjects_df
+            events_df = self.events_df
+            dynamic_measurements_df = self.dynamic_measurements_df
+
+        print(f"Subjects DataFrame shape: {subjects_df.shape}")
+        print(f"Events DataFrame shape: {events_df.shape}")
+        print(f"Dynamic Measurements DataFrame shape: {dynamic_measurements_df.shape}")
 
         static_data = subjects_df.select(
             "subject_id",
@@ -1552,73 +1521,57 @@ class Dataset(DatasetBase):
             *[(pl.col(m).is_null().cast(pl.Int32) == 0).alias(f"static_counts_{m}") for m in subject_measures]
         )
 
-        # 2. Process event data into the right format.
-        if subject_ids:
-            events_df = self._filter_col_inclusion(self.events_df, {"subject_id": subject_ids})
-            event_ids = list(events_df["event_id"])
-        else:
-            events_df = self.events_df
-            event_ids = None
+        print("Checking dynamic_measurements_df for null or invalid values")
+        null_count = dynamic_measurements_df.filter(pl.col('dynamic_indices').is_null()).shape[0]
+        invalid_count = dynamic_measurements_df.filter(pl.col('dynamic_indices') == '').shape[0]
+        print(f"Null values in dynamic_indices: {null_count}")
+        print(f"Empty string values in dynamic_indices: {invalid_count}")
 
-        # Filter out rows with null timestamps
-        events_df = events_df.filter(pl.col("timestamp").is_not_null())
+        dynamic_data = dynamic_measurements_df.select(
+            "event_id",
+            pl.col("dynamic_indices"),
+            pl.when(pl.col("dynamic_indices").is_not_null() & (pl.col("dynamic_indices") != ""))
+            .then(1)
+            .otherwise(0)
+            .alias("dynamic_counts")
+        )
 
         event_data = events_df.select(
             "subject_id",
             "timestamp",
             "event_id",
             *[pl.col(m).alias(f"{m}_index") for m in event_measures]
-        ).groupby(["subject_id", "event_id"]).agg(
-            pl.col("timestamp").first().alias("timestamp"),
-            *[pl.col(f"{m}_index").alias(f"dynamic_indices_{m}") for m in event_measures],
-            *[(pl.col(f"{m}_index").is_null().cast(pl.Int32) == 0).alias(f"dynamic_counts_{m}") for m in event_measures],
+        ).join(
+            dynamic_data,
+            on="event_id",
+            how="left"
         )
 
-        # 3. Process measurement data into the right base format:
-        if event_ids:
-            dynamic_measurements_df = self._filter_col_inclusion(
-                self.dynamic_measurements_df, {"event_id": event_ids}
-            )
-        else:
-            dynamic_measurements_df = self.dynamic_measurements_df
+        print("Checking event_data for null or invalid values")
+        null_count = event_data.filter(pl.col('dynamic_indices').is_null()).shape[0]
+        invalid_count = event_data.filter(pl.col('dynamic_indices') == '').shape[0]
+        print(f"Null values in dynamic_indices: {null_count}")
+        print(f"Empty string values in dynamic_indices: {invalid_count}")
 
-        dynamic_ids = ["event_id", "measurement_id"] if do_sort_outputs else ["event_id"]
+        # Remove rows with null or empty dynamic_indices
+        event_data = event_data.filter(
+            pl.col("dynamic_indices").is_not_null() & (pl.col("dynamic_indices") != "")
+        )
 
-        if dynamic_measures and not dynamic_measurements_df.is_empty():
-            dynamic_data = dynamic_measurements_df.select(
-                *dynamic_ids,
-                *[pl.col(m).alias(f"{m}_value") for m in dynamic_measures if m != "next_event_measurements"],
-            ).groupby(dynamic_ids).agg(
-                *[pl.col(f"{m}_value").alias(f"dynamic_indices_{m}") for m in dynamic_measures if m != "next_event_measurements"],
-                *[(pl.col(f"{m}_value").is_null().cast(pl.Int32) == 0).alias(f"dynamic_counts_{m}") for m in dynamic_measures if m != "next_event_measurements"],
-            )
-
-            if "next_event_measurements" in dynamic_measurements_df.columns:
-                dynamic_data = dynamic_data.join(
-                    dynamic_measurements_df.select(
-                        *dynamic_ids,
-                        pl.col("next_event_measurements").alias("dynamic_indices_next_event_measurements"),
-                        (pl.col("next_event_measurements").is_null().cast(pl.Int32) == 0).alias("dynamic_counts_next_event_measurements")
-                    ),
-                    on=dynamic_ids,
-                    how="left"
-                )
-
-            if do_sort_outputs:
-                dynamic_data = dynamic_data.sort("event_id", "measurement_id")
-
-            event_data = event_data.join(dynamic_data, on="event_id", how="left")
-        else:
-            event_data = event_data.with_columns(
-                *[pl.lit(None).alias(f"dynamic_indices_{m}") for m in dynamic_measures if m != "next_event_measurements"],
-                *[pl.lit(0).alias(f"dynamic_counts_{m}") for m in dynamic_measures if m != "next_event_measurements"],
-                pl.lit(None).alias("dynamic_indices_next_event_measurements"),
-                pl.lit(0).alias("dynamic_counts_next_event_measurements")
-            )
+        if do_sort_outputs:
+            event_data = event_data.sort("event_id")
 
         out = static_data.join(event_data, on="subject_id", how="outer")
+
         if do_sort_outputs:
             out = out.sort("subject_id")
+
+        print("Final check for UNKNOWN_CODE")
+        unknown_count = out.filter(pl.col('dynamic_indices') == 'UNKNOWN_CODE').shape[0]
+        print(f"UNKNOWN_CODE count in final output: {unknown_count}")
+
+        print(f"Final output shape: {out.shape}")
+        print(f"Sample of final output:\n{out.head()}")
 
         return out
 

@@ -37,6 +37,8 @@ from abc import ABCMeta
 import dill
 import pickle
 
+from math import ceil
+
 class CustomJSONEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, ABCMeta):
@@ -427,146 +429,107 @@ class DatasetBase(
     def dynamic_measurements_df(self, dynamic_measurements_df: DF_T):
         self._dynamic_measurements_df = dynamic_measurements_df
 
-    @classmethod
-    def load(cls, dir_or_config: Union[Path, dict[str, Any]], do_pickle_config: bool = True, **kwargs) -> "Dataset":
-        if isinstance(dir_or_config, dict):
-            # If the input is a dictionary, create a new Dataset instance directly
-            config = DatasetConfig.from_dict(dir_or_config)
-            return cls(config=config, **kwargs)
-        else:
-            load_dir = dir_or_config
-
-        attrs_fp = load_dir / "E.pkl"
-        if attrs_fp.stat().st_size == 0:
-            raise ValueError(f"The attributes file {attrs_fp} is empty.")
-
-        DatasetConfig = get_dataset_config()
-        reloaded_config = None
-        attrs_to_add = {}
-
-        if do_pickle_config:
-            with open(load_dir / "config.json") as f:
-                attrs_to_add["config"] = DatasetConfig.from_dict(json.load(f))
-        else:
-            reloaded_config = DatasetConfig.from_json_file(load_dir / "config.json")
-            if reloaded_config.save_dir != load_dir:
-                print(f"Updating config.save_dir from {reloaded_config.save_dir} to {load_dir}")
-                reloaded_config.save_dir = load_dir
-            attrs_to_add["config"] = reloaded_config
-
-        print("Attributes to add:")
-        for key, value in attrs_to_add.items():
-            print(f"Key: {key}, Type: {type(value)}")
-
-        inferred_measurement_configs_fp = load_dir / "inferred_measurement_configs.json"
-        if inferred_measurement_configs_fp.is_file():
-            with open(inferred_measurement_configs_fp) as f:
-                attrs_to_add["inferred_measurement_configs"] = {
-                    k: MeasurementConfig.from_dict(v, base_dir=load_dir) for k, v in json.load(f).items()
-                }
-        else:
-            attrs_to_add["inferred_measurement_configs"] = {}
-
-        class Wrapper:
-            def __init__(self, **kwargs):
-                for key, value in kwargs.items():
-                    setattr(self, key, value)
-
-        wrapped_attrs = Wrapper(**attrs_to_add)
-
-        print("Wrapped attributes before loading:")
-        for attr in dir(wrapped_attrs):
-            if not attr.startswith('__'):
-                print(f"{attr}: {type(getattr(wrapped_attrs, attr))}")
-
-        try:
-            loaded_object = DatasetBase._load(attrs_fp)
-        except AttributeError:
-            print("AttributeError occurred during loading. Creating a new Dataset object.")
-            config = attrs_to_add["config"]
-            subjects_df_fp = load_dir / "subjects_df.parquet"
-            events_df_fp = load_dir / "events_df.parquet"
-            dynamic_measurements_df_fp = load_dir / "dynamic_measurements_df.parquet"
-
-            subjects_df = pl.read_parquet(subjects_df_fp) if subjects_df_fp.is_file() else None
-            events_df = pl.read_parquet(events_df_fp) if events_df_fp.is_file() else None
-            dynamic_measurements_df = pl.read_parquet(dynamic_measurements_df_fp) if dynamic_measurements_df_fp.is_file() else None
-
-            loaded_object = cls(config=config, subjects_df=subjects_df, events_df=events_df, dynamic_measurements_df=dynamic_measurements_df, **kwargs)
-
-        # Debugging statements to check the loaded object
-        print("Loaded object type:", type(loaded_object))
-        print("Loaded object contents:", loaded_object)
-
-        return loaded_object
-
     def save(self, **kwargs):
-        """Saves the calling object to disk, in the directory `self.config.save_dir`.
-
-        This function stores to disk the internal parameters of the calling object, in the following format:
-
-        * The base configuration object is stored in the file ``'config.json'``, in JSON format.
-        * If the saved dataset has already been fit, then the pre-processed measurement configs with inferred
-          parameters are stroed in ``'inferred_measurement_configs.json'``, in JSON format. Note that these
-          configs may in turn store their own attributes in further files, such as their
-          `measurement_metadata` dataframes, which are stored on disk in separate files to facilitate lazy
-          loading.
-        * The raw or fully pre-processed subjects, events, and measurements dataframes are stored in their
-          respective filenames (`SUBJECTS_FN`, `EVENTS_FN`, `DYNAMIC_MEASUREMENTS_FN`).
-        * Remaining attributes are stored in pickle format at ``'E.pkl'``.
-
-        Args:
-            do_overwrite: Keyword only; if passed with a value evaluating to `True`, then the system will
-                overwrite any files that exist, rather than erroring.
-
-        Raises:
-            FileExistsError: If any of the desired filepaths already exist and `do_overwrite` is False.
-        """
-
+        """Saves the dataset object to disk."""
         self.config.save_dir.mkdir(parents=True, exist_ok=True)
-
         do_overwrite = kwargs.get("do_overwrite", False)
 
+        # Save configuration
         config_fp = self.config.save_dir / "config.json"
         print("Saving configuration...")
         self.config.to_json_file(config_fp, do_overwrite=do_overwrite, cls=CustomJSONEncoder)
         print("Configuration saved.")
 
+        # Save code mapping
+        if hasattr(self, 'code_mapping') and self.code_mapping is not None:
+            code_mapping_fp = self.config.save_dir / "code_mapping.json"
+            print("Saving code mapping...")
+            with open(code_mapping_fp, 'w') as f:
+                json.dump(self.code_mapping, f)
+            print("Code mapping saved.")
+
+        # Save inferred measurement configs
         if self._is_fit and self.inferred_measurement_configs:
             print("Saving inferred measurement metadata...")
-            self.config.save_dir / "inferred_measurement_metadata"
-            for k, v in self.inferred_measurement_configs.items():
-                v.cache_measurement_metadata(self.config.save_dir, f"inferred_measurement_metadata/{k}.csv")
-
             inferred_measurement_configs_fp = self.config.save_dir / "inferred_measurement_configs.json"
-            inferred_measurement_configs = {
-                k: v.to_dict() for k, v in self.inferred_measurement_configs.items()
-            }
+            inferred_measurement_configs = {k: v.to_dict() for k, v in self.inferred_measurement_configs.items()}
             with open(inferred_measurement_configs_fp, mode="w") as f:
                 json.dump(inferred_measurement_configs, f)
             print("Inferred measurement metadata saved.")
 
-
-        attrs_to_save = self.__dict__  # Save the entire object
-        with open(self.config.save_dir / "E.pkl", mode="wb") as f:
-            dill.dump(attrs_to_save, f, protocol=pickle.HIGHEST_PROTOCOL)
-        print("Dataset attributes saved.")
-
+        # Save vocabulary configuration
         vocab_config_fp = self.config.save_dir / "vocabulary_config.json"
-
         print("Saving vocabulary configuration...")
         self.vocabulary_config.to_json_file(vocab_config_fp, do_overwrite=do_overwrite)
         print("Vocabulary configuration saved.")
 
-        subjects_fp = self.subjects_fp(self.config.save_dir)
-        events_fp = self.events_fp(self.config.save_dir)
-        dynamic_measurements_fp = self.dynamic_measurements_fp(self.config.save_dir)
-
+        # Save dataframes
         print("Saving dataframes...")
-        self._write_df(self.subjects_df, subjects_fp, do_overwrite=do_overwrite)
-        self._write_df(self.events_df, events_fp, do_overwrite=do_overwrite)
-        self._write_df(self.dynamic_measurements_df, dynamic_measurements_fp, do_overwrite=do_overwrite)
+        self._write_df(self.subjects_df, self.subjects_fp(self.config.save_dir), do_overwrite=do_overwrite)
+        self._write_df(self.events_df, self.events_fp(self.config.save_dir), do_overwrite=do_overwrite)
+        self._write_df(self.dynamic_measurements_df, self.dynamic_measurements_fp(self.config.save_dir), do_overwrite=do_overwrite)
         print("Dataframes saved.")
+
+        # Save other attributes
+        attrs_to_save = {k: v for k, v in self.__dict__.items() if k not in ['_subjects_df', '_events_df', '_dynamic_measurements_df']}
+        attrs_fp = self.config.save_dir / "attrs.pkl"
+        print("Saving other attributes...")
+        with open(attrs_fp, mode="wb") as f:
+            dill.dump(attrs_to_save, f, protocol=pickle.HIGHEST_PROTOCOL)
+        print("Other attributes saved.")
+        
+    @classmethod
+    def load(cls, dir_or_config: Union[Path, dict[str, Any]], do_pickle_config: bool = True, **kwargs) -> "Dataset":
+        """Loads a dataset object from disk."""
+        if isinstance(dir_or_config, dict):
+            config = DatasetConfig.from_dict(dir_or_config)
+            return cls(config=config, **kwargs)
+        
+        load_dir = Path(dir_or_config)
+        
+        # Load configuration
+        if do_pickle_config:
+            with open(load_dir / "config.json") as f:
+                config = DatasetConfig.from_dict(json.load(f))
+        else:
+            config = DatasetConfig.from_json_file(load_dir / "config.json")
+            if config.save_dir != load_dir:
+                print(f"Updating config.save_dir from {config.save_dir} to {load_dir}")
+                config.save_dir = load_dir
+
+        # Load dataframes
+        subjects_df = cls._read_df(cls.subjects_fp(load_dir))
+        events_df = cls._read_df(cls.events_fp(load_dir))
+        dynamic_measurements_df = cls._read_df(cls.dynamic_measurements_fp(load_dir))
+
+        # Load code mapping
+        code_mapping_fp = load_dir / "code_mapping.json"
+        if code_mapping_fp.is_file():
+            with open(code_mapping_fp, 'r') as f:
+                code_mapping = json.load(f)
+        else:
+            code_mapping = None
+
+        # Create dataset object
+        dataset = cls(config=config, subjects_df=subjects_df, events_df=events_df, dynamic_measurements_df=dynamic_measurements_df, code_mapping=code_mapping, **kwargs)
+
+        # Load inferred measurement configs
+        inferred_measurement_configs_fp = load_dir / "inferred_measurement_configs.json"
+        if inferred_measurement_configs_fp.is_file():
+            with open(inferred_measurement_configs_fp) as f:
+                dataset.inferred_measurement_configs = {
+                    k: MeasurementConfig.from_dict(v, base_dir=load_dir) for k, v in json.load(f).items()
+                }
+
+        # Load other attributes
+        attrs_fp = load_dir / "attrs.pkl"
+        if attrs_fp.is_file():
+            with open(attrs_fp, "rb") as f:
+                other_attrs = dill.load(f)
+            for key, value in other_attrs.items():
+                setattr(dataset, key, value)
+
+        return dataset
 
     def __init__(
         self,
@@ -852,70 +815,39 @@ class DatasetBase(
         
     @TimeableMixin.TimeAs
     def fit_measurements(self):
-        """Fits all preprocessing parameters over the training dataset, according to `self.config`.
-
-        Raises:
-            ValueError: if fitting preprocessing parameters fails for a given measurement.
-        """
         self._is_fit = False
-
         for measure, config in self.config.measurement_configs.items():
             if config.is_dropped:
                 continue
-
             self.inferred_measurement_configs[measure] = copy.deepcopy(config)
             config = self.inferred_measurement_configs[measure]
-
             _, _, source_df = self._get_source_df(config, do_only_train=True)
-
             if measure not in source_df:
                 print(f"WARNING: Measure {measure} not found! Dropping...")
                 config.drop()
                 continue
-
             total_possible, total_observed, raw_total_observed = self._total_possible_and_observed(
                 measure, config, source_df
             )
             source_df = self._filter_col_inclusion(source_df, {measure: True})
-
             if total_possible == 0:
                 print(f"Found no possible events for {measure}!")
                 config.drop()
                 continue
-
             config.observation_rate_over_cases = total_observed / total_possible
             config.observation_rate_per_case = raw_total_observed / total_observed
-
-            # 2. Drop the column if observations occur too rarely.
-            if lt_count_or_proportion(
-                total_observed, self.config.min_valid_column_observations, total_possible
-            ):
-                print(f"Dropping {measure} due to insufficient observations!")
-                config.drop()
-                continue
-
             if config.is_numeric:
                 config.add_missing_mandatory_metadata_cols()
                 try:
                     config.measurement_metadata = self._fit_measurement_metadata(measure, config, source_df)
                 except BaseException as e:
                     raise ValueError(f"Fitting measurement metadata failed for measure {measure}!") from e
-
             if config.vocabulary is None:
                 config.vocabulary = self._fit_vocabulary(measure, config, source_df)
-
-                # 4. Eliminate observations that occur too rarely.
-                if config.vocabulary is not None:
-                    if self.config.min_valid_vocab_element_observations is not None:
-                        config.vocabulary.filter(
-                            len(source_df), self.config.min_valid_vocab_element_observations
-                        )
-
-                    # 5. If all observations were eliminated, drop the column.
-                    if config.vocabulary.vocabulary == ["UNK"]:
-                        print(f"Dropping {measure} due to all observations being eliminated!")
-                        config.drop()
-
+                if config.vocabulary is None:
+                    print(f"WARNING: Empty vocabulary for measure {measure}! Dropping...")
+                    config.drop()
+                    continue
         self._is_fit = True
 
     @abc.abstractmethod
@@ -1476,24 +1408,13 @@ class DatasetBase(
                     pl.col("subject_id").alias("subject_id_right"),
                     "event_id",
                     "timestamp",
-                    "dynamic_indices_event_type",
-                    "dynamic_counts_event_type",
-                    "measurement_id"
+                    "dynamic_indices",
+                    "dynamic_counts",
                 ]
-
-                if "dynamic_indices_dynamic_indices" in split_cached_df.columns:
-                    select_columns.append(pl.col("dynamic_indices_dynamic_indices").alias("dynamic_indices"))
-                else:
-                    select_columns.append(pl.lit(None).alias("dynamic_indices"))
-
-                if "dynamic_counts_dynamic_indices" in split_cached_df.columns:
-                    select_columns.append(pl.col("dynamic_counts_dynamic_indices").alias("dynamic_counts"))
-                else:
-                    select_columns.append(pl.lit(None).alias("dynamic_counts"))
 
                 split_cached_df = split_cached_df.select(select_columns)
                 self._write_df(split_cached_df, fp, do_overwrite=do_overwrite)
-
+                
     @property
     def vocabulary_config(self) -> VocabularyConfig:
         """Returns the implied `VocabularyConfig` object corresponding to this (fit) dataset.

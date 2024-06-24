@@ -206,12 +206,6 @@ class ESTForStreamClassificationLM(L.LightningModule):
             self.log(f"{prefix}_loss", results.loss)
 
     def training_step(self, batch, batch_idx):
-        print("batch:", batch)
-        if batch is None:
-            print("batch is None")
-        else:
-            print("batch is not None")
-            print("Keys in batch:", list(batch.keys()))
         outputs = self.model(
             dynamic_indices_event_type=batch["dynamic_indices_event_type"],
             dynamic_counts_event_type=batch["dynamic_counts_event_type"],
@@ -220,13 +214,10 @@ class ESTForStreamClassificationLM(L.LightningModule):
             labels=batch["labels"]
         )
         loss = outputs.loss
+        self.log('train_loss', loss)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        if batch is None:
-            self.log('val_loss', torch.tensor(0.0))
-            return
-
         outputs = self.model(
             dynamic_indices_event_type=batch["dynamic_indices_event_type"],
             dynamic_counts_event_type=batch["dynamic_counts_event_type"],
@@ -236,6 +227,7 @@ class ESTForStreamClassificationLM(L.LightningModule):
         )
         loss = outputs.loss
         self.log('val_loss', loss)
+        return loss
 
     def test_step(self, batch, batch_idx):
         outputs = self.model(
@@ -247,6 +239,7 @@ class ESTForStreamClassificationLM(L.LightningModule):
         )
         loss = outputs.loss
         self.log('test_loss', loss)
+        return loss
 
     def forward(self, batch, **kwargs):
         if not isinstance(batch, PytorchBatch):
@@ -485,23 +478,12 @@ def collate_fn(batch):
     }
     
 @task_wrapper
-def train(cfg: FinetuneConfig, train_pyd: PytorchDataset, tuning_pyd: PytorchDataset, held_out_pyd: PytorchDataset, wandb_logger: WandbLogger | None = None):
+def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, wandb_logger: WandbLogger | None = None):
     logging.basicConfig(level=logging.DEBUG)    
-    """Runs the end to end training procedure for the fine-tuning model.
-    Args:
-        cfg: The fine-tuning configuration object specifying the cohort and task for which and model from
-            which you wish to fine-tune.
-        train_pyd: The PyTorch dataset for the training split.
-        tuning_pyd: The PyTorch dataset for the tuning split.
-        held_out_pyd: The PyTorch dataset for the held-out split.
-    """
 
     L.seed_everything(cfg.seed)
     if cfg.do_use_filesystem_sharing:
         torch.multiprocessing.set_sharing_strategy("file_system")
-
-    # Set the dl_reps_dir attribute correctly
-    cfg.data_config.dl_reps_dir = cfg.data_config.save_dir / "DL_reps"
 
     print(f"Train dataset length: {len(train_pyd)}")
     print(f"Tuning dataset length: {len(tuning_pyd)}")
@@ -522,8 +504,8 @@ def train(cfg: FinetuneConfig, train_pyd: PytorchDataset, tuning_pyd: PytorchDat
             config.to_json_file(config_fp)
 
         data_config_dict = cfg.data_config.to_dict()
-        data_config_dict["save_dir"] = str(data_config_dict["save_dir"])  # Convert PosixPath to string
-        data_config_dict["dl_reps_dir"] = str(data_config_dict["dl_reps_dir"])  # Convert PosixPath to string
+        data_config_dict["save_dir"] = str(data_config_dict["save_dir"])
+        data_config_dict["dl_reps_dir"] = str(data_config_dict["dl_reps_dir"])
         with open(cfg.save_dir / "data_config.json", "w") as f:
             json.dump(data_config_dict, f, indent=2)
 
@@ -531,9 +513,8 @@ def train(cfg: FinetuneConfig, train_pyd: PytorchDataset, tuning_pyd: PytorchDat
         with open(cfg.save_dir / "optimization_config.json", "w") as f:
             json.dump(optimization_config_dict, f, indent=2)
 
-        if os.environ.get("LOCAL_RANK", "0") == "0":
-            if cfg.wandb_experiment_config_kwargs:
-                wandb_logger.experiment.config.update(cfg.wandb_experiment_config_kwargs)
+        if cfg.wandb_experiment_config_kwargs:
+            wandb_logger.experiment.config.update(cfg.wandb_experiment_config_kwargs)
 
     if not config.problem_type:
         config.problem_type = 'single_label_classification'
@@ -543,13 +524,13 @@ def train(cfg: FinetuneConfig, train_pyd: PytorchDataset, tuning_pyd: PytorchDat
         model_params["pretrained_weights_fp"] = cfg.pretrained_weights_fp
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    LM = ESTForStreamClassificationLM(config, optimization_config, cfg, **model_params).to(config.device)
+    LM = ESTForStreamClassificationLM(config, optimization_config, cfg, **model_params).to(device)
 
     train_dataloader = torch.utils.data.DataLoader(
         train_pyd,
         batch_size=optimization_config['batch_size'],
         num_workers=optimization_config['num_dataloader_workers'],
-        collate_fn=collate_fn,
+        collate_fn=train_pyd.collate_fn,
         shuffle=True,
         persistent_workers=True,
     )
@@ -558,7 +539,7 @@ def train(cfg: FinetuneConfig, train_pyd: PytorchDataset, tuning_pyd: PytorchDat
         tuning_pyd,
         batch_size=optimization_config['validation_batch_size'],
         num_workers=optimization_config['num_dataloader_workers'],
-        collate_fn=collate_fn,
+        collate_fn=tuning_pyd.collate_fn,
         shuffle=False,
         persistent_workers=True,
     )
@@ -567,20 +548,20 @@ def train(cfg: FinetuneConfig, train_pyd: PytorchDataset, tuning_pyd: PytorchDat
         held_out_pyd,
         batch_size=optimization_config['validation_batch_size'],
         num_workers=optimization_config['num_dataloader_workers'],
-        collate_fn=collate_fn,
+        collate_fn=held_out_pyd.collate_fn,
         shuffle=False,
         persistent_workers=True,
     )
 
     checkpoint_callback = ModelCheckpoint(
-        dirpath=cfg.save_dir / "checkpoints",  # Specify a directory for saving checkpoints
+        dirpath=cfg.save_dir / "checkpoints",
         filename="{epoch}-{val_loss:.2f}",
         monitor="val_loss",
         mode="min",
-        save_top_k=1,  # Save the best model
-        save_weights_only=True,  # Save only the model weights
-        save_last=True,  # Save the model at the end of training
-        auto_insert_metric_name=False,  # Disable automatic metric name insertion
+        save_top_k=1,
+        save_weights_only=True,
+        save_last=True,
+        auto_insert_metric_name=False,
     )
 
     callbacks = [
@@ -605,7 +586,6 @@ def train(cfg: FinetuneConfig, train_pyd: PytorchDataset, tuning_pyd: PytorchDat
         else:
             do_log_graph = False
 
-        # Finish any existing wandb run
         wandb.finish()
 
         wandb_logger = WandbLogger(
@@ -630,7 +610,7 @@ def train(cfg: FinetuneConfig, train_pyd: PytorchDataset, tuning_pyd: PytorchDat
         trainer_kwargs["accumulate_grad_batches"] = optimization_config['gradient_accumulation']
 
     checkpoints_dir = cfg.save_dir / "model_checkpoints"
-    checkpoints_dir.mkdir(parents=False, exist_ok=True)
+    checkpoints_dir.mkdir(parents=True, exist_ok=True)
 
     trainer = L.Trainer(**trainer_kwargs)
 
@@ -676,5 +656,5 @@ def train(cfg: FinetuneConfig, train_pyd: PytorchDataset, tuning_pyd: PytorchDat
             print("No held-out metrics to save.")
 
     return None, tuning_metrics, held_out_metrics
-
+    
 __all__ = ['FinetuneConfig', 'train']
