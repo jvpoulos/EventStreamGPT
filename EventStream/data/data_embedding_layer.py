@@ -214,7 +214,6 @@ class DataEmbeddingLayer(torch.nn.Module):
     ):
         super().__init__()
         self.n_total_embeddings = n_total_embeddings
-        self.embedding = torch.nn.Linear(n_total_embeddings, out_dim, bias=False)
         self.out_dim = out_dim
         self.static_embedding_mode = static_embedding_mode
         self.do_normalize_by_measurement_index = do_normalize_by_measurement_index
@@ -227,7 +226,7 @@ class DataEmbeddingLayer(torch.nn.Module):
                 embedding_dim=out_dim,
                 mode="sum",
                 padding_idx=0,
-                sparse=True,
+                sparse=False,
             )
             if self.oov_index is not None:
                 self.data_embedding_layer.weight.data[self.oov_index] = 0
@@ -238,14 +237,14 @@ class DataEmbeddingLayer(torch.nn.Module):
                 embedding_dim=categorical_embedding_dim,
                 mode="sum",
                 padding_idx=0,
-                sparse=True,
+                sparse=False,
             )
             self.numerical_embed_layer = torch.nn.EmbeddingBag(
                 num_embeddings=n_total_embeddings,
                 embedding_dim=numerical_embedding_dim,
                 mode="sum",
                 padding_idx=0,
-                sparse=True,
+                sparse=False,
             )
             if self.oov_index is not None:
                 self.categorical_embed_layer.weight.data[self.oov_index] = 0

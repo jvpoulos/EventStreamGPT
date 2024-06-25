@@ -242,12 +242,18 @@ class ESTForStreamClassificationLM(L.LightningModule):
             self.log('train_loss', torch.tensor(float('inf')))
             return None
 
-        outputs = self.model(batch, labels=batch['labels'])
-        loss = outputs.loss
-        
+        try:
+            outputs = self.model(batch, labels=batch['labels'])
+            loss = outputs.loss
+        except Exception as e:
+            logger.error(f"Error in model forward pass: {str(e)}")
+            logger.error(f"Batch content: {batch}")
+            raise
+
         if loss is not None:
             if torch.isnan(loss):
                 logger.error("NaN loss detected in training step")
+                logger.error(f"Batch content: {batch}")
                 self.log('train_loss', torch.tensor(float('inf')))
                 return None
             self.log('train_loss', loss)
@@ -327,7 +333,7 @@ class ESTForStreamClassificationLM(L.LightningModule):
         return outputs.last_hidden_state if hasattr(outputs, 'last_hidden_state') else outputs
 
     def configure_optimizers(self):
-        opt = torch.optim.Adam(
+        opt = torch.optim.AdamW(
             self.model.parameters(),
             lr=self.optimization_config.init_lr,
             weight_decay=self.optimization_config.weight_decay,
@@ -659,7 +665,12 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, wandb_logger
             trainer_kwargs["accumulate_grad_batches"] = optimization_config['gradient_accumulation']
 
         logger.info("Setting up trainer")
-        trainer = L.Trainer(**trainer_kwargs)
+        if cfg.trainer_config.get("strategy") == "ddp_find_unused_parameters_true":
+            from lightning.pytorch.strategies import DDPStrategy
+            strategy = DDPStrategy(find_unused_parameters=True)
+            cfg.trainer_config["strategy"] = strategy
+
+        trainer = L.Trainer(**cfg.trainer_config, callbacks=callbacks, logger=wandb_logger)
 
         logger.info("Starting training")
         try:

@@ -755,6 +755,13 @@ class ConditionallyIndependentPointProcessInputLayer(torch.nn.Module):
         # Multiply by counts
         data_embed = data_embed * dynamic_counts.unsqueeze(-1)
         
+        # Add a small epsilon to avoid division by zero
+        epsilon = 1e-8
+        data_embed = torch.where(torch.isnan(data_embed), torch.zeros_like(data_embed) + epsilon, data_embed)
+        
+        # Clip values to avoid extreme values
+        data_embed = torch.clamp(data_embed, min=-1e6, max=1e6)
+        
         return self.embedding_dropout(data_embed)
         
 class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTrainedModel):
@@ -812,6 +819,10 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
         torch._assert(
             ~torch.isnan(input_embeds).any(), f"{torch.isnan(input_embeds).sum()} NaNs in input_embeds"
         )
+
+        if torch.isnan(input_embeds).any():
+            logger.warning(f"NaNs detected in input_embeds. Replacing with zeros.")
+            input_embeds = torch.where(torch.isnan(input_embeds), torch.zeros_like(input_embeds), input_embeds)
 
         if batch is not None and hasattr(batch, 'event_mask') and batch.event_mask is not None:
             seq_attention_mask = expand_mask(batch.event_mask, input_embeds.dtype)

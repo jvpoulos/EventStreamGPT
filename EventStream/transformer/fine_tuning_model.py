@@ -61,7 +61,13 @@ class ESTForStreamClassification(StructuredTransformerPreTrainedModel):
             dynamic_counts=dynamic_counts
         )
 
-        encoded = self.encoder(pytorch_batch).last_hidden_state
+        try:
+            encoded = self.encoder(pytorch_batch).last_hidden_state
+        except AssertionError as e:
+            logger.error(f"AssertionError in encoder: {str(e)}")
+            logger.error(f"dynamic_indices shape: {dynamic_indices.shape}")
+            logger.error(f"dynamic_counts shape: {dynamic_counts.shape}")
+            raise
 
         event_encoded = encoded[:, :, -1, :] if self._uses_dep_graph else encoded
 
