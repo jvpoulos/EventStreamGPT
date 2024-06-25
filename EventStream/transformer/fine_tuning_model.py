@@ -43,14 +43,9 @@ class ESTForStreamClassification(StructuredTransformerPreTrainedModel):
 
         self.pooling_method = config.task_specific_params["pooling_method"]
 
-        is_binary = config.id2label == {0: False, 1: True}
-        if is_binary:
-            assert config.num_labels == 2
-            self.logit_layer = torch.nn.Linear(config.hidden_size, 1).to(config.device)
-            self.criteria = torch.nn.BCEWithLogitsLoss()
-        else:
-            self.logit_layer = torch.nn.Linear(config.hidden_size, config.num_labels).to(config.device)
-            self.criteria = torch.nn.CrossEntropyLoss()
+        # Change this part for binary classification
+        self.logit_layer = torch.nn.Linear(config.hidden_size, 1).to(config.device)
+        self.criteria = torch.nn.BCEWithLogitsLoss()
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -66,14 +61,14 @@ class ESTForStreamClassification(StructuredTransformerPreTrainedModel):
             dynamic_counts=dynamic_counts
         )
 
-        encoded = self.encoder(batch=pytorch_batch).last_hidden_state
+        encoded = self.encoder(pytorch_batch).last_hidden_state
 
         event_encoded = encoded[:, :, -1, :] if self._uses_dep_graph else encoded
 
-        logits = self.logit_layer(event_encoded.mean(dim=1))
+        logits = self.logit_layer(event_encoded.mean(dim=1)).squeeze(-1)
 
         if labels is not None:
-            labels = labels.to(logits.device)
+            labels = labels.to(logits.device).float()  # Ensure labels are float for BCEWithLogitsLoss
             loss = self.criteria(logits, labels)
         else:
             loss = None

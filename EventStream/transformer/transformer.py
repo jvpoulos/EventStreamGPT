@@ -713,10 +713,6 @@ class ConditionallyIndependentPointProcessInputLayer(torch.nn.Module):
 
         print(f"ConditionallyIndependentPointProcessInputLayer: oov_index = {oov_index}")
 
-        print("Initializing DataEmbeddingLayer with the following parameters:")
-        print(f"n_total_embeddings: {max(vocab_sizes_by_measurement.values()) + 125}")
-        print(f"vocab_sizes_by_measurement: {vocab_sizes_by_measurement}")
-
         self.config = config
 
         self.data_embedding_layer = DataEmbeddingLayer(
@@ -744,52 +740,22 @@ class ConditionallyIndependentPointProcessInputLayer(torch.nn.Module):
 
         self.embedding_dropout = torch.nn.Dropout(p=config.input_dropout)
 
-    def forward(self, batch: PytorchBatch) -> torch.Tensor:
-        if not isinstance(batch, PytorchBatch):
-            raise TypeError("Input 'batch' should be a PytorchBatch object.")
+    def forward(self, batch: PytorchBatch | torch.Tensor) -> torch.Tensor:
+        if isinstance(batch, torch.Tensor):
+            dynamic_indices = batch
+            dynamic_counts = torch.ones_like(dynamic_indices, dtype=torch.float)
+        elif isinstance(batch, PytorchBatch):
+            dynamic_indices = batch.dynamic_indices
+            dynamic_counts = batch.dynamic_counts
+        else:
+            raise TypeError("Input 'batch' should be a PytorchBatch object or a Tensor.")
 
-        # Handle cases where dynamic_indices or dynamic_counts might not be tensors
-        dynamic_indices = batch.dynamic_indices
-        if isinstance(dynamic_indices, PytorchBatch):
-            dynamic_indices = dynamic_indices.dynamic_indices
-        if not isinstance(dynamic_indices, torch.Tensor):
-            dynamic_indices = torch.tensor(dynamic_indices, dtype=torch.long)
+        data_embed: torch.Tensor = self.data_embedding_layer(dynamic_indices)
         
-        dynamic_counts = getattr(batch, 'dynamic_counts', None)
-        if dynamic_counts is None:
-            dynamic_counts = torch.ones_like(dynamic_indices, dtype=torch.float32)
-        elif isinstance(dynamic_counts, PytorchBatch):
-            dynamic_counts = dynamic_counts.dynamic_counts
-        elif not isinstance(dynamic_counts, torch.Tensor):
-            dynamic_counts = torch.tensor(dynamic_counts, dtype=torch.float32)
+        # Multiply by counts
+        data_embed = data_embed * dynamic_counts.unsqueeze(-1)
         
-        # Create a new batch with the processed data
-        processed_batch = PytorchBatch(
-            dynamic_indices=dynamic_indices,
-            dynamic_counts=dynamic_counts,
-        )
-
-        # Add event_type if it's present in the original batch
-        if hasattr(batch, 'event_type'):
-            processed_batch.event_type = batch.event_type
-
-        data_embed: torch.Tensor = self.data_embedding_layer(processed_batch)
-        
-        if not hasattr(batch, 'time_delta') or batch.time_delta is None:
-            logger.warning("'time_delta' is missing or None in the batch. Skipping time embedding.")
-            return data_embed
-
-        time_embed = self.time_embedding_layer(batch)
-
-        data_embed = data_embed.to(time_embed.device)
-        embed = data_embed + time_embed
-
-        if hasattr(batch, 'event_mask') and batch.event_mask is not None:
-            mask = batch.event_mask.unsqueeze(-1)
-            mask = mask.expand_as(embed)
-            embed = torch.where(mask, embed, torch.zeros_like(embed))
-
-        return embed
+        return self.embedding_dropout(data_embed)
         
 class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTrainedModel):
     def __init__(self, config: StructuredTransformerConfig, vocabulary_config: VocabularyConfig, oov_index: int):

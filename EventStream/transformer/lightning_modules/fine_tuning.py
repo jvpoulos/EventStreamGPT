@@ -236,15 +236,20 @@ class ESTForStreamClassificationLM(L.LightningModule):
             self.log(f"{prefix}_loss", results.loss)
 
     def training_step(self, batch, batch_idx):
-        logger.debug(f"Training step - Batch keys: {batch.keys()}")
+        logger.debug(f"Training step - Batch keys: {batch.keys() if batch is not None else 'None'}")
+        logger.debug(f"Training step - Batch shape: {batch['dynamic_indices'].shape if batch is not None and 'dynamic_indices' in batch else 'None'}")
         if batch is None:
-            self.log('train_loss', None)
+            self.log('train_loss', torch.tensor(float('inf')))
             return None
 
         outputs = self.model(batch, labels=batch['labels'])
         loss = outputs.loss
         
         if loss is not None:
+            if torch.isnan(loss):
+                logger.error("NaN loss detected in training step")
+                self.log('train_loss', torch.tensor(float('inf')))
+                return None
             self.log('train_loss', loss)
         else:
             self.log('train_loss', torch.tensor(float('inf')))
@@ -252,31 +257,56 @@ class ESTForStreamClassificationLM(L.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        logger.debug(f"Validation step - Batch keys: {batch.keys()}")
+        logger.debug(f"Validation step - Batch keys: {batch.keys() if batch is not None else 'None'}")
+        logger.debug(f"Validation step - Batch shape: {batch['dynamic_indices'].shape if batch is not None and 'dynamic_indices' in batch else 'None'}")
+        logger.debug(f"Validation step - Batch types: {type(batch['dynamic_indices']) if batch is not None and 'dynamic_indices' in batch else 'None'}")
         if batch is None:
-            self.log('val_loss', None)
+            self.log('val_loss', torch.tensor(float('inf')))
             return None
         
-        outputs = self.model(batch, labels=batch['labels'])
-        loss = outputs.loss
-        self.log('val_loss', loss)
-        return loss
+        try:
+            outputs = self.model(batch, labels=batch['labels'])
+            loss = outputs.loss
+            
+            if loss is not None:
+                if torch.isnan(loss):
+                    logger.error("NaN loss detected in validation step")
+                    self.log('val_loss', torch.tensor(float('inf')))
+                    return None
+                self.log('val_loss', loss)
+            else:
+                self.log('val_loss', torch.tensor(float('inf')))
+            
+            # Compute accuracy for binary classification
+            preds = (outputs.preds > 0).float()
+            acc = (preds == batch['labels']).float().mean()
+            self.log('val_acc', acc)
+            
+            return loss
+        except Exception as e:
+            logger.exception(f"An error occurred during validation step: {str(e)}")
+            logger.error(f"Batch content: {batch}")
+            return None
 
     def test_step(self, batch, batch_idx):
-        logger.debug(f"Test step - Batch keys: {batch.keys()}")
+        logger.debug(f"Test step - Batch keys: {batch.keys() if batch is not None else 'None'}")
         if batch is None:
             self.log('test_loss', None)
             return None
         
-        outputs = self.model(batch, labels=batch['labels'])
-        loss = outputs.loss
-        
-        if loss is not None:
-            self.log('test_loss', loss)
-        else:
-            self.log('test_loss', torch.tensor(float('inf')))
-        
-        return loss
+        try:
+            outputs = self.model(batch, labels=batch['labels'])
+            loss = outputs.loss
+            
+            if loss is not None:
+                self.log('test_loss', loss)
+            else:
+                self.log('test_loss', torch.tensor(float('inf')))
+            
+            return loss
+        except Exception as e:
+            logger.exception(f"Error in test step: {str(e)}")
+            return None
 
     def forward(self, batch, **kwargs):
         if not isinstance(batch, dict):
@@ -297,14 +327,13 @@ class ESTForStreamClassificationLM(L.LightningModule):
         return outputs.last_hidden_state if hasattr(outputs, 'last_hidden_state') else outputs
 
     def configure_optimizers(self):
-        """Configures optimizer and learning rate scheduler."""
-
-        opt = torch.optim.AdamW(
+        opt = torch.optim.Adam(
             self.model.parameters(),
             lr=self.optimization_config.init_lr,
             weight_decay=self.optimization_config.weight_decay,
         )
 
+        # Rest of the method remains the same
         num_warmup_steps = self.optimization_config.lr_num_warmup_steps
         num_training_steps = self.optimization_config.max_training_steps
 
@@ -497,22 +526,19 @@ def collate_fn(batch):
     if batch is None or len(batch) == 0:
         return None
 
-    valid_items = [item for item in batch if item["labels"] is not None]
+    valid_items = [item for item in batch if item is not None and all(k in item for k in ['dynamic_indices', 'dynamic_counts', 'labels'])]
 
     if not valid_items:
         return None
 
-    required_keys = ['dynamic_indices', 'dynamic_counts', 'labels']
-    collated_batch = {}
-
-    for key in required_keys:
-        if key == 'labels':
-            collated_batch[key] = torch.stack([item[key] for item in valid_items]).float()
-        else:
-            collated_batch[key] = torch.stack([item[key] for item in valid_items])
+    collated_batch = {
+        'dynamic_indices': torch.nn.utils.rnn.pad_sequence([item['dynamic_indices'] for item in valid_items], batch_first=True),
+        'dynamic_counts': torch.nn.utils.rnn.pad_sequence([item['dynamic_counts'] for item in valid_items], batch_first=True),
+        'labels': torch.stack([item['labels'] for item in valid_items]).squeeze()
+    }
 
     return collated_batch
-
+    
 def worker_init_fn(worker_id):
     np.random.seed(worker_id)
     random.seed(worker_id)
@@ -520,111 +546,145 @@ def worker_init_fn(worker_id):
 @task_wrapper
 def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, wandb_logger: WandbLogger | None = None):
     logging.basicConfig(level=logging.DEBUG)
+    logger = logging.getLogger(__name__)
 
-    L.seed_everything(cfg.seed)
-    if cfg.do_use_filesystem_sharing:
-        torch.multiprocessing.set_sharing_strategy("file_system")
+    try:
+        L.seed_everything(cfg.seed)
+        if cfg.do_use_filesystem_sharing:
+            torch.multiprocessing.set_sharing_strategy("file_system")
 
-    config = cfg.config
-    data_config = cfg.data_config
-    optimization_config = cfg.optimization_config
+        config = cfg.config
+        data_config = cfg.data_config
+        optimization_config = cfg.optimization_config
 
-    # Ensure problem_type is set
-    if not hasattr(config, 'problem_type') or config.problem_type is None:
-        config.problem_type = "single_label_classification"
+        # Ensure problem_type is set
+        if not hasattr(config, 'problem_type') or config.problem_type is None:
+            config.problem_type = "single_label_classification"
 
-    model_params = dict()
-    if cfg.pretrained_weights_fp is not None:
-        model_params["pretrained_weights_fp"] = cfg.pretrained_weights_fp
+        model_params = dict()
+        if cfg.pretrained_weights_fp is not None:
+            model_params["pretrained_weights_fp"] = cfg.pretrained_weights_fp
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    LM = ESTForStreamClassificationLM(config, optimization_config, cfg, **model_params).to(device)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        logger.info("Initializing model")
+        LM = ESTForStreamClassificationLM(config, optimization_config, cfg, **model_params).to(device)
 
-    train_dataloader = torch.utils.data.DataLoader(
-        train_pyd,
-        batch_size=optimization_config['batch_size'],
-        num_workers=optimization_config['num_dataloader_workers'],
-        collate_fn=collate_fn,
-        shuffle=True,
-        persistent_workers=True,
-        prefetch_factor=4,  # Adjust the prefetch factor based on your system
-        pin_memory=True,  # If you are using a GPU, pinning memory can be beneficial
-        worker_init_fn=worker_init_fn,
-    )
+        logger.info(f"Train dataset length: {len(train_pyd)}")
+        logger.info(f"First few items from train dataset:")
+        for i in range(min(5, len(train_pyd))):
+            item = train_pyd[i]
+            logger.info(f"Item {i}: {item}")
 
-    tuning_dataloader = torch.utils.data.DataLoader(
-        tuning_pyd,
-        batch_size=optimization_config['validation_batch_size'],
-        num_workers=optimization_config['num_dataloader_workers'],
-        collate_fn=collate_fn,
-        shuffle=False,
-        persistent_workers=True,
-        prefetch_factor=4,
-        pin_memory=True,
-        worker_init_fn=worker_init_fn,
-    )
-
-    held_out_dataloader = torch.utils.data.DataLoader(
-        held_out_pyd,
-        batch_size=optimization_config['validation_batch_size'],
-        num_workers=optimization_config['num_dataloader_workers'],
-        collate_fn=collate_fn,
-        shuffle=False,
-        persistent_workers=True,
-        prefetch_factor=4,
-        pin_memory=True,
-        worker_init_fn=worker_init_fn,
-    )
-
-    checkpoint_callback = ModelCheckpoint(
-        dirpath=cfg.save_dir / "checkpoints",
-        filename="{epoch}-{val_loss:.2f}",
-        monitor="val_loss",
-        mode="min",
-        save_top_k=1,
-        save_weights_only=True,
-        save_last=True,
-        auto_insert_metric_name=False,
-    )
-
-    callbacks = [
-        LearningRateMonitor(logging_interval="step"),
-        checkpoint_callback,
-    ]
-
-    if 'patience' in optimization_config and optimization_config['patience'] is not None:
-        callbacks.append(
-            EarlyStopping(monitor="val_loss", mode="min", patience=optimization_config['patience'])
+        logger.info("Creating data loaders")
+        train_dataloader = TimeoutDataLoader(
+            train_pyd,
+            batch_size=optimization_config['batch_size'],
+            num_workers=optimization_config['num_dataloader_workers'],
+            collate_fn=collate_fn,
+            shuffle=True,
+            persistent_workers=True,
+            prefetch_factor=2,
+            pin_memory=True,
+            worker_init_fn=worker_init_fn,
+            timeout=600  # 10 minutes timeout
         )
 
-    trainer_kwargs = dict(
-        **cfg.trainer_config,
-        callbacks=callbacks,
-        logger=wandb_logger,
-    )
+        logger.info("Checking first batch from DataLoader:")
+        for batch in train_dataloader:
+            if batch is not None:
+                logger.info(f"Batch keys: {batch.keys()}")
+                logger.info(f"Batch shapes: {[batch[k].shape for k in batch.keys()]}")
+            else:
+                logger.info("Batch is None")
+            break
 
-    trainer_kwargs["max_epochs"] = optimization_config['max_epochs']
+        tuning_dataloader = TimeoutDataLoader(
+            tuning_pyd,
+            batch_size=optimization_config['validation_batch_size'],
+            num_workers=optimization_config['num_dataloader_workers'],
+            collate_fn=collate_fn,
+            shuffle=False,
+            persistent_workers=True,
+            prefetch_factor=2,
+            pin_memory=True,
+            worker_init_fn=worker_init_fn,
+            timeout=120  # 2 minutes timeout
+        )
 
-    if (optimization_config.get('gradient_accumulation') is not None) and (
-        optimization_config['gradient_accumulation'] > 1
-    ):
-        trainer_kwargs["accumulate_grad_batches"] = optimization_config['gradient_accumulation']
+        held_out_dataloader = TimeoutDataLoader(
+            held_out_pyd,
+            batch_size=optimization_config['validation_batch_size'],
+            num_workers=optimization_config['num_dataloader_workers'],
+            collate_fn=collate_fn,
+            shuffle=False,
+            persistent_workers=True,
+            prefetch_factor=2,
+            pin_memory=True,
+            worker_init_fn=worker_init_fn,
+            timeout=120  # 2 minutes timeout
+        )
 
-    trainer = L.Trainer(**trainer_kwargs)
+        checkpoint_callback = ModelCheckpoint(
+            dirpath=cfg.save_dir / "checkpoints",
+            filename="{epoch}-{val_loss:.2f}",
+            monitor="val_loss",
+            mode="min",
+            save_top_k=1,
+            save_weights_only=True,
+            save_last=True,
+            auto_insert_metric_name=False,
+        )
 
-    trainer.fit(model=LM, train_dataloaders=train_dataloader, val_dataloaders=tuning_dataloader)
+        callbacks = [
+            LearningRateMonitor(logging_interval="step"),
+            checkpoint_callback,
+        ]
 
-    if len(tuning_pyd) == 0:
-        tuning_metrics = None
-    else:
-        tuning_metrics = trainer.validate(model=LM, dataloaders=tuning_dataloader, ckpt_path="best")
+        if 'patience' in optimization_config and optimization_config['patience'] is not None:
+            callbacks.append(
+                EarlyStopping(monitor="val_loss", mode="min", patience=optimization_config['patience'])
+            )
 
-    if len(held_out_pyd) == 0:
-        held_out_metrics = None
-    else:
-        held_out_metrics = trainer.test(model=LM, dataloaders=held_out_dataloader, ckpt_path="best")
+        trainer_kwargs = dict(
+            **cfg.trainer_config,
+            callbacks=callbacks,
+            logger=wandb_logger,
+        )
 
-    return None, tuning_metrics, held_out_metrics
+        trainer_kwargs["max_epochs"] = optimization_config['max_epochs']
 
+        if (optimization_config.get('gradient_accumulation') is not None) and (
+            optimization_config['gradient_accumulation'] > 1
+        ):
+            trainer_kwargs["accumulate_grad_batches"] = optimization_config['gradient_accumulation']
+
+        logger.info("Setting up trainer")
+        trainer = L.Trainer(**trainer_kwargs)
+
+        logger.info("Starting training")
+        try:
+            trainer.fit(model=LM, train_dataloaders=train_dataloader, val_dataloaders=tuning_dataloader)
+        except Exception as e:
+            logger.exception(f"An error occurred during training: {str(e)}")
+            # Print more detailed information about the error
+            import traceback
+            logger.error(traceback.format_exc())
+            return None, None, None
+
+        if len(tuning_pyd) == 0:
+            tuning_metrics = None
+        else:
+            tuning_metrics = trainer.validate(model=LM, dataloaders=tuning_dataloader, ckpt_path="best")
+
+        if len(held_out_pyd) == 0:
+            held_out_metrics = None
+        else:
+            held_out_metrics = trainer.test(model=LM, dataloaders=held_out_dataloader, ckpt_path="best")
+
+        return None, tuning_metrics, held_out_metrics
+
+    except Exception as e:
+        logger.exception(f"An error occurred during training: {str(e)}")
+        return None, None, None
 
 __all__ = ['FinetuneConfig', 'train']
