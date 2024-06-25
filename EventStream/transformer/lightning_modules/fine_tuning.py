@@ -7,6 +7,7 @@ from pathlib import Path
 import pathlib
 from typing import Any
 import wandb
+from torch.optim.lr_scheduler import LambdaLR
 
 import lightning as L
 import omegaconf
@@ -236,63 +237,56 @@ class ESTForStreamClassificationLM(L.LightningModule):
             self.log(f"{prefix}_loss", results.loss)
 
     def training_step(self, batch, batch_idx):
-        logger.debug(f"Training step - Batch keys: {batch.keys() if batch is not None else 'None'}")
-        logger.debug(f"Training step - Batch shape: {batch['dynamic_indices'].shape if batch is not None and 'dynamic_indices' in batch else 'None'}")
-        if batch is None:
-            self.log('train_loss', torch.tensor(float('inf')))
-            return None
-
-        try:
-            outputs = self.model(batch, labels=batch['labels'])
-            loss = outputs.loss
-        except Exception as e:
-            logger.error(f"Error in model forward pass: {str(e)}")
-            logger.error(f"Batch content: {batch}")
-            raise
-
-        if loss is not None:
-            if torch.isnan(loss):
-                logger.error("NaN loss detected in training step")
-                logger.error(f"Batch content: {batch}")
-                self.log('train_loss', torch.tensor(float('inf')))
-                return None
-            self.log('train_loss', loss)
-        else:
-            self.log('train_loss', torch.tensor(float('inf')))
+        outputs = self.model(batch, labels=batch['labels'])
+        loss = outputs.loss
         
+        if loss is not None:
+            self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+            self.log('train_accuracy', outputs.accuracy, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+            
+            # Log debugging information
+            if outputs.debug_info:
+                for key, value in outputs.debug_info.items():
+                    self.log(f'train_{key}', value)
+    
         return loss
 
     def validation_step(self, batch, batch_idx):
         logger.debug(f"Validation step - Batch keys: {batch.keys() if batch is not None else 'None'}")
-        logger.debug(f"Validation step - Batch shape: {batch['dynamic_indices'].shape if batch is not None and 'dynamic_indices' in batch else 'None'}")
-        logger.debug(f"Validation step - Batch types: {type(batch['dynamic_indices']) if batch is not None and 'dynamic_indices' in batch else 'None'}")
-        if batch is None:
-            self.log('val_loss', torch.tensor(float('inf')))
-            return None
         
-        try:
-            outputs = self.model(batch, labels=batch['labels'])
-            loss = outputs.loss
-            
-            if loss is not None:
-                if torch.isnan(loss):
-                    logger.error("NaN loss detected in validation step")
-                    self.log('val_loss', torch.tensor(float('inf')))
-                    return None
-                self.log('val_loss', loss)
-            else:
+        outputs = self.model(batch, labels=batch['labels'])
+        loss = outputs.loss
+        
+        logger.debug(f"Model outputs: {outputs}")
+        logger.debug(f"Loss: {loss}")
+        
+        if loss is not None:
+            if torch.isnan(loss):
+                logger.error("NaN loss detected in validation step")
+                logger.error(f"Batch that caused NaN loss: {batch}")
                 self.log('val_loss', torch.tensor(float('inf')))
-            
-            # Compute accuracy for binary classification
-            preds = (outputs.preds > 0).float()
-            acc = (preds == batch['labels']).float().mean()
-            self.log('val_acc', acc)
-            
-            return loss
-        except Exception as e:
-            logger.exception(f"An error occurred during validation step: {str(e)}")
-            logger.error(f"Batch content: {batch}")
-            return None
+                return None
+            self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        else:
+            self.log('val_loss', torch.tensor(float('inf')), on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        
+        # Log accuracy and AUROC from model outputs
+        if outputs.accuracy is not None:
+            self.log('val_acc', outputs.accuracy)
+        
+        if outputs.auc is not None:
+            self.log('val_auroc', outputs.auc, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        else:
+            # Compute AUROC using torchmetrics if not provided by the model
+            auroc = BinaryAUROC()(outputs.preds, batch['labels'])
+            self.log('val_auroc', auroc, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        
+        # Log debugging information
+        if outputs.debug_info:
+            for key, value in outputs.debug_info.items():
+                self.log(f'val_{key}', value)
+        
+        return loss
 
     def test_step(self, batch, batch_idx):
         logger.debug(f"Test step - Batch keys: {batch.keys() if batch is not None else 'None'}")
@@ -300,19 +294,31 @@ class ESTForStreamClassificationLM(L.LightningModule):
             self.log('test_loss', None)
             return None
         
-        try:
-            outputs = self.model(batch, labels=batch['labels'])
-            loss = outputs.loss
-            
-            if loss is not None:
-                self.log('test_loss', loss)
-            else:
-                self.log('test_loss', torch.tensor(float('inf')))
-            
-            return loss
-        except Exception as e:
-            logger.exception(f"Error in test step: {str(e)}")
-            return None
+        outputs = self.model(batch, labels=batch['labels'])
+        loss = outputs.loss
+        
+        if loss is not None:
+            self.log('test_loss', loss)
+        else:
+            self.log('test_loss', torch.tensor(float('inf')))
+        
+        # Log accuracy and AUROC
+        if outputs.accuracy is not None:
+            self.log('test_acc', outputs.accuracy)
+        
+        if outputs.auc is not None:
+            self.log('test_auroc', outputs.auc)
+        else:
+            # Compute AUROC using torchmetrics if not provided by the model
+            auroc = BinaryAUROC()(outputs.preds, batch['labels'])
+            self.log('test_auroc', auroc)
+        
+        # Log debugging information
+        if outputs.debug_info:
+            for key, value in outputs.debug_info.items():
+                self.log(f'test_{key}', value)
+        
+        return loss
 
     def forward(self, batch, **kwargs):
         if not isinstance(batch, dict):
@@ -333,40 +339,45 @@ class ESTForStreamClassificationLM(L.LightningModule):
         return outputs.last_hidden_state if hasattr(outputs, 'last_hidden_state') else outputs
 
     def configure_optimizers(self):
-        opt = torch.optim.AdamW(
+        optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=self.optimization_config.init_lr,
             weight_decay=self.optimization_config.weight_decay,
         )
-
-        # Rest of the method remains the same
+        
         num_warmup_steps = self.optimization_config.lr_num_warmup_steps
         num_training_steps = self.optimization_config.max_training_steps
 
-        if num_warmup_steps is None and num_training_steps is not None and hasattr(self.optimization_config, 'lr_frac_warmup_steps'):
-            num_warmup_steps = int(num_training_steps * self.optimization_config.lr_frac_warmup_steps)
+        def get_custom_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, min_lr_ratio=0.1):
+            # custom scheduler that combines linear warmup and cosine decay
+            def lr_lambda(current_step):
+                if current_step < num_warmup_steps:
+                    return float(current_step) / float(max(1, num_warmup_steps))
+                progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
+                return max(min_lr_ratio, 0.5 * (1.0 + math.cos(math.pi * progress)))
 
-        if num_warmup_steps is not None and num_training_steps is not None:
-            scheduler = get_polynomial_decay_schedule_with_warmup(
-                optimizer=opt,
-                num_warmup_steps=num_warmup_steps,
-                num_training_steps=num_training_steps,
-                power=self.optimization_config.lr_decay_power,
-                lr_end=self.optimization_config.end_lr,
-            )
-        else:
-            scheduler = None
+            return LambdaLR(optimizer, lr_lambda)
 
-        if scheduler is not None:
-            return {
-                "optimizer": opt,
-                "lr_scheduler": {
-                    "scheduler": scheduler,
-                    "interval": "step",
-                },
-            }
-        else:
-            return {"optimizer": opt}
+        scheduler = get_custom_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=num_warmup_steps,
+            num_training_steps=num_training_steps,
+            min_lr_ratio=self.optimization_config.end_lr_frac_of_init_lr
+        )
+        
+        scheduler_config = {
+            "scheduler": scheduler,
+            "interval": "step",
+            "frequency": 1,
+        }
+        
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": scheduler_config,
+            "gradient_clip_val": 1.0,
+            "gradient_clip_algorithm": "norm",
+            "monitor": "val_loss",
+        }
 
 @hydra_dataclass
 class FinetuneConfig:
@@ -648,7 +659,7 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, wandb_logger
 
         if 'patience' in optimization_config and optimization_config['patience'] is not None:
             callbacks.append(
-                EarlyStopping(monitor="val_loss", mode="min", patience=optimization_config['patience'])
+                EarlyStopping(monitor="val_loss", min_delta=0.00, mode="min", patience=optimization_config['patience'], verbose=True)
             )
 
         trainer_kwargs = dict(
@@ -673,14 +684,7 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, wandb_logger
         trainer = L.Trainer(**cfg.trainer_config, callbacks=callbacks, logger=wandb_logger)
 
         logger.info("Starting training")
-        try:
-            trainer.fit(model=LM, train_dataloaders=train_dataloader, val_dataloaders=tuning_dataloader)
-        except Exception as e:
-            logger.exception(f"An error occurred during training: {str(e)}")
-            # Print more detailed information about the error
-            import traceback
-            logger.error(traceback.format_exc())
-            return None, None, None
+        trainer.fit(model=LM, train_dataloaders=train_dataloader, val_dataloaders=tuning_dataloader)
 
         if len(tuning_pyd) == 0:
             tuning_metrics = None

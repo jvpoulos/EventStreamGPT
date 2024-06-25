@@ -508,6 +508,10 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
                 else:
                     full_subj_data[col] = v[idx]
 
+            # Convert dynamic_indices to float
+            if 'dynamic_indices' in full_subj_data:
+                full_subj_data['dynamic_indices'] = torch.tensor(full_subj_data['dynamic_indices'], dtype=torch.float64)
+        
             for k in ["static_indices", "static_measurement_indices"]:
                 if full_subj_data.get(k) is None:
                     full_subj_data[k] = []
@@ -819,7 +823,7 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
         max_seq_len = max(len(item["dynamic_indices"]) for item in valid_items)
 
         # Initialize the tensors with the correct shape
-        dynamic_indices = torch.zeros((len(valid_items), max_seq_len), dtype=torch.long, device=device)
+        dynamic_indices = torch.zeros((len(valid_items), max_seq_len), dtype=torch.float64, device=device)
         dynamic_counts = torch.zeros((len(valid_items), max_seq_len), dtype=torch.float, device=device)
         labels = torch.zeros((len(valid_items),), dtype=torch.bool, device=device)
 

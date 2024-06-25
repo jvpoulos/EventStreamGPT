@@ -1218,17 +1218,12 @@ class GenerativeSequenceModelOutput(ModelOutput):
 
 @dataclass
 class StreamClassificationModelOutput(ModelOutput):
-    """Contains all outputs for the Stream Classification Model.
-
-    Args:
-        loss: The overall model loss.
-        preds: The model predictions.
-        labels: The model labels.
-    """
-
     loss: torch.FloatTensor
     preds: torch.FloatTensor = None
     labels: torch.LongTensor | torch.FloatTensor = None
+    auc: torch.FloatTensor = None
+    accuracy: torch.FloatTensor = None
+    debug_info: dict = None
 
 
 class GenerativeOutputLayerBase(torch.nn.Module):
