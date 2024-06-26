@@ -262,7 +262,7 @@ class DataEmbeddingLayer(torch.nn.Module):
         return self.embedding(one_hot)
 
     def _dynamic_embedding(self, batch: PytorchBatch) -> torch.Tensor:
-        dynamic_indices = batch.dynamic_indices
+        dynamic_indices = batch.dynamic_indices.to(torch.long)
         dynamic_counts = batch.dynamic_counts
         measurement_indices = getattr(batch, 'dynamic_measurement_indices', None)
         values = getattr(batch, 'dynamic_values', None)

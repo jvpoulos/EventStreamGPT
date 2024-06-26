@@ -5,14 +5,16 @@ import random
 from collections.abc import Sequence
 from pathlib import Path
 import pathlib
-from typing import Any
+from typing import Dict, Any
 import wandb
 from torch.optim.lr_scheduler import LambdaLR
+import math
 
 import lightning as L
 import omegaconf
 from omegaconf import DictConfig
 import torch
+from pytorch_lightning import LightningModule
 import torchmetrics
 from lightning.pytorch.callbacks import Callback, LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
@@ -57,6 +59,11 @@ import numpy as np
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
+def get_config_value(config, key, default=None):
+    if isinstance(config, dict):
+        return config.get(key, default)
+    return getattr(config, key, default)
+
 class TimeoutDataLoader(torch.utils.data.DataLoader):
     def __init__(self, *args, **kwargs):
         self.timeout = kwargs.pop('timeout', 60)  # Default timeout of 60 seconds
@@ -82,8 +89,6 @@ class TimeoutDataLoaderIter:
                     raise TimeoutError(f"DataLoader timed out after {self.timeout} seconds") from e
 
 class ESTForStreamClassificationLM(L.LightningModule):
-    """A PyTorch Lightning Module for a `ESTForStreamClassification` model."""
-
     def __init__(
         self,
         config: StructuredTransformerConfig | dict[str, Any],
@@ -95,16 +100,27 @@ class ESTForStreamClassificationLM(L.LightningModule):
     ):
         """Initializes the Lightning Module."""
         super().__init__()
-
         if isinstance(config, dict):
             config = StructuredTransformerConfig(**config)
         if isinstance(optimization_config, dict):
             optimization_config = OptimizationConfig(**optimization_config)
-
+        
         self.config = config
         self.optimization_config = optimization_config
-        self.cfg = cfg  # Assign the passed `cfg` instance to the instance attribute
+        self.cfg = cfg
         self.do_debug_mode = do_debug_mode
+        
+        # Use the optimization_config object directly since we've already converted it
+        self.learning_rate = get_config_value(optimization_config, 'init_lr', 1e-3)
+        self.num_training_steps = optimization_config.max_training_steps
+        self.weight_decay = optimization_config.weight_decay
+        self.use_lr_scheduler = getattr(optimization_config, 'use_lr_scheduler', False)
+        self.lr_scheduler_type = getattr(optimization_config, 'lr_scheduler_type', 'cosine')
+        self.end_lr = optimization_config.end_lr
+        self.end_lr_frac_of_init_lr = optimization_config.end_lr_frac_of_init_lr
+        self.train_metrics = {}
+        self.val_metrics = {}
+        self.test_metrics = {}
 
         self.save_hyperparameters(
             {
@@ -241,14 +257,25 @@ class ESTForStreamClassificationLM(L.LightningModule):
         loss = outputs.loss
         
         if loss is not None:
-            self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-            self.log('train_accuracy', outputs.accuracy, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+            self.log('train_loss', loss, on_step=True, on_epoch=False, prog_bar=True, logger=True)
+            self.log('train_accuracy', outputs.accuracy, on_step=True, on_epoch=False, prog_bar=True, logger=True)
             
-            # Log debugging information
-            if outputs.debug_info:
-                for key, value in outputs.debug_info.items():
-                    self.log(f'train_{key}', value)
-    
+            # Accumulate metrics
+            self._accumulate_metrics('train', {
+                'loss': loss.item(),
+                'accuracy': outputs.accuracy,
+                'auc': outputs.auc if outputs.auc is not None else 0.0,
+            })
+            
+            # Debugging print statements
+            if batch_idx % 100 == 0:
+                logger.info(f"Step {batch_idx}: train_loss={loss.item():.4f}, train_accuracy={outputs.accuracy:.4f}")
+            
+            # Log gradient norm
+            if self.global_step % 100 == 0:
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
+                self.log('grad_norm', grad_norm)
+        
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -256,6 +283,10 @@ class ESTForStreamClassificationLM(L.LightningModule):
         
         outputs = self.model(batch, labels=batch['labels'])
         loss = outputs.loss
+        
+        # Add learning rate to debug info
+        if outputs.debug_info is not None:
+            outputs.debug_info["learning_rate"] = self.trainer.optimizers[0].param_groups[0]['lr']
         
         logger.debug(f"Model outputs: {outputs}")
         logger.debug(f"Loss: {loss}")
@@ -266,25 +297,22 @@ class ESTForStreamClassificationLM(L.LightningModule):
                 logger.error(f"Batch that caused NaN loss: {batch}")
                 self.log('val_loss', torch.tensor(float('inf')))
                 return None
-            self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-        else:
-            self.log('val_loss', torch.tensor(float('inf')), on_step=False, on_epoch=True, prog_bar=True, logger=True)
-        
-        # Log accuracy and AUROC from model outputs
-        if outputs.accuracy is not None:
-            self.log('val_acc', outputs.accuracy)
-        
-        if outputs.auc is not None:
-            self.log('val_auroc', outputs.auc, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-        else:
-            # Compute AUROC using torchmetrics if not provided by the model
-            auroc = BinaryAUROC()(outputs.preds, batch['labels'])
-            self.log('val_auroc', auroc, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-        
+            
+            # Accumulate metrics
+            self._accumulate_metrics('val', {
+                'loss': loss.item(),
+                'accuracy': outputs.accuracy,
+                'auc': outputs.auc if outputs.auc is not None else BinaryAUROC()(outputs.preds, batch['labels']).item(),
+            })
+     
+        if loss is not None:
+            self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+            self.log('val_loss_epoch', loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+            
         # Log debugging information
         if outputs.debug_info:
             for key, value in outputs.debug_info.items():
-                self.log(f'val_{key}', value)
+                self._accumulate_metrics('val', {f'debug_{key}': value})
         
         return loss
 
@@ -298,25 +326,17 @@ class ESTForStreamClassificationLM(L.LightningModule):
         loss = outputs.loss
         
         if loss is not None:
-            self.log('test_loss', loss)
-        else:
-            self.log('test_loss', torch.tensor(float('inf')))
-        
-        # Log accuracy and AUROC
-        if outputs.accuracy is not None:
-            self.log('test_acc', outputs.accuracy)
-        
-        if outputs.auc is not None:
-            self.log('test_auroc', outputs.auc)
-        else:
-            # Compute AUROC using torchmetrics if not provided by the model
-            auroc = BinaryAUROC()(outputs.preds, batch['labels'])
-            self.log('test_auroc', auroc)
+            # Accumulate metrics
+            self._accumulate_metrics('test', {
+                'loss': loss.item(),
+                'accuracy': outputs.accuracy,
+                'auc': outputs.auc if outputs.auc is not None else BinaryAUROC()(outputs.preds, batch['labels']).item(),
+            })
         
         # Log debugging information
         if outputs.debug_info:
             for key, value in outputs.debug_info.items():
-                self.log(f'test_{key}', value)
+                self._accumulate_metrics('test', {f'debug_{key}': value})
         
         return loss
 
@@ -338,46 +358,69 @@ class ESTForStreamClassificationLM(L.LightningModule):
         
         return outputs.last_hidden_state if hasattr(outputs, 'last_hidden_state') else outputs
 
+    def _accumulate_metrics(self, prefix, metrics):
+        for key, value in metrics.items():
+            if key not in self.__dict__[f'{prefix}_metrics']:
+                self.__dict__[f'{prefix}_metrics'][key] = []
+            self.__dict__[f'{prefix}_metrics'][key].append(value)
+
+    def on_train_epoch_end(self):
+        self._log_epoch_metrics('train')
+
+    def on_validation_epoch_end(self):
+        self._log_epoch_metrics('val')
+
+    def on_test_epoch_end(self):
+        self._log_epoch_metrics('test')
+
+    def _log_epoch_metrics(self, prefix):
+        metrics = self.__dict__[f'{prefix}_metrics']
+        for key, values in metrics.items():
+            avg_value = sum(values) / len(values)
+            self.log(f'{prefix}_{key}_epoch', avg_value, on_step=False, on_epoch=True, logger=True)
+        
+        # Log learning rate
+        if prefix in ['train', 'val'] and self.trainer.optimizers:
+            self.log(f'{prefix}_learning_rate_epoch', self.trainer.optimizers[0].param_groups[0]['lr'], on_step=False, on_epoch=True, logger=True)
+        
+        # Clear accumulated metrics
+        self.__dict__[f'{prefix}_metrics'].clear()
+
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=self.optimization_config.init_lr,
-            weight_decay=self.optimization_config.weight_decay,
+            self.parameters(),
+            lr=self.learning_rate,
+            weight_decay=self.weight_decay,
         )
-        
-        num_warmup_steps = self.optimization_config.lr_num_warmup_steps
-        num_training_steps = self.optimization_config.max_training_steps
 
-        def get_custom_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, min_lr_ratio=0.1):
-            # custom scheduler that combines linear warmup and cosine decay
-            def lr_lambda(current_step):
-                if current_step < num_warmup_steps:
-                    return float(current_step) / float(max(1, num_warmup_steps))
-                progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
-                return max(min_lr_ratio, 0.5 * (1.0 + math.cos(math.pi * progress)))
+        # Clip gradients
+        self.clip_gradients(optimizer, gradient_clip_val=1.0, gradient_clip_algorithm="norm")
 
-            return LambdaLR(optimizer, lr_lambda)
+        if self.use_lr_scheduler:
+            if self.lr_scheduler_type == "cosine":
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer,  # Changed from optimizer to self.optimizer
+                    T_max=self.num_training_steps,
+                    eta_min=self.end_lr
+                )
+            elif self.lr_scheduler_type == "linear":
+                scheduler = torch.optim.lr_scheduler.LinearLR(
+                    optimizer,  # Changed from optimizer to self.optimizer
+                    start_factor=1.0,
+                    end_factor=self.end_lr_frac_of_init_lr,
+                    total_iters=self.num_training_steps
+                )
+            else:
+                raise ValueError(f"Unknown scheduler type: {self.lr_scheduler_type}")
 
-        scheduler = get_custom_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=num_warmup_steps,
-            num_training_steps=num_training_steps,
-            min_lr_ratio=self.optimization_config.end_lr_frac_of_init_lr
-        )
-        
-        scheduler_config = {
-            "scheduler": scheduler,
-            "interval": "step",
-            "frequency": 1,
-        }
-        
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": scheduler_config,
-            "gradient_clip_val": 1.0,
-            "gradient_clip_algorithm": "norm",
-            "monitor": "val_loss",
-        }
+            scheduler = {
+                "scheduler": scheduler,
+                "interval": "step",
+                "frequency": 1,
+            }
+            return [optimizer], [scheduler]
+        else:
+            return optimizer
 
 @hydra_dataclass
 class FinetuneConfig:
@@ -426,7 +469,17 @@ class FinetuneConfig:
             },
         }
     )
-    optimization_config: OptimizationConfig = dataclasses.field(default_factory=lambda: OptimizationConfig())
+
+    optimization_config: Dict[str, Any] = dataclasses.field(
+        default_factory=lambda: {
+            'batch_size': 32,
+            'validation_batch_size': 64,
+            'num_dataloader_workers': 4,
+            'max_epochs': 100,
+            'gradient_accumulation': 1,
+        }
+    )
+
     data_config: dict[str, Any] | None = dataclasses.field(
         default_factory=lambda: {
             **{k: None for k in PytorchDatasetConfig().to_dict().keys()},
@@ -451,6 +504,9 @@ class FinetuneConfig:
         }
     )
     do_use_filesystem_sharing: bool = True
+
+    def to_dict(self):
+        return dataclasses.asdict(self)
 
     def __post_init__(self, data_config_path: str = None):
         match self.save_dir:
@@ -519,6 +575,14 @@ class FinetuneConfig:
         print(f"Loading config from {config_fp}")
         reloaded_config = StructuredTransformerConfig.from_json_file(config_fp)
 
+        if isinstance(self.data_config, dict):
+            dl_reps_dir = self.data_config.pop('dl_reps_dir', None)
+            self.data_config = PytorchDatasetConfig(**self.data_config)
+            self.data_config.dl_reps_dir = dl_reps_dir
+
+        if isinstance(self.optimization_config, OptimizationConfig):
+            self.optimization_config = dataclasses.asdict(self.optimization_config)        
+
         for param, val in self.config.items():
             if val is None:
                 continue
@@ -539,31 +603,72 @@ class FinetuneConfig:
             self.wandb_logger_kwargs["project"] = reloaded_pretrain_config.wandb_logger_kwargs.project
 
 
-def collate_fn(batch):
-    if batch is None or len(batch) == 0:
-        return None
+class CollateFunction:
+    def __init__(self, vocab_size):
+        self.vocab_size = vocab_size
 
-    valid_items = [item for item in batch if item is not None and all(k in item for k in ['dynamic_indices', 'dynamic_counts', 'labels'])]
+    def __call__(self, batch):
+        batch = [item for item in batch if item is not None]
+        if len(batch) == 0:
+            logger.warning("All items in batch are None")
+            return None
 
-    if not valid_items:
-        return None
+        valid_items = [item for item in batch if all(k in item for k in ['dynamic_indices', 'dynamic_counts', 'labels'])]
+        
+        if not valid_items:
+            logger.warning("No valid items found in batch")
+            return None
 
-    collated_batch = {
-        'dynamic_indices': torch.nn.utils.rnn.pad_sequence([item['dynamic_indices'] for item in valid_items], batch_first=True),
-        'dynamic_counts': torch.nn.utils.rnn.pad_sequence([item['dynamic_counts'] for item in valid_items], batch_first=True),
-        'labels': torch.stack([item['labels'] for item in valid_items]).squeeze()
-    }
+        max_allowed_index = self.vocab_size - 1
 
-    return collated_batch
-    
+        def safe_pad_sequence(sequences, max_val, dtype):
+            try:
+                sequences = [s if isinstance(s, torch.Tensor) else torch.tensor(s, dtype=dtype) for s in sequences]
+                sequences = [torch.clamp(s, max=max_val) for s in sequences]
+                padded = torch.nn.utils.rnn.pad_sequence(sequences, batch_first=True)
+                return padded
+            except Exception as e:
+                logger.error(f"Error in safe_pad_sequence: {str(e)}")
+                return None
+
+        try:
+            collated_batch = {
+                'dynamic_indices': safe_pad_sequence([item['dynamic_indices'] for item in valid_items], max_allowed_index, torch.int32),
+                'dynamic_counts': safe_pad_sequence([torch.nan_to_num(item['dynamic_counts'], nan=0.0) for item in valid_items], float('inf'), torch.float32),
+                'labels': torch.stack([torch.tensor(item['labels']) for item in valid_items]).squeeze()
+            }
+
+            # Check if any of the tensors are None
+            if any(value is None for value in collated_batch.values()):
+                logger.error("One or more tensors in collated_batch are None")
+                return None
+
+            # Add shape and dtype information for debugging
+            for key, value in collated_batch.items():
+                logger.info(f"{key}: shape = {value.shape}, dtype = {value.dtype}, max = {value.max().item()}, min = {value.min().item()}")
+
+            return collated_batch
+
+        except Exception as e:
+            logger.error(f"Error in collate_fn: {str(e)}")
+            return None
+
 def worker_init_fn(worker_id):
     np.random.seed(worker_id)
     random.seed(worker_id)
 
 @task_wrapper
 def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, wandb_logger: WandbLogger | None = None):
+
     logging.basicConfig(level=logging.DEBUG)
     logger = logging.getLogger(__name__)
+
+    if wandb_logger is None:
+        wandb.init(project=cfg.wandb_logger_kwargs.get('project', 'default_project'),
+                   name=cfg.wandb_logger_kwargs.get('name', 'default_run'),
+                   config=cfg.to_dict())
+    else:
+        wandb.init(config=cfg.to_dict())
 
     try:
         L.seed_everything(cfg.seed)
@@ -593,6 +698,8 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, wandb_logger
             logger.info(f"Item {i}: {item}")
 
         logger.info("Creating data loaders")
+        collate_fn = CollateFunction(config.vocab_size)
+
         train_dataloader = TimeoutDataLoader(
             train_pyd,
             batch_size=optimization_config['batch_size'],
@@ -605,15 +712,6 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, wandb_logger
             worker_init_fn=worker_init_fn,
             timeout=600  # 10 minutes timeout
         )
-
-        logger.info("Checking first batch from DataLoader:")
-        for batch in train_dataloader:
-            if batch is not None:
-                logger.info(f"Batch keys: {batch.keys()}")
-                logger.info(f"Batch shapes: {[batch[k].shape for k in batch.keys()]}")
-            else:
-                logger.info("Batch is None")
-            break
 
         tuning_dataloader = TimeoutDataLoader(
             tuning_pyd,
@@ -654,13 +752,24 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, wandb_logger
 
         callbacks = [
             LearningRateMonitor(logging_interval="step"),
-            checkpoint_callback,
-        ]
-
-        if 'patience' in optimization_config and optimization_config['patience'] is not None:
-            callbacks.append(
-                EarlyStopping(monitor="val_loss", min_delta=0.00, mode="min", patience=optimization_config['patience'], verbose=True)
+            ModelCheckpoint(
+                dirpath=cfg.save_dir / "checkpoints",
+                filename="{epoch}-{val_loss_epoch:.2f}",  # Changed from val_loss to val_loss_epoch
+                monitor="val_loss_epoch",  # Changed from val_loss to val_loss_epoch
+                mode="min",
+                save_top_k=1,
+                save_weights_only=True,
+                save_last=True,
+                auto_insert_metric_name=False,
+            ),
+            EarlyStopping(
+                monitor='val_loss_epoch',  # Changed from val_loss to val_loss_epoch
+                min_delta=0.00,
+                patience=cfg.optimization_config['patience'],
+                verbose=False,
+                mode='min'
             )
+        ]
 
         trainer_kwargs = dict(
             **cfg.trainer_config,
@@ -668,11 +777,9 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, wandb_logger
             logger=wandb_logger,
         )
 
-        trainer_kwargs["max_epochs"] = optimization_config['max_epochs']
+        trainer_kwargs["max_epochs"] = optimization_config.get('max_epochs', 100)  # Add a default value
 
-        if (optimization_config.get('gradient_accumulation') is not None) and (
-            optimization_config['gradient_accumulation'] > 1
-        ):
+        if optimization_config.get('gradient_accumulation', 1) > 1:
             trainer_kwargs["accumulate_grad_batches"] = optimization_config['gradient_accumulation']
 
         logger.info("Setting up trainer")
@@ -681,7 +788,14 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, wandb_logger
             strategy = DDPStrategy(find_unused_parameters=True)
             cfg.trainer_config["strategy"] = strategy
 
-        trainer = L.Trainer(**cfg.trainer_config, callbacks=callbacks, logger=wandb_logger)
+        trainer = L.Trainer(
+            **cfg.trainer_config,
+            callbacks=callbacks,
+            logger=wandb_logger,
+            precision="16-mixed",  # Enable mixed precision
+            accumulate_grad_batches=optimization_config.get('gradient_accumulation', 1),
+            max_epochs=optimization_config.get('max_epochs', 100),
+        )
 
         logger.info("Starting training")
         trainer.fit(model=LM, train_dataloaders=train_dataloader, val_dataloaders=tuning_dataloader)

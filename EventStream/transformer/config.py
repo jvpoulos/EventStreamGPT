@@ -246,7 +246,10 @@ class OptimizationConfig(JSONableMixin):
     lr_decay_power: float = 1.0
     weight_decay: float = 0.01
     patience: int | None = None
-    gradient_accumulation: int | None = None
+    gradient_accumulation: int = 1
+    use_lr_scheduler: bool = False
+    lr_scheduler_type: str = "cosine"
+    lr_num_warmup_steps: int = 100
 
     num_dataloader_workers: int = 0
 
@@ -513,6 +516,7 @@ class StructuredTransformerConfig(PretrainedConfig):
         dep_graph_attention_types: ATTENTION_TYPES_LIST_T | None = None,
         dep_graph_window_size: int | None = 2,
         intermediate_size: int = 32,
+        vocab_size: int = 1, 
         activation_function: str = "gelu",
         attention_dropout: float = 0.1,
         input_dropout: float = 0.1,

@@ -3,6 +3,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn import LayerNorm
 from torchmetrics.classification import BinaryAUROC
+from pytorch_lightning.callbacks import EarlyStopping
 
 from ..data.types import PytorchBatch
 from .config import StructuredEventProcessingMode, StructuredTransformerConfig
@@ -46,14 +47,6 @@ class ESTForStreamClassification(StructuredTransformerPreTrainedModel):
         
         self.pooling_method = config.task_specific_params["pooling_method"]
         
-        # Add intermediate layers
-        self.intermediate = torch.nn.Sequential(
-            torch.nn.Linear(config.hidden_size, config.hidden_size),
-            torch.nn.ReLU(),
-            LayerNorm(config.hidden_size),
-            torch.nn.Dropout(config.resid_dropout)
-        )
-        
         # Output layer for binary classification
         self.logit_layer = torch.nn.Linear(config.hidden_size, 1)
         
@@ -66,6 +59,20 @@ class ESTForStreamClassification(StructuredTransformerPreTrainedModel):
         # Initialize AUROC
         self.auroc = BinaryAUROC()
 
+        # Initialize gradient clipping
+        self.max_grad_norm = getattr(config, 'max_grad_norm', 1.0)
+
+        # Initialize dropout
+        self.dropout = torch.nn.Dropout(config.intermediate_dropout)
+
+        # Add intermediate layers
+        self.intermediate = torch.nn.Sequential(
+            torch.nn.Linear(config.hidden_size, config.hidden_size),
+            torch.nn.ReLU(),
+            LayerNorm(config.hidden_size),
+            self.dropout
+        )
+        
     def forward(self, batch: dict, labels=None):
         device = self.logit_layer.weight.device
         
@@ -73,6 +80,15 @@ class ESTForStreamClassification(StructuredTransformerPreTrainedModel):
         dynamic_indices = batch['dynamic_indices'].to(device)
         dynamic_counts = batch['dynamic_counts'].to(device)
         
+        # Replace NaN values with 0
+        dynamic_counts = torch.nan_to_num(dynamic_counts, nan=0.0)
+        
+        # Check vocab size
+        max_index = dynamic_indices.max().item()
+        vocab_size = self.config.vocab_size
+        if max_index >= vocab_size:
+            raise ValueError(f"Max index in dynamic_indices ({max_index}) is >= vocab_size ({vocab_size})")
+
         # Create PytorchBatch object
         pytorch_batch = PytorchBatch(
             dynamic_indices=dynamic_indices,
@@ -101,16 +117,23 @@ class ESTForStreamClassification(StructuredTransformerPreTrainedModel):
             pooled = event_encoded.max(dim=1)[0]
         else:
             raise ValueError(f"Unknown pooling method: {self.pooling_method}")
-        
+      
+        if self.training:
+            # Apply gradient clipping
+            torch.nn.utils.clip_grad_norm_(self.parameters(), self.max_grad_norm)
+
         # Apply intermediate layers
         intermediate = self.intermediate(pooled)
+
+        # Apply dropout
+        intermediate = self.dropout(intermediate)
         
         # Get logits
         logits = self.logit_layer(intermediate).squeeze(-1)
         
         # Apply sigmoid to get probabilities
         probs = torch.sigmoid(logits)
-        
+    
         # Compute loss if labels are provided
         if labels is not None:
             labels = labels.to(logits.device).float()
@@ -134,14 +157,17 @@ class ESTForStreamClassification(StructuredTransformerPreTrainedModel):
             "pooled_std": pooled.std().item(),
             "logits_mean": logits.mean().item(),
             "logits_std": logits.std().item(),
+            "gradient_norm": torch.nn.utils.clip_grad_norm_(self.parameters(), self.max_grad_norm).item(),
         }
+        
+        logger.debug(f"Debug info: {debug_info}")
         
         return StreamClassificationModelOutput(
             loss=loss,
-            preds=probs,  # Return probabilities instead of logits
+            preds=logits,
             labels=labels,
-            auc=auc,
             accuracy=accuracy,
+            auc=auc,
             debug_info=debug_info
         )
         
