@@ -807,66 +807,54 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
 
         return out_batch
 
-    @TimeableMixin.TimeAs
-    def collate(self, batch: list[DATA_ITEM_T]) -> PytorchBatch:
-        print(f"Collating batch of size: {len(batch)}")
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        # Filter out items with None labels
-        valid_items = [item for item in batch if item["labels"] is not None]
-
-        if not valid_items:
-            # If all items have None labels, return None
-            return None
-
-        # Get the maximum sequence length in the batch
-        max_seq_len = max(len(item["dynamic_indices"]) for item in valid_items)
-
-        # Initialize the tensors with the correct shape
-        dynamic_indices = torch.zeros((len(valid_items), max_seq_len), dtype=torch.float64, device=device)
-        dynamic_counts = torch.zeros((len(valid_items), max_seq_len), dtype=torch.float, device=device)
-        labels = torch.zeros((len(valid_items),), dtype=torch.bool, device=device)
-
-        # Populate the tensors with the data from valid items
-        for i, item in enumerate(valid_items):
-            seq_len = len(item["dynamic_indices"])
-            dynamic_indices[i, :seq_len] = torch.tensor(item["dynamic_indices"][:seq_len], dtype=torch.long)
-            dynamic_counts[i, :seq_len] = torch.tensor(item["dynamic_counts"][:seq_len], dtype=torch.float)
-            labels[i] = item["labels"]
-
-        out_batch = {
-            "dynamic_indices": dynamic_indices,
-            "dynamic_counts": dynamic_counts,
-            "labels": labels
-        }
-
-        print(f"Batch after collation: {out_batch}")
-        print(f"Tensor shapes and types:")
-        for key, value in out_batch.items():
-            print(f"{key}: {value.shape}, {value.dtype}")
-
-        # Process task-specific labels
-        self._register_start("collate_task_labels")
+@TimeableMixin.TimeAs
+def collate(self, batch: list[DATA_ITEM_T]) -> PytorchBatch:
+    print(f"Collating batch of size: {len(batch)}")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Filter out items with None labels
+    valid_items = [item for item in batch if item["labels"] is not None]
+    if not valid_items:
+        # If all items have None labels, return None
+        return None
+    
+    # Get the maximum sequence length in the batch
+    max_seq_len = max(len(item["dynamic_indices"]) for item in valid_items)
+    
+    # Initialize the tensors with the correct shape
+    dynamic_indices = torch.zeros((len(valid_items), max_seq_len), dtype=torch.long, device=device)
+    dynamic_counts = torch.zeros((len(valid_items), max_seq_len), dtype=torch.float, device=device)
+    labels = torch.zeros((len(valid_items),), dtype=torch.float, device=device)
+    
+    # Populate the tensors with the data from valid items
+    for i, item in enumerate(valid_items):
+        seq_len = len(item["dynamic_indices"])
+        dynamic_indices[i, :seq_len] = torch.tensor(item["dynamic_indices"][:seq_len], dtype=torch.long)
+        dynamic_counts[i, :seq_len] = torch.tensor(item["dynamic_counts"][:seq_len], dtype=torch.float)
+        labels[i] = item["labels"]
+    
+    out_batch = {
+        "dynamic_indices": dynamic_indices,
+        "dynamic_counts": dynamic_counts,
+        "labels": labels
+    }
+    
+    # Process task-specific labels
+    if self.has_task:
         out_labels = {}
-        if self.has_task:
-            for task in self.tasks:
-                task_type = self.task_types[task]
-                task_idx = self.tasks.index(task)
-                out_labels[task] = labels[:, task_idx]
-                if task_type == "multi_class_classification":
-                    out_labels[task] = out_labels[task].long()
-                elif task_type == "binary_classification":
-                    out_labels[task] = out_labels[task].float()
-                elif task_type == "regression":
-                    out_labels[task] = out_labels[task].float()
-                else:
-                    raise TypeError(f"Don't know how to tensorify task of type {task_type}!")
-
-            out_batch['stream_labels'] = out_labels
-        self._register_end("collate_task_labels")
-
-        # Ensure only valid keyword arguments are passed to PytorchBatch
-        valid_keys = PytorchBatch.__annotations__.keys()
-        out_batch_filtered = {k: v for k, v in out_batch.items() if k in valid_keys}
-
-        return PytorchBatch(**out_batch_filtered).to(device)
+        for task in self.tasks:
+            task_type = self.task_types[task]
+            if task_type == "multi_class_classification":
+                out_labels[task] = labels.long()
+            elif task_type in ["binary_classification", "regression"]:
+                out_labels[task] = labels.float()
+            else:
+                raise TypeError(f"Don't know how to tensorify task of type {task_type}!")
+        out_batch['stream_labels'] = out_labels
+    
+    # Ensure only valid keyword arguments are passed to PytorchBatch
+    valid_keys = PytorchBatch.__annotations__.keys()
+    out_batch_filtered = {k: v for k, v in out_batch.items() if k in valid_keys}
+    
+    print(f"Collation completed. Returning batch of size: {len(out_batch_filtered)}")
+    return PytorchBatch(**out_batch_filtered).to(device)

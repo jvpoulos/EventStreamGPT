@@ -49,6 +49,7 @@ from ...data.types import PytorchBatch
 from pytorch_lightning.loggers import WandbLogger
 
 import time
+from torch.utils.data import DataLoader
 import torch.multiprocessing as mp
 
 import logging
@@ -64,9 +65,9 @@ def get_config_value(config, key, default=None):
         return config.get(key, default)
     return getattr(config, key, default)
 
-class TimeoutDataLoader(torch.utils.data.DataLoader):
+class TimeoutDataLoader(DataLoader):
     def __init__(self, *args, **kwargs):
-        self.timeout = kwargs.pop('timeout', 60)  # Default timeout of 60 seconds
+        self.timeout = kwargs.pop('timeout', 600)  # Default timeout of 600 seconds (10 minutes)
         super().__init__(*args, **kwargs)
 
     def __iter__(self):
@@ -76,17 +77,22 @@ class TimeoutDataLoaderIter:
     def __init__(self, iterator, timeout):
         self.iterator = iterator
         self.timeout = timeout
+        self.start_time = time.time()
 
     def __next__(self):
-        start = time.time()
-        while True:
-            try:
-                return next(self.iterator)
-            except StopIteration:
-                raise
-            except Exception as e:
-                if time.time() - start > self.timeout:
-                    raise TimeoutError(f"DataLoader timed out after {self.timeout} seconds") from e
+        if self.timeout <= 0:  # If timeout is 0 or negative, don't apply timeout
+            return next(self.iterator)
+        
+        elapsed_time = time.time() - self.start_time
+        if elapsed_time > self.timeout:
+            raise TimeoutError(f"DataLoader timed out after {elapsed_time:.2f} seconds")
+        
+        try:
+            return next(self.iterator)
+        except StopIteration:
+            raise
+        except Exception as e:
+            raise TimeoutError(f"DataLoader encountered an error after {elapsed_time:.2f} seconds: {str(e)}")
 
 class ESTForStreamClassificationLM(L.LightningModule):
     def __init__(
@@ -602,7 +608,6 @@ class FinetuneConfig:
             print(f"Setting wandb project to {reloaded_pretrain_config.wandb_logger_kwargs.project}")
             self.wandb_logger_kwargs["project"] = reloaded_pretrain_config.wandb_logger_kwargs.project
 
-
 class CollateFunction:
     def __init__(self, vocab_size):
         self.vocab_size = vocab_size
@@ -698,8 +703,8 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, wandb_logger
             logger.info(f"Item {i}: {item}")
 
         logger.info("Creating data loaders")
-        collate_fn = CollateFunction(config.vocab_size)
 
+        collate_fn = CollateFunction(config.vocab_size)
         train_dataloader = TimeoutDataLoader(
             train_pyd,
             batch_size=optimization_config['batch_size'],
