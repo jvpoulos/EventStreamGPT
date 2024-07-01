@@ -739,28 +739,48 @@ class DatasetBase(
         event_ids = self.held_out_events_df["event_id"]
         return self._filter_col_inclusion(self.dynamic_measurements_df, {"event_id": list(event_ids)})
 
+    @abc.abstractmethod
+    def _convert_dynamic_indices_to_indices(self):
+        """Convert dynamic_indices from categorical codes to indices."""
+        raise NotImplementedError("This method must be implemented by a subclass.")
+
+    @abc.abstractmethod
+    def _create_code_mapping(self):
+        """Create a mapping from categorical codes to indices."""
+        raise NotImplementedError("This method must be implemented by a subclass.")
+
     @TimeableMixin.TimeAs
     def preprocess(self):
-        """Fits all pre-processing parameters over the train set, then transforms all observations.
-
-        This entails the following steps:
-
-        1. First, filter out subjects that have too few events.
-        2. Next, pre-compute the `FUNCTIONAL_TIME_DEPENDENT` temporality measurements and store their values
-           in the events dataframe.
-        3. Next, fit all pre-processing parameters over the observed measurements.
-        4. Finally, transform all data via the fit pre-processing parameters.
-        """
+        """Preprocesses the dataset."""
         print("Starting preprocessing...")
+        
         self._filter_subjects()
         print("Finished filtering subjects.")
+        
         self._add_time_dependent_measurements()
         print("Finished adding time-dependent measurements.")
+        
+        self._create_code_mapping()
+        print("Finished creating code mapping.")
+        
+        self._convert_dynamic_indices_to_indices()
+        print("Finished converting dynamic indices to indices.")
+        
+        if not hasattr(self, 'code_mapping') or self.code_mapping is None:
+            print("Warning: code_mapping is not available. inverse_mapping will not be created.")
+        else:
+            self.inverse_mapping = {idx: code for code, idx in self.code_mapping.items()}
+            print("Created inverse mapping.")
+        
         self.fit_measurements()
         print("Finished fitting measurements.")
+        
         self.transform_measurements()
         print("Finished transforming measurements.")
+        
         print("Preprocessing completed successfully.")
+
+    # ... (rest of the existing code) ...
 
     @TimeableMixin.TimeAs
     @abc.abstractmethod
@@ -1410,6 +1430,8 @@ class DatasetBase(
                     "timestamp",
                     "dynamic_indices",
                     "dynamic_counts",
+                    "InitialA1c", "Female", "Married", "GovIns", 
+                    "English", "AgeYears", "SDI_score", "Veteran"
                 ]
 
                 split_cached_df = split_cached_df.select(select_columns)

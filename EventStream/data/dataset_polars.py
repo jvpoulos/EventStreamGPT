@@ -99,7 +99,8 @@ class Dataset(DatasetBase):
             config = DatasetConfig.from_dict(config)
 
         self.config = config
-        self.code_mapping = code_mapping
+        self.code_mapping = code_mapping or self._create_code_mapping()
+        self.inverse_mapping = {v: k for k, v in self.code_mapping.items()}
 
         # Initialize the necessary attributes
         self.subjects_df = subjects_df
@@ -1105,6 +1106,12 @@ class Dataset(DatasetBase):
         else:
             return measurement_metadata
 
+    def _create_code_mapping(self):
+        # Collect all unique codes from dynamic_measurements_df
+        all_codes = set(self.dynamic_measurements_df['CodeWithType'].unique())
+        # Create a mapping from codes to indices, starting from 1
+        return {code: idx for idx, code in enumerate(sorted(all_codes), start=1)}
+
     def preprocess(self):
         print("Starting preprocessing...")
         self._filter_subjects()
@@ -1112,16 +1119,21 @@ class Dataset(DatasetBase):
         self._add_time_dependent_measurements()
         print("Finished adding time-dependent measurements.")
         
-        if not hasattr(self, 'code_mapping') or self.code_mapping is None:
-            print("Warning: code_mapping is not available. inverse_mapping will not be created.")
-        else:
-            self.inverse_mapping = {idx: code for code, idx in self.code_mapping.items()}
+        self._create_code_mapping()
+        self._convert_dynamic_indices_to_indices()
+
+        self.inverse_mapping = {idx: code for code, idx in self.code_mapping.items()}
         
         self.fit_measurements()
         print("Finished fitting measurements.")
         self.transform_measurements()
         print("Finished transforming measurements.")
         print("Preprocessing completed successfully.")
+
+    def _convert_dynamic_indices_to_indices(self):
+        self.dynamic_measurements_df = self.dynamic_measurements_df.with_columns([
+            pl.col('CodeWithType').map_dict(self.code_mapping).alias('dynamic_indices')
+        ])
 
     @TimeableMixin.TimeAs
     def _fit_vocabulary(self, measure: str, config: MeasurementConfig, source_df: DF_T) -> Vocabulary:
@@ -1518,7 +1530,10 @@ class Dataset(DatasetBase):
         static_data = subjects_df.select(
             "subject_id",
             *[pl.col(m).alias(f"static_indices_{m}") for m in subject_measures],
-            *[(pl.col(m).is_null().cast(pl.Int32) == 0).alias(f"static_counts_{m}") for m in subject_measures]
+            *[(pl.col(m).is_null().cast(pl.Int32) == 0).alias(f"static_counts_{m}") for m in subject_measures],
+            # Add these new columns
+            "InitialA1c", "Female", "Married", "GovIns", 
+            "English", "AgeYears", "SDI_score", "Veteran"
         )
 
         print("Checking dynamic_measurements_df for null or invalid values")
@@ -1530,10 +1545,7 @@ class Dataset(DatasetBase):
         dynamic_data = dynamic_measurements_df.select(
             "event_id",
             pl.col("dynamic_indices"),
-            pl.when(pl.col("dynamic_indices").is_not_null() & (pl.col("dynamic_indices") != ""))
-            .then(1)
-            .otherwise(0)
-            .alias("dynamic_counts")
+            pl.lit(1).alias("dynamic_counts")  # Set all counts to 1
         )
 
         event_data = events_df.select(

@@ -494,8 +494,8 @@ class StructuredTransformerConfig(PretrainedConfig):
         measurements_per_dep_graph_level: list[list[MEAS_INDEX_GROUP_T]] | None = None,
         max_seq_len: int = 256,
         do_split_embeddings: bool = False,
-        categorical_embedding_dim: int | None = None,
-        numerical_embedding_dim: int | None = None,
+        categorical_embedding_dim: int = 64,  # Set a default value
+        numerical_embedding_dim: int = 32,
         static_embedding_mode: StaticEmbeddingMode = StaticEmbeddingMode.SUM_ALL,
         static_embedding_weight: float = 0.5,
         dynamic_embedding_weight: float = 0.5,

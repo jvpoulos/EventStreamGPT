@@ -1,5 +1,6 @@
 """A model for fine-tuning on classification tasks."""
 import torch
+from torch import nn
 import torch.nn.functional as F
 from torch.nn import LayerNorm
 from torchmetrics.classification import BinaryAUROC
@@ -65,99 +66,107 @@ class ESTForStreamClassification(StructuredTransformerPreTrainedModel):
         # Initialize dropout
         self.dropout = torch.nn.Dropout(config.intermediate_dropout)
 
-        # Add intermediate layers
-        self.intermediate = torch.nn.Sequential(
-            torch.nn.Linear(config.hidden_size, config.hidden_size),
-            torch.nn.ReLU(),
+        # Add embeddings for categorical variables
+        self.categorical_embeddings = nn.ModuleDict({
+            'Female': nn.Embedding(2, config.hidden_size),
+            'Married': nn.Embedding(2, config.hidden_size),
+            'GovIns': nn.Embedding(2, config.hidden_size),
+            'English': nn.Embedding(2, config.hidden_size),
+            'Veteran': nn.Embedding(2, config.hidden_size)
+        })
+        
+        # Linear layer for continuous variables
+        self.continuous_encoder = nn.Linear(3, config.hidden_size)
+        
+        # Adjust the input size of the first layer in self.intermediate
+        self.intermediate = nn.Sequential(
+            nn.Linear(config.hidden_size, config.hidden_size),
+            nn.ReLU(),
             LayerNorm(config.hidden_size),
             self.dropout
         )
+
+        self.static_weight = nn.Parameter(torch.tensor(config.static_embedding_weight))
+        self.dynamic_weight = nn.Parameter(torch.tensor(config.dynamic_embedding_weight))
         
     def forward(self, batch: dict, labels=None):
         device = self.logit_layer.weight.device
         
-        # Move batch data to the correct device
+        # Process dynamic data
         dynamic_indices = batch['dynamic_indices'].to(device)
-        dynamic_counts = batch['dynamic_counts'].to(device)
+        dynamic_counts = torch.nan_to_num(batch['dynamic_counts'].to(device), nan=0.0)
         
-        # Replace NaN values with 0
-        dynamic_counts = torch.nan_to_num(dynamic_counts, nan=0.0)
-        
-        # Check vocab size
+        # Validate vocab size
         max_index = dynamic_indices.max().item()
-        vocab_size = self.config.vocab_size
-        if max_index >= vocab_size:
-            raise ValueError(f"Max index in dynamic_indices ({max_index}) is >= vocab_size ({vocab_size})")
+        if max_index >= self.config.vocab_size:
+            raise ValueError(f"Max index in dynamic_indices ({max_index}) is >= vocab_size ({self.config.vocab_size})")
 
-        # Create PytorchBatch object
-        pytorch_batch = PytorchBatch(
-            dynamic_indices=dynamic_indices,
-            dynamic_counts=dynamic_counts
-        )
+        # Process static data
+        static_categorical = {k: batch[k].to(device) for k in ['Female', 'Married', 'GovIns', 'English', 'Veteran']}
+        static_continuous = torch.stack([
+            batch['InitialA1c'].to(device),
+            batch['AgeYears'].to(device), 
+            batch['SDI_score'].to(device)
+        ], dim=1)
         
-        try:
-            # Get encoded representation from the encoder
-            encoded = self.encoder(pytorch_batch).last_hidden_state
-        except AssertionError as e:
-            logger.error(f"AssertionError in encoder: {str(e)}")
-            logger.error(f"dynamic_indices shape: {dynamic_indices.shape}")
-            logger.error(f"dynamic_counts shape: {dynamic_counts.shape}")
-            raise
+        # Encode dynamic data
+        pytorch_batch = PytorchBatch(dynamic_indices=dynamic_indices, dynamic_counts=dynamic_counts)
+        encoded = self.encoder(pytorch_batch).last_hidden_state
         
         # Extract relevant encoded information
-        if self._uses_dep_graph:
-            event_encoded = encoded[:, :, -1, :]
-        else:
-            event_encoded = encoded
+        event_encoded = encoded[:, :, -1, :] if self._uses_dep_graph else encoded
         
-        # Apply pooling
+        # Apply pooling to dynamic data
         if self.pooling_method == "mean":
-            pooled = event_encoded.mean(dim=1)
+            pooled_dynamic = event_encoded.mean(dim=1)
         elif self.pooling_method == "max":
-            pooled = event_encoded.max(dim=1)[0]
+            pooled_dynamic = event_encoded.max(dim=1)[0]
         else:
             raise ValueError(f"Unknown pooling method: {self.pooling_method}")
-      
-        if self.training:
-            # Apply gradient clipping
-            torch.nn.utils.clip_grad_norm_(self.parameters(), self.max_grad_norm)
-
-        # Apply intermediate layers
-        intermediate = self.intermediate(pooled)
-
-        # Apply dropout
-        intermediate = self.dropout(intermediate)
         
-        # Get logits
+        # Encode static data
+        static_cat_embeds = [self.categorical_embeddings[k](static_categorical[k]) for k in static_categorical]
+        static_cat_embed = torch.stack(static_cat_embeds, dim=1).mean(dim=1)
+        static_num_embed = self.continuous_encoder(static_continuous)
+
+        # Combine static embeddings
+        static_embed = static_cat_embed + static_num_embed
+
+        # Combine dynamic and static embeddings
+        combined_embed = self.static_weight * static_embed + self.dynamic_weight * pooled_dynamic
+        
+        # Apply intermediate layers and dropout
+        intermediate = self.dropout(self.intermediate(combined_embed))
+        
+        # Get logits and probabilities
         logits = self.logit_layer(intermediate).squeeze(-1)
-        
-        # Apply sigmoid to get probabilities
         probs = torch.sigmoid(logits)
-    
-        # Compute loss if labels are provided
+        
+        # Compute loss and metrics if labels are provided
+        loss, accuracy, auc = None, None, None
         if labels is not None:
-            labels = labels.to(logits.device).float()
+            labels = labels.to(device).float()
             loss = self.criteria(logits, labels)
-            
-            # Compute additional metrics
             with torch.no_grad():
                 self.auroc.update(probs, labels.int())
                 auc = self.auroc.compute()
                 accuracy = ((probs > 0.5) == labels).float().mean()
+        
+        # Apply gradient clipping if in training mode
+        if self.training:
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), self.max_grad_norm)
         else:
-            loss = None
-            auc = None
-            accuracy = None
+            grad_norm = torch.tensor(0.0)
         
         # Collect debugging information
         debug_info = {
             "encoded_mean": encoded.mean().item(),
             "encoded_std": encoded.std().item(),
-            "pooled_mean": pooled.mean().item(),
-            "pooled_std": pooled.std().item(),
+            "combined_embed_mean": combined_embed.mean().item(),
+            "combined_embed_std": combined_embed.std().item(),
             "logits_mean": logits.mean().item(),
             "logits_std": logits.std().item(),
-            "gradient_norm": torch.nn.utils.clip_grad_norm_(self.parameters(), self.max_grad_norm).item(),
+            "gradient_norm": grad_norm.item(),
         }
         
         logger.debug(f"Debug info: {debug_info}")
@@ -170,7 +179,7 @@ class ESTForStreamClassification(StructuredTransformerPreTrainedModel):
             auc=auc,
             debug_info=debug_info
         )
-        
+    
     @property
     def _uses_dep_graph(self):
         return self.config.structured_event_processing_mode == StructuredEventProcessingMode.NESTED_ATTENTION
