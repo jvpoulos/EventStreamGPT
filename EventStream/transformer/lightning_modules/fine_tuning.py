@@ -680,11 +680,11 @@ class CollateFunction:
             
             if 'dynamic_indices' not in item or item['dynamic_indices'] is None:
                 self.logger.warning(f"Item {i} has missing or None dynamic_indices, using default")
-                item['dynamic_indices'] = [0]  # Use a default value
+                item['dynamic_indices'] = torch.tensor([0], dtype=torch.long)  # Use 0 for padding
             
-            if not isinstance(item['dynamic_indices'], (list, torch.Tensor)) or len(item['dynamic_indices']) == 0:
+            if not isinstance(item['dynamic_indices'], torch.Tensor) or item['dynamic_indices'].numel() == 0:
                 self.logger.warning(f"Invalid dynamic_indices in item {i}, using default")
-                item['dynamic_indices'] = [0]  # Use a default value
+                item['dynamic_indices'] = torch.tensor([0], dtype=torch.long)  # Use 0 for padding
             
             valid_items.append(item)
 
@@ -692,40 +692,31 @@ class CollateFunction:
             self.logger.error("No valid items found in batch")
             raise ValueError("No valid items in batch")
 
-        max_allowed_index = self.vocab_size - 1
+        max_seq_len = max(item['dynamic_indices'].size(0) for item in valid_items)
 
-        try:
-            dynamic_indices = self.safe_pad_sequence([item['dynamic_indices'] for item in valid_items], max_allowed_index, torch.long)
-            if dynamic_indices.numel() == 0:
-                self.logger.warning("dynamic_indices is empty after padding, using default")
-                dynamic_indices = torch.zeros((len(valid_items), 1), dtype=torch.long)
+        dynamic_indices = torch.zeros((len(valid_items), max_seq_len), dtype=torch.long)
+        dynamic_counts = torch.zeros((len(valid_items), max_seq_len), dtype=torch.float32)
 
-            dynamic_counts = self.safe_pad_sequence([item.get('dynamic_counts', [1.0]) for item in valid_items], float('inf'), torch.float32)
+        for i, item in enumerate(valid_items):
+            seq_len = item['dynamic_indices'].size(0)
+            dynamic_indices[i, :seq_len] = item['dynamic_indices']
+            dynamic_counts[i, :seq_len] = item['dynamic_counts'][:seq_len]
 
-            # Ensure dynamic_indices and dynamic_counts have the same sequence length
-            max_seq_len = max(dynamic_indices.size(1), dynamic_counts.size(1))
-            dynamic_indices = torch.nn.functional.pad(dynamic_indices, (0, max_seq_len - dynamic_indices.size(1)))
-            dynamic_counts = torch.nn.functional.pad(dynamic_counts, (0, max_seq_len - dynamic_counts.size(1)))
+        collated_batch = {
+            'dynamic_indices': dynamic_indices,
+            'dynamic_counts': dynamic_counts,
+            'labels': torch.stack([self.safe_tensor_conversion(item.get('labels', 0), torch.float32) for item in valid_items]).squeeze(),
+            'InitialA1c': torch.tensor([self.safe_float_conversion(item.get('InitialA1c', 0.0)) for item in valid_items], dtype=torch.float32),
+            'Female': torch.tensor([self.safe_int_conversion(item.get('Female', 0)) for item in valid_items], dtype=torch.long),
+            'Married': torch.tensor([self.safe_int_conversion(item.get('Married', 0)) for item in valid_items], dtype=torch.long),
+            'GovIns': torch.tensor([self.safe_int_conversion(item.get('GovIns', 0)) for item in valid_items], dtype=torch.long),
+            'English': torch.tensor([self.safe_int_conversion(item.get('English', 0)) for item in valid_items], dtype=torch.long),
+            'AgeYears': torch.tensor([self.safe_float_conversion(item.get('AgeYears', 0.0)) for item in valid_items], dtype=torch.float32),
+            'SDI_score': torch.tensor([self.safe_float_conversion(item.get('SDI_score', 0.0)) for item in valid_items], dtype=torch.float32),
+            'Veteran': torch.tensor([self.safe_int_conversion(item.get('Veteran', 0)) for item in valid_items], dtype=torch.long),
+        }
 
-            collated_batch = {
-                'dynamic_indices': dynamic_indices.cpu(),
-                'dynamic_counts': dynamic_counts.cpu(),
-                'labels': torch.stack([self.safe_tensor_conversion(item.get('labels', 0), torch.float32) for item in valid_items]).squeeze().cpu(),
-                'InitialA1c': torch.tensor([self.safe_float_conversion(item.get('InitialA1c', 0.0)) for item in valid_items], dtype=torch.float32).cpu(),
-                'Female': torch.tensor([self.safe_int_conversion(item.get('Female', 0)) for item in valid_items], dtype=torch.long).cpu(),
-                'Married': torch.tensor([self.safe_int_conversion(item.get('Married', 0)) for item in valid_items], dtype=torch.long).cpu(),
-                'GovIns': torch.tensor([self.safe_int_conversion(item.get('GovIns', 0)) for item in valid_items], dtype=torch.long).cpu(),
-                'English': torch.tensor([self.safe_int_conversion(item.get('English', 0)) for item in valid_items], dtype=torch.long).cpu(),
-                'AgeYears': torch.tensor([self.safe_float_conversion(item.get('AgeYears', 0.0)) for item in valid_items], dtype=torch.float32).cpu(),
-                'SDI_score': torch.tensor([self.safe_float_conversion(item.get('SDI_score', 0.0)) for item in valid_items], dtype=torch.float32).cpu(),
-                'Veteran': torch.tensor([self.safe_int_conversion(item.get('Veteran', 0)) for item in valid_items], dtype=torch.long).cpu(),
-            }
-
-            return collated_batch
-
-        except Exception as e:
-            self.logger.exception(f"Error in collate_fn: {str(e)}")
-            raise
+        return collated_batch
 
     def safe_tensor_conversion(self, value, dtype):
         if value is None:
@@ -826,10 +817,14 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, wandb_logger
         held_out_dataloader = create_dataloader(held_out_pyd, optimization_config['validation_batch_size'], False)
 
         for i, batch in enumerate(train_dataloader):
-            if i == 0:  # Just check the first batch
-                logger.info(f"First batch shape: {batch['dynamic_indices'].shape}")
-                logger.info(f"First batch dynamic_indices: {batch['dynamic_indices']}")
-            break
+            if i < 5:  # Check the first 5 batches
+                logger.info(f"Batch {i} shape: {batch['dynamic_indices'].shape}")
+                logger.info(f"Batch {i} unique values: {torch.unique(batch['dynamic_indices'])}")
+                for row in range(min(5, batch['dynamic_indices'].size(0))):  # Check the first 5 rows of each batch
+                    logger.info(f"Batch {i}, Row {row}, dynamic_indices: {batch['dynamic_indices'][row]}")
+                    logger.info(f"Batch {i}, Row {row}, non-zero indices: {batch['dynamic_indices'][row].nonzero().flatten()}")
+            else:
+                break
 
         callbacks = [
             LearningRateMonitor(logging_interval="step"),
@@ -844,11 +839,11 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, wandb_logger
                 auto_insert_metric_name=False,
             ),
             EarlyStopping(
-                monitor='val_loss',
+                monitor='val_auc_epoch',
                 min_delta=0.00,
                 patience=cfg.optimization_config['patience'],
-                verbose=False,
-                mode='min'
+                verbose=True,
+                mode='max'
             )
         ]
 
