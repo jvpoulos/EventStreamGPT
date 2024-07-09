@@ -103,7 +103,6 @@ class ESTForStreamClassificationLM(L.LightningModule):
         do_debug_mode: bool = True,
         **model_params
     ):
-        """Initializes the Lightning Module."""
         super().__init__()
         if isinstance(config, dict):
             config = StructuredTransformerConfig(**config)
@@ -114,25 +113,38 @@ class ESTForStreamClassificationLM(L.LightningModule):
         self.optimization_config = optimization_config
         self.cfg = cfg
         self.do_debug_mode = do_debug_mode
-        self.code_mapping = self._load_code_mapping()
-        self.inverse_mapping = {v: k for k, v in self.code_mapping.items()}
         
-        # Use the optimization_config object directly since we've already converted it
-        self.learning_rate = get_config_value(optimization_config, 'init_lr', 1e-3)
-        self.num_training_steps = optimization_config.max_training_steps
-        self.weight_decay = optimization_config.weight_decay
-        self.use_lr_scheduler = getattr(optimization_config, 'use_lr_scheduler', False)
-        self.lr_scheduler_type = getattr(optimization_config, 'lr_scheduler_type', 'cosine')
-        self.end_lr = optimization_config.end_lr
-        self.end_lr_frac_of_init_lr = optimization_config.end_lr_frac_of_init_lr
+        # Initialize metrics dictionaries
         self.train_metrics = {}
         self.val_metrics = {}
         self.test_metrics = {}
 
+        # Explicitly set these as class attributes
+        self.learning_rate = self.optimization_config.init_lr
+        self.num_training_steps = self.optimization_config.max_training_steps
+        self.weight_decay = self.optimization_config.weight_decay
+        self.use_lr_scheduler = self.optimization_config.use_lr_scheduler
+        self.lr_scheduler_type = self.optimization_config.lr_scheduler_type
+        self.end_lr = self.optimization_config.end_lr
+        self.end_lr_frac_of_init_lr = self.optimization_config.end_lr_frac_of_init_lr
+        self.use_grad_value_clipping = self.optimization_config.use_grad_value_clipping
+        self.clip_grad_value = self.optimization_config.clip_grad_value
+
+        # Load the vocabulary_config from a file
+        vocabulary_config_path = "data/vocabulary_config.json"
+        with open(vocabulary_config_path, "r") as f:
+            vocabulary_config_dict = json.load(f)
+        vocabulary_config = VocabularyConfig.from_dict(vocabulary_config_dict)
+
+        if pretrained_weights_fp is None or pretrained_weights_fp == "skip":
+            self.model = ESTForStreamClassification(config, vocabulary_config, self.optimization_config)
+        else:
+            self.model = ESTForStreamClassification.from_pretrained(pretrained_weights_fp, config=config, vocabulary_config=vocabulary_config, optimization_config=self.optimization_config)
+
         self.save_hyperparameters(
             {
                 "config": config.to_dict(),
-                "optimization_config": dataclasses.asdict(optimization_config),
+                "optimization_config": dataclasses.asdict(self.optimization_config),
             }
         )
         self.build_metrics()
@@ -144,9 +156,9 @@ class ESTForStreamClassificationLM(L.LightningModule):
         vocabulary_config = VocabularyConfig.from_dict(vocabulary_config_dict)
 
         if pretrained_weights_fp is None or pretrained_weights_fp == "skip":
-            self.model = ESTForStreamClassification(config, vocabulary_config)
+            self.model = ESTForStreamClassification(config, vocabulary_config, self.optimization_config)
         else:
-            self.model = ESTForStreamClassification.from_pretrained(pretrained_weights_fp, config=config, vocabulary_config=vocabulary_config)
+            self.model = ESTForStreamClassification.from_pretrained(pretrained_weights_fp, config=config, vocabulary_config=vocabulary_config, optimization_config=self.optimization_config)
 
     def __reduce__(self):
         return (self.__class__, (self.config, self.optimization_config, self.cfg))
@@ -267,76 +279,82 @@ class ESTForStreamClassificationLM(L.LightningModule):
         loss = outputs.loss
         
         if loss is not None:
+            if self.do_debug_mode:
+                logger.debug(f"Training step - Logits shape: {outputs.preds.shape}")
+                logger.debug(f"Training step - Labels shape: {outputs.labels.shape}")
+                logger.debug(f"Training step - Loss: {loss.item()}")
+
             self.log('train_loss', loss, on_step=True, on_epoch=False, prog_bar=True, logger=True)
-            self.log('train_accuracy', outputs.accuracy, on_step=True, on_epoch=False, prog_bar=True, logger=True)
+            
+            if outputs.accuracy is not None:
+                self.log('train_accuracy', outputs.accuracy, on_step=True, on_epoch=False, prog_bar=True, logger=True)
             
             # Accumulate metrics
             self._accumulate_metrics('train', {
                 'loss': loss.item(),
-                'accuracy': outputs.accuracy,
+                'accuracy': outputs.accuracy if outputs.accuracy is not None else 0.0,
                 'auc': outputs.auc if outputs.auc is not None else 0.0,
             })
-            
-            # Debugging print statements
-            if batch_idx % 100 == 0:
-                logger.info(f"Step {batch_idx}: train_loss={loss.item():.4f}, train_accuracy={outputs.accuracy:.4f}")
-            
-            # Log gradient norm
-            if self.global_step % 100 == 0:
-                grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=5.0)
-                self.log('grad_norm', grad_norm)
         
         return loss
 
     def validation_step(self, batch, batch_idx):
-        logger.debug(f"Validation step - Batch keys: {batch.keys() if batch is not None else 'None'}")
+        outputs = self.model(batch, labels=batch['labels'])
+        loss = outputs.loss
         
-        if batch is None:
-            logger.warning(f"Received None batch in validation step (batch_idx: {batch_idx})")
-            return None
+        if loss is not None:
+            if self.do_debug_mode:
+                logger.debug(f"Validation step - Logits shape: {outputs.preds.shape}")
+                logger.debug(f"Validation step - Labels shape: {outputs.labels.shape}")
+                logger.debug(f"Validation step - Loss: {loss.item()}")
+
+            self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+            
+            if outputs.accuracy is not None:
+                self.log('val_accuracy', outputs.accuracy, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+            
+            # Accumulate metrics
+            self._accumulate_metrics('val', {
+                'loss': loss.item(),
+                'accuracy': outputs.accuracy if outputs.accuracy is not None else 0.0,
+                'auc': outputs.auc if outputs.auc is not None else 0.0,
+            })
         
-        if 'labels' not in batch:
-            logger.warning(f"'labels' not found in batch (batch_idx: {batch_idx}). Batch keys: {batch.keys()}")
-            return None
+        return loss
+
+    def _accumulate_metrics(self, prefix, metrics):
+        for key, value in metrics.items():
+            if isinstance(value, torch.Tensor):
+                value = value.item()
+            if key not in self.__dict__[f'{prefix}_metrics']:
+                self.__dict__[f'{prefix}_metrics'][key] = []
+            self.__dict__[f'{prefix}_metrics'][key].append(value)
+
+    def _log_epoch_metrics(self, prefix):
+        metrics = self.__dict__[f'{prefix}_metrics']
+        for key, values in metrics.items():
+            if values:  # Check if the list is not empty
+                avg_value = sum(values) / len(values)
+                self.log(f'{prefix}_{key}_epoch', avg_value, on_step=False, on_epoch=True, logger=True)
         
-        try:
-            outputs = self.model(batch, labels=batch['labels'])
-            loss = outputs.loss
-            
-            # Add learning rate to debug info
-            if outputs.debug_info is not None:
-                outputs.debug_info["learning_rate"] = self.trainer.optimizers[0].param_groups[0]['lr']
-            
-            logger.debug(f"Model outputs: {outputs}")
-            logger.debug(f"Loss: {loss}")
-            
-            if loss is not None:
-                if torch.isnan(loss):
-                    logger.error("NaN loss detected in validation step")
-                    logger.error(f"Batch that caused NaN loss: {batch}")
-                    self.log('val_loss', torch.tensor(float('inf')))
-                    return None
-                
-                # Accumulate metrics
-                self._accumulate_metrics('val', {
-                    'loss': loss.item(),
-                    'accuracy': outputs.accuracy,
-                    'auc': outputs.auc if outputs.auc is not None else BinaryAUROC()(outputs.preds, batch['labels']).item(),
-                })
-         
-                self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-                self.log('val_loss_epoch', loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-                
-            # Log debugging information
-            if outputs.debug_info:
-                for key, value in outputs.debug_info.items():
-                    self._accumulate_metrics('val', {f'debug_{key}': value})
-            
-            return {'val_loss': loss, 'val_loss_epoch': loss}
+        # Clear accumulated metrics
+        self.__dict__[f'{prefix}_metrics'].clear()
+
+    def on_train_epoch_end(self):
+        self._log_epoch_metrics('train')
+
+    def on_validation_epoch_end(self):
+        self._log_epoch_metrics('val')
+
+    def on_after_backward(self):
+        # Apply grad_value clipping if enabled
+        if self.use_grad_value_clipping:
+            torch.nn.utils.clip_grad_value_(self.parameters(), self.clip_grad_value)
         
-        except Exception as e:
-            logger.exception(f"Error in validation step (batch_idx: {batch_idx}): {str(e)}")
-            return None
+        # Log gradient norm
+        if self.global_step % 100 == 0:
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=5.0)
+            self.log('grad_norm', grad_norm)
 
     def test_step(self, batch, batch_idx):
         logger.debug(f"Test step - Batch keys: {batch.keys() if batch is not None else 'None'}")
@@ -391,33 +409,11 @@ class ESTForStreamClassificationLM(L.LightningModule):
         
         return outputs.last_hidden_state if hasattr(outputs, 'last_hidden_state') else outputs
 
-    def _accumulate_metrics(self, prefix, metrics):
-        for key, value in metrics.items():
-            if key not in self.__dict__[f'{prefix}_metrics']:
-                self.__dict__[f'{prefix}_metrics'][key] = []
-            self.__dict__[f'{prefix}_metrics'][key].append(value)
-
     def on_train_epoch_end(self):
         self._log_epoch_metrics('train')
 
-    def on_validation_epoch_end(self):
-        self._log_epoch_metrics('val')
-
     def on_test_epoch_end(self):
         self._log_epoch_metrics('test')
-
-    def _log_epoch_metrics(self, prefix):
-        metrics = self.__dict__[f'{prefix}_metrics']
-        for key, values in metrics.items():
-            avg_value = sum(values) / len(values)
-            self.log(f'{prefix}_{key}_epoch', avg_value, on_step=False, on_epoch=True, logger=True)
-        
-        # Log learning rate
-        if prefix in ['train', 'val'] and self.trainer.optimizers:
-            self.log(f'{prefix}_learning_rate_epoch', self.trainer.optimizers[0].param_groups[0]['lr'], on_step=False, on_epoch=True, logger=True)
-        
-        # Clear accumulated metrics
-        self.__dict__[f'{prefix}_metrics'].clear()
 
     def configure_optimizers(self):
         # Group parameters by weight decay

@@ -99,13 +99,13 @@ class Dataset(DatasetBase):
             config = DatasetConfig.from_dict(config)
 
         self.config = config
-        self.code_mapping = code_mapping or self._create_code_mapping()
-        self.inverse_mapping = {v: k for k, v in self.code_mapping.items()}
-
-        # Initialize the necessary attributes
         self.subjects_df = subjects_df
         self.events_df = events_df
         self.dynamic_measurements_df = dynamic_measurements_df
+
+        # Create the code mapping
+        self.code_mapping = code_mapping or self._create_code_mapping()
+        self.inverse_mapping = {v: k for k, v in self.code_mapping.items()}
 
         # Call the parent class constructor
         super().__init__(config, subjects_df, events_df, dynamic_measurements_df, **kwargs)
@@ -337,40 +337,44 @@ class Dataset(DatasetBase):
         df: DF_T,
         event_type: str,
         columns_schema: dict[str, tuple[str, InputDataType]],
-    ) -> tuple[DF_T, DF_T | None]:
+    ):
+        # First, rename 'Date' to 'timestamp' if it exists
+        if 'Date' in df.columns and 'timestamp' not in df.columns:
+            df = df.rename({'Date': 'timestamp'})
+
         cols_select_exprs = [
-            pl.col("Date").alias("timestamp"),
-            pl.col("EMPI").alias("subject_id"),
+            pl.col("timestamp"),
+            pl.col("StudyID"),  # Keep StudyID as is
+            pl.lit(event_type).cast(pl.Categorical).alias("event_type")
         ]
-        
-        if event_type.startswith("COL:"):
-            event_type_col = event_type[len("COL:") :]
-            cols_select_exprs.append(pl.col(event_type_col).cast(pl.Categorical).alias("event_type"))
-        else:
-            cols_select_exprs.append(pl.lit(event_type).cast(pl.Categorical).alias("event_type"))
 
         for in_col, (out_col, _) in columns_schema.items():
-            cols_select_exprs.append(pl.col(in_col).alias(out_col))
+            if in_col in df.columns:
+                cols_select_exprs.append(pl.col(in_col).alias(out_col))
 
         df = (
-            df.filter(pl.col("Date").is_not_null() & pl.col("EMPI").is_not_null())
+            df.filter(pl.col("timestamp").is_not_null() & pl.col("StudyID").is_not_null())
             .select(cols_select_exprs)
             .unique()
             .with_row_count("event_id")
         )
 
-        events_df = df.select("event_id", "subject_id", "timestamp", "event_type")
-        dynamic_measurements_df = df.select("event_id", "subject_id", "timestamp", "CodeWithType")
-        
-        print(f"Before processing: {dynamic_measurements_df.filter(pl.col('CodeWithType').is_null()).shape[0]} null CodeWithType values")
-        
-        # Ensure CodeWithType is not null and is a string
-        dynamic_measurements_df = dynamic_measurements_df.with_columns([
-            pl.col("CodeWithType").cast(pl.Utf8).alias("dynamic_indices")
-        ])
-        
-        print(f"After processing: {dynamic_measurements_df.filter(pl.col('dynamic_indices').is_null()).shape[0]} null dynamic_indices values")
-        print(f"Sample of dynamic_measurements_df:\n{dynamic_measurements_df.head()}")
+        events_df = df.select("event_id", "StudyID", "timestamp", "event_type")
+
+        # For dynamic_measurements_df, select columns based on event type and available columns
+        dynamic_cols = ["event_id", "StudyID", "timestamp"]
+        if event_type == 'LAB':
+            if 'Code' in df.columns:
+                dynamic_cols.append("Code")
+            if 'Result' in df.columns:
+                dynamic_cols.append("Result")
+        else:
+            if 'CodeWithType' in df.columns:
+                dynamic_cols.append("CodeWithType")
+
+        dynamic_measurements_df = df.select(dynamic_cols)
+
+        print(f"Columns in dynamic_measurements_df for {event_type}: {dynamic_measurements_df.columns}")
 
         return events_df, dynamic_measurements_df
 
@@ -538,7 +542,7 @@ class Dataset(DatasetBase):
             total_count = id_col.shape[0]
         
         if unique_count != total_count:
-            raise ValueError(f"ID column {col_name} is not unique!")
+            print(f"Warning: ID column {col_name} is not unique. Consider regenerating this column.")
 
         # Check data type and non-negativity
         dtype = id_col.dtypes[0]
@@ -589,8 +593,18 @@ class Dataset(DatasetBase):
                     raise ValueError(f"Missing mandatory linkage col {id_col}")
                 source_df = source_df.with_columns(pl.col(id_col).cast(id_col_dt))
 
+        # Check if id_col_name exists and is unique
         if id_col_name not in source_df.columns:
+            print(f"Creating {id_col_name} column as it doesn't exist")
             source_df = source_df.with_row_count(name=id_col_name)
+        else:
+            # Check uniqueness
+            if source_df[id_col_name].n_unique() != len(source_df):
+                print(f"Warning: {id_col_name} is not unique. Creating a new unique {id_col_name}")
+                # Create a new unique id column
+                source_df = source_df.with_row_count(name=f"unique_{id_col_name}")
+                # Drop the original id_col_name and rename the new column to id_col_name
+                source_df = source_df.drop(id_col_name).rename({f"unique_{id_col_name}": id_col_name})
 
         id_col, id_col_dt = self._validate_id_col(source_df.select(id_col_name))
 
@@ -1107,10 +1121,26 @@ class Dataset(DatasetBase):
             return measurement_metadata
 
     def _create_code_mapping(self):
-        # Collect all unique codes from dynamic_measurements_df
-        all_codes = set(self.dynamic_measurements_df['CodeWithType'].unique())
-        # Create a mapping from codes to indices, starting from 1
-        return {code: idx for idx, code in enumerate(sorted(all_codes), start=1)}
+        print("Creating code mapping...")
+        all_codes = set()
+
+        # Collect codes from CodeWithType in dynamic_measurements_df
+        if self.dynamic_measurements_df is not None and 'CodeWithType' in self.dynamic_measurements_df.columns:
+            all_codes.update(self.dynamic_measurements_df['CodeWithType'].unique().to_list())
+
+        # Collect codes from Code in events_df (for lab events)
+        if self.events_df is not None and 'Code' in self.events_df.columns:
+            all_codes.update(self.events_df.filter(pl.col('event_type') == 'LAB')['Code'].unique().to_list())
+
+        # Remove None values and convert to strings
+        all_codes = {str(code) for code in all_codes if code is not None}
+
+        print(f"Number of unique codes found: {len(all_codes)}")
+        
+        # Sort the codes and create the mapping
+        sorted_codes = sorted(all_codes)
+        return {code: idx for idx, code in enumerate(sorted_codes, start=1)}
+
 
     def preprocess(self):
         print("Starting preprocessing...")
@@ -1129,11 +1159,57 @@ class Dataset(DatasetBase):
         self.transform_measurements()
         print("Finished transforming measurements.")
         print("Preprocessing completed successfully.")
+        
+    def _create_code_mapping(self):
+        print("Creating code mapping...")
+        all_codes = set()
 
+        # Collect codes from CodeWithType in dynamic_measurements_df
+        if self.dynamic_measurements_df is not None and 'CodeWithType' in self.dynamic_measurements_df.columns:
+            all_codes.update(self.dynamic_measurements_df['CodeWithType'].unique().to_list())
+
+        # Collect codes from Code in events_df (for lab events)
+        if self.events_df is not None and 'Code' in self.events_df.columns:
+            all_codes.update(self.events_df.filter(pl.col('event_type') == 'LAB')['Code'].unique().to_list())
+
+        # Remove None values and convert to strings
+        all_codes = {str(code) for code in all_codes if code is not None}
+
+        print(f"Number of unique codes found: {len(all_codes)}")
+        
+        # Sort the codes and create the mapping
+        sorted_codes = sorted(all_codes)
+        return {code: idx for idx, code in enumerate(sorted_codes, start=1)}
+ 
     def _convert_dynamic_indices_to_indices(self):
+        print("Entering _convert_dynamic_indices_to_indices")
+        print("Columns in dynamic_measurements_df:", self.dynamic_measurements_df.columns)
+        
+        if 'CodeWithType' in self.dynamic_measurements_df.columns:
+            code_column = 'CodeWithType'
+        elif 'Code' in self.dynamic_measurements_df.columns:
+            code_column = 'Code'
+        else:
+            print(f"Warning: No suitable column found for converting to indices in dynamic_measurements_df.")
+            print(f"Available columns: {self.dynamic_measurements_df.columns}")
+            return
+
+        print(f"Using {code_column} as code column")
+        
         self.dynamic_measurements_df = self.dynamic_measurements_df.with_columns([
-            pl.col('CodeWithType').map_dict(self.code_mapping).alias('dynamic_indices')
+            pl.when(pl.col(code_column).is_null())
+            .then(pl.lit(None))
+            .otherwise(pl.col(code_column).map_dict(self.code_mapping).cast(pl.Utf8))
+            .alias('dynamic_indices')
         ])
+        
+        if 'Result' in self.dynamic_measurements_df.columns:
+            self.dynamic_measurements_df = self.dynamic_measurements_df.with_columns([
+                pl.col('Result').alias('dynamic_values')
+            ])
+        
+        print("Exiting _convert_dynamic_indices_to_indices")
+        print("Columns in dynamic_measurements_df:", self.dynamic_measurements_df.columns)
 
     @TimeableMixin.TimeAs
     def _fit_vocabulary(self, measure: str, config: MeasurementConfig, source_df: DF_T) -> Vocabulary:

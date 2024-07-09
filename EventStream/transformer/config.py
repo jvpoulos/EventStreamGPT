@@ -11,7 +11,7 @@ import itertools
 import math
 import torch
 from collections.abc import Hashable
-from typing import Any, Union
+from typing import Any, Union, Optional, List, Dict
 import json
 
 from transformers import PretrainedConfig
@@ -249,6 +249,8 @@ class OptimizationConfig(JSONableMixin):
     gradient_accumulation: int = 1
     use_lr_scheduler: bool = False
     lr_scheduler_type: str = "cosine"
+    use_grad_value_clipping: bool = True
+    clip_grad_value: float = 1.0
     lr_num_warmup_steps: int = 100
 
     num_dataloader_workers: int = 0
@@ -494,8 +496,8 @@ class StructuredTransformerConfig(PretrainedConfig):
         measurements_per_dep_graph_level: list[list[MEAS_INDEX_GROUP_T]] | None = None,
         max_seq_len: int = 256,
         do_split_embeddings: bool = False,
-        categorical_embedding_dim: int = 64,  # Set a default value
-        numerical_embedding_dim: int = 32,
+        categorical_embedding_dim: Optional[int] = None,
+        numerical_embedding_dim: Optional[int] = None,
         static_embedding_mode: StaticEmbeddingMode = StaticEmbeddingMode.SUM_ALL,
         static_embedding_weight: float = 0.5,
         dynamic_embedding_weight: float = 0.5,
@@ -620,8 +622,8 @@ class StructuredTransformerConfig(PretrainedConfig):
                 numerical_embedding_dim = None
 
         self.do_split_embeddings = do_split_embeddings
-        self.categorical_embedding_dim = categorical_embedding_dim
-        self.numerical_embedding_dim = numerical_embedding_dim
+        self.categorical_embedding_dim = categorical_embedding_dim if do_split_embeddings else None
+        self.numerical_embedding_dim = numerical_embedding_dim if do_split_embeddings else None
         self.static_embedding_mode = static_embedding_mode
         self.static_embedding_weight = static_embedding_weight
         self.dynamic_embedding_weight = dynamic_embedding_weight
