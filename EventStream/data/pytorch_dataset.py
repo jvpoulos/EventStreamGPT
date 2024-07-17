@@ -502,15 +502,23 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
     def __getitem__(self, idx: int) -> dict[str, any]:
         try:
             full_subj_data = {}
-            for col, v in self.cached_data.items():
-                if isinstance(v[idx], str):
-                    full_subj_data[col] = json.loads(v[idx])
+            for col, v in self.cached_data[idx].items():
+                if isinstance(v, str):
+                    full_subj_data[col] = json.loads(v)
                 else:
-                    full_subj_data[col] = v[idx]
+                    full_subj_data[col] = v
             
-            # Convert dynamic_indices to float
+            # Convert dynamic_indices to tensor
             if 'dynamic_indices' in full_subj_data:
-                full_subj_data['dynamic_indices'] = torch.tensor(full_subj_data['dynamic_indices'], dtype=torch.float64)
+                full_subj_data['dynamic_indices'] = torch.tensor(full_subj_data['dynamic_indices'], dtype=torch.long)
+            
+            # Convert dynamic_counts to tensor
+            if 'dynamic_counts' in full_subj_data:
+                full_subj_data['dynamic_counts'] = torch.tensor(full_subj_data['dynamic_counts'], dtype=torch.long)
+            
+            # Convert dynamic_values to tensor, keeping it as float
+            if 'dynamic_values' in full_subj_data:
+                full_subj_data['dynamic_values'] = torch.tensor(full_subj_data['dynamic_values'], dtype=torch.float)
             
             # Process static data
             static_fields = ['InitialA1c', 'A1cGreaterThan7', 'Female', 'Married', 'GovIns', 'English', 'AgeYears', 'SDI_score', 'Veteran']
@@ -824,37 +832,31 @@ def collate(self, batch):
         valid_items = batch
     
     # Get the maximum sequence length in the batch
-    max_seq_len = max(max(len(item["dynamic_indices"]), len(item["dynamic_counts"])) for item in valid_items)
+    max_seq_len = max(len(item["dynamic_indices"]) for item in valid_items)
     
     # Initialize the tensors with the correct shape
     dynamic_indices = torch.zeros((len(valid_items), max_seq_len), dtype=torch.long, device=device)
-    dynamic_counts = torch.zeros((len(valid_items), max_seq_len), dtype=torch.float, device=device)
+    dynamic_counts = torch.zeros((len(valid_items), max_seq_len), dtype=torch.long, device=device)
+    dynamic_values = torch.zeros((len(valid_items), max_seq_len), dtype=torch.float, device=device)
     
     # Populate the tensors with the data from valid items
     for i, item in enumerate(valid_items):
-        di_len = len(item["dynamic_indices"])
-        dc_len = len(item["dynamic_counts"])
-        dynamic_indices[i, :di_len] = torch.tensor(item["dynamic_indices"], dtype=torch.long)
-        dynamic_counts[i, :dc_len] = torch.tensor(item["dynamic_counts"], dtype=torch.float)
-        
-        # If lengths don't match, pad the shorter one
-        if di_len != dc_len:
-            self.logger.warning(f"Mismatch in lengths: dynamic_indices ({di_len}) and dynamic_counts ({dc_len})")
-            if di_len < dc_len:
-                dynamic_indices[i, di_len:dc_len] = 0
-            else:
-                dynamic_counts[i, dc_len:di_len] = 0
+        seq_len = len(item["dynamic_indices"])
+        dynamic_indices[i, :seq_len] = item["dynamic_indices"]
+        dynamic_counts[i, :seq_len] = item["dynamic_counts"]
+        dynamic_values[i, :seq_len] = item["dynamic_values"]
     
     out_batch = {
         "dynamic_indices": dynamic_indices,
         "dynamic_counts": dynamic_counts,
+        "dynamic_values": dynamic_values,
     }
     
     # Add static features
     static_features = ['InitialA1c', 'Female', 'Married', 'GovIns', 'English', 'AgeYears', 'SDI_score', 'Veteran', 'A1cGreaterThan7']
     for feature in static_features:
         if feature in valid_items[0]:
-            out_batch[feature] = torch.stack([torch.tensor(item[feature], dtype=torch.float if feature in ['InitialA1c', 'AgeYears', 'SDI_score'] else torch.long) for item in valid_items]).to(device)
+            out_batch[feature] = torch.stack([item[feature] for item in valid_items]).to(device)
     
     # Process task-specific labels
     if self.has_task:

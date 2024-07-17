@@ -15,6 +15,7 @@ from torch import nn
 from transformers.activations import ACT2FN
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
+from flash_attn import flash_attn_qkvpacked_func, flash_attn_func
 
 from ..data.data_embedding_layer import DataEmbeddingLayer, MeasIndexGroupOptions
 from ..data.types import PytorchBatch
@@ -104,6 +105,7 @@ class InnerSelfAttention(nn.Module):
         window_size: int,
     ):
         super().__init__()
+        self.config = config  # Store the config as an attribute
 
         max_seq_len = config.max_seq_len
         self.window_size = window_size
@@ -183,44 +185,61 @@ class InnerSelfAttention(nn.Module):
             A tuple containing the output of the attention operation and the attention weights.
         """
 
-        # Keep the attention weights computation in fp32 to avoid overflow issues
-        query = query.to(torch.float32)
-        key = key.to(torch.float32)
+        if self.config.use_flash_attention:
+            # Reshape inputs for Flash Attention
+            qkv = torch.stack([query, key, value], dim=2)
+            qkv = qkv.transpose(0, 1).contiguous()  # [seqlen, bsz, 3, num_heads, head_dim]
+            
+            # Call Flash Attention
+            context = flash_attn_qkvpacked_func(
+                qkv,
+                dropout_p=self.drop.p if self.training else 0.0,
+                softmax_scale=None,  # Let the function use default scale
+                causal=self.causal
+            )
+            
+            # Reshape output
+            context = context.transpose(0, 1)  # [bsz, seqlen, num_heads, head_dim]
+            return context, None  # Flash Attention doesn't return attention weights
+        else:
+            # Keep the attention weights computation in fp32 to avoid overflow issues
+            query = query.to(torch.float32)
+            key = key.to(torch.float32)
 
-        # query, key, and value are all of shape (batch, head, seq_length, head_features)
+            # query, key, and value are all of shape (batch, head, seq_length, head_features)
 
-        attn_weights = torch.matmul(query, key.transpose(-1, -2))
-        # attn_weights is of shape batch, head, query_seq_length, key_seq_length
+            attn_weights = torch.matmul(query, key.transpose(-1, -2))
+            # attn_weights is of shape batch, head, query_seq_length, key_seq_length
 
-        # Move the tensors to the appropriate device
-        query = query.to(attn_weights.device)
-        key = key.to(attn_weights.device)
-        value = value.to(attn_weights.device)
+            # Move the tensors to the appropriate device
+            query = query.to(attn_weights.device)
+            key = key.to(attn_weights.device)
+            value = value.to(attn_weights.device)
 
-        query_length, key_length = query.size(-2), key.size(-2)
-        causal_mask = self.bias[:, :, key_length - query_length : key_length, :key_length].to(torch.bool)
-        mask_value = torch.finfo(attn_weights.dtype).min
-        # Need to be a tensor, otherwise we get error:
-        # `RuntimeError: expected scalar type float but found double`.
-        # Need to be on the same device, otherwise `RuntimeError: ..., x and y to be on the same device`
-        mask_value = torch.tensor(mask_value, dtype=attn_weights.dtype).to(attn_weights.device)
-        attn_weights = torch.where(causal_mask, attn_weights, mask_value)
+            query_length, key_length = query.size(-2), key.size(-2)
+            causal_mask = self.bias[:, :, key_length - query_length : key_length, :key_length].to(torch.bool)
+            mask_value = torch.finfo(attn_weights.dtype).min
+            # Need to be a tensor, otherwise we get error:
+            # `RuntimeError: expected scalar type float but found double`.
+            # Need to be on the same device, otherwise `RuntimeError: ..., x and y to be on the same device`
+            mask_value = torch.tensor(mask_value, dtype=attn_weights.dtype).to(attn_weights.device)
+            attn_weights = torch.where(causal_mask, attn_weights, mask_value)
 
-        if attention_mask is not None:
-            # Apply the attention mask
-            attn_weights = attn_weights + attention_mask
+            if attention_mask is not None:
+                # Apply the attention mask
+                attn_weights = attn_weights + attention_mask
 
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1)
-        attn_weights = attn_weights.to(value.dtype)
-        attn_weights = self.attn_dropout(attn_weights)
+            attn_weights = nn.functional.softmax(attn_weights, dim=-1)
+            attn_weights = attn_weights.to(value.dtype)
+            attn_weights = self.attn_dropout(attn_weights)
 
-        # Mask heads if we want to
-        if head_mask is not None:
-            attn_weights = attn_weights * head_mask
+            # Mask heads if we want to
+            if head_mask is not None:
+                attn_weights = attn_weights * head_mask
 
-        attn_output = torch.matmul(attn_weights, value)
+            attn_output = torch.matmul(attn_weights, value)
 
-        return attn_output, attn_weights
+            return attn_output, attn_weights
 
     def forward(
         self,
@@ -524,7 +543,6 @@ class StructuredTransformerBlock(nn.Module):
 
 class StructuredTransformerPreTrainedModel(PreTrainedModel):
     """The base pre-trained model class for Transformer models."""
-
     config_class = StructuredTransformerConfig
     base_model_prefix = "transformer"
     supports_gradient_checkpointing = True
@@ -533,26 +551,9 @@ class StructuredTransformerPreTrainedModel(PreTrainedModel):
     def __init__(self, *inputs, **kwargs):
         super().__init__(*inputs, **kwargs)
 
-    def _init_weights(self, module):
-        """Initialize the weights."""
-        if isinstance(module, (nn.Linear,)):
-            # Slightly different from the TF version which uses truncated_normal for initialization
-            # cf https://github.com/pytorch/pytorch/pull/5617
-            module.weight.data.normal_(mean=0.0, std=self.config.init_std)
-            if module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=self.config.init_std)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
-        elif isinstance(module, nn.LayerNorm):
-            module.bias.data.zero_()
-            module.weight.data.fill_(1.0)
-
     def _set_gradient_checkpointing(self, module, value=False):
         if isinstance(module, StructuredTransformerPreTrainedModel):
             module.gradient_checkpointing = value
-
 
 def time_from_deltas(batch: PytorchBatch) -> torch.Tensor:
     """Given a batch of time deltas, compute the relative time-since-start for each event.

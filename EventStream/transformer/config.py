@@ -16,6 +16,8 @@ import json
 
 from transformers import PretrainedConfig
 
+from flash_attn import flash_attn_qkvpacked_func, flash_attn_func
+
 from ..data.config import MeasurementConfig
 from ..data.data_embedding_layer import MeasIndexGroupOptions, StaticEmbeddingMode
 from ..data.pytorch_dataset import PytorchDataset
@@ -484,6 +486,7 @@ class StructuredTransformerConfig(PretrainedConfig):
     def __init__(
         self,
         # Data configuration
+        use_flash_attention: bool = False,
         do_use_sinusoidal: bool = False,  # Add this line to the configuration class
         num_labels: int | None = None,
         problem_type: str = "single_label_classification",
@@ -587,6 +590,8 @@ class StructuredTransformerConfig(PretrainedConfig):
 
         # Call the parent constructor with the updated kwargs
         super().__init__(**kwargs)
+
+        self.use_flash_attention = use_flash_attention
 
         # Initialize id2label and label2id based on the value of num_labels
         if num_labels is None:

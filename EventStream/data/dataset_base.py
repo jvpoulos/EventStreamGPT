@@ -854,8 +854,13 @@ class DatasetBase(
                 print(f"Found no possible events for {measure}!")
                 config.drop()
                 continue
-            config.observation_rate_over_cases = total_observed / total_possible
-            config.observation_rate_per_case = raw_total_observed / total_observed
+            if total_observed == 0:
+                print(f"WARNING: No observations found for {measure}! Setting observation rates to 0.")
+                config.observation_rate_over_cases = 0
+                config.observation_rate_per_case = 0
+            else:
+                config.observation_rate_over_cases = total_observed / total_possible
+                config.observation_rate_per_case = raw_total_observed / total_observed
             if config.is_numeric:
                 config.add_missing_mandatory_metadata_cols()
                 try:
@@ -1430,6 +1435,7 @@ class DatasetBase(
                     "timestamp",
                     "dynamic_indices",
                     "dynamic_counts",
+                    "dynamic_values",
                     "InitialA1c", "Female", "Married", "GovIns", 
                     "English", "AgeYears", "SDI_score", "Veteran"
                 ]

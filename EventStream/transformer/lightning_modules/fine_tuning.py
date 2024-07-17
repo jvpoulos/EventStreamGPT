@@ -1,11 +1,12 @@
 import dataclasses
+from dataclasses import is_dataclass, asdict
 import json
 import os
 import random
 from collections.abc import Sequence
 from pathlib import Path
 import pathlib
-from typing import Dict, Any
+from typing import Dict, Any, Union, Optional
 import wandb
 from torch.optim.lr_scheduler import LambdaLR
 import math
@@ -53,6 +54,9 @@ from torch.utils.data import DataLoader
 import logging
 
 import numpy as np
+from torch.cuda.amp import GradScaler
+
+from dataclasses import dataclass, field
 
 # Configure the logger
 logger = logging.getLogger(__name__)
@@ -106,20 +110,22 @@ class ESTForStreamClassificationLM(L.LightningModule):
         super().__init__()
         if isinstance(config, dict):
             config = StructuredTransformerConfig(**config)
-        if isinstance(optimization_config, dict):
-            optimization_config = OptimizationConfig(**optimization_config)
-        
         self.config = config
-        self.optimization_config = optimization_config
+        if isinstance(optimization_config, dict):
+            self.optimization_config = OptimizationConfig(**optimization_config)
+        else:
+            self.optimization_config = optimization_config
         self.cfg = cfg
         self.do_debug_mode = do_debug_mode
         
+        self.gradient_norm_changes = []
+        self.max_outliers_to_log = 10
+
         # Initialize metrics dictionaries
         self.train_metrics = {}
         self.val_metrics = {}
         self.test_metrics = {}
 
-        # Explicitly set these as class attributes
         self.learning_rate = self.optimization_config.init_lr
         self.num_training_steps = self.optimization_config.max_training_steps
         self.weight_decay = self.optimization_config.weight_decay
@@ -129,6 +135,10 @@ class ESTForStreamClassificationLM(L.LightningModule):
         self.end_lr_frac_of_init_lr = self.optimization_config.end_lr_frac_of_init_lr
         self.use_grad_value_clipping = self.optimization_config.use_grad_value_clipping
         self.clip_grad_value = self.optimization_config.clip_grad_value
+        self.max_grad_norm = self.config.max_grad_norm
+
+        self.grad_norm_before = None
+        self.grad_norm_after = None
 
         # Load the vocabulary_config from a file
         vocabulary_config_path = "data/vocabulary_config.json"
@@ -144,9 +154,10 @@ class ESTForStreamClassificationLM(L.LightningModule):
         self.save_hyperparameters(
             {
                 "config": config.to_dict(),
-                "optimization_config": dataclasses.asdict(self.optimization_config),
+                "optimization_config": asdict(self.optimization_config) if is_dataclass(self.optimization_config) else self.optimization_config,
             }
         )
+
         self.build_metrics()
 
         # Load the vocabulary_config from a file
@@ -160,6 +171,22 @@ class ESTForStreamClassificationLM(L.LightningModule):
         else:
             self.model = ESTForStreamClassification.from_pretrained(pretrained_weights_fp, config=config, vocabulary_config=vocabulary_config, optimization_config=self.optimization_config)
 
+    def on_before_optimizer_step(self, optimizer):
+        self.grad_norm_before = self.get_gradient_norm()
+        self.log('grad_norm_before', self.grad_norm_before, on_step=True, on_epoch=False, prog_bar=False, logger=True)
+
+    def on_after_optimizer_step(self, optimizer):
+        self.grad_norm_after = self.get_gradient_norm()
+        self.log('grad_norm_after', self.grad_norm_after, on_step=True, on_epoch=False, prog_bar=False, logger=True)
+
+    def get_gradient_norm(self):
+        total_norm = 0.0
+        for p in self.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+        return total_norm ** 0.5
+        
     def __reduce__(self):
         return (self.__class__, (self.config, self.optimization_config, self.cfg))
 
@@ -277,30 +304,62 @@ class ESTForStreamClassificationLM(L.LightningModule):
     def training_step(self, batch, batch_idx):
         outputs = self.model(batch, labels=batch['labels'])
         loss = outputs.loss
-        
-        if loss is not None:
-            if self.do_debug_mode:
-                logger.debug(f"Training step - Logits shape: {outputs.preds.shape}")
-                logger.debug(f"Training step - Labels shape: {outputs.labels.shape}")
-                logger.debug(f"Training step - Loss: {loss.item()}")
 
-            self.log('train_loss', loss, on_step=True, on_epoch=False, prog_bar=True, logger=True)
-            
-            if outputs.accuracy is not None:
-                self.log('train_accuracy', outputs.accuracy, on_step=True, on_epoch=False, prog_bar=True, logger=True)
-            
-            # Accumulate metrics
-            self._accumulate_metrics('train', {
-                'loss': loss.item(),
-                'accuracy': outputs.accuracy if outputs.accuracy is not None else 0.0,
-                'auc': outputs.auc if outputs.auc is not None else 0.0,
-            })
+        # Check for NaN or Inf values
+        if torch.isnan(loss) or torch.isinf(loss):
+            logger.error(f"NaN or Inf loss detected: {loss}")
+            return None
+
+        # Calculate gradient norm (this will be after potential clipping by PyTorch Lightning)
+        grad_norm = self.get_gradient_norm()
+
+        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        self.log('train_accuracy', outputs.accuracy, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        self.log('train_auc', outputs.auc, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        self.log('grad_norm', grad_norm, on_step=True, on_epoch=False, prog_bar=False, logger=True)
+        
+        log_message = f"Step {batch_idx}: train_loss={loss.item():.4f}, train_accuracy={outputs.accuracy:.4f}, grad_norm={grad_norm:.4f}"
+        logger.info(log_message)
+
+        # Accumulate metrics
+        self._accumulate_metrics('train', {
+            'loss': loss.item(),
+            'accuracy': outputs.accuracy if outputs.accuracy is not None else 0.0,
+            'auc': outputs.auc if outputs.auc is not None else 0.0,
+            'grad_norm': grad_norm,
+        })
+
+        # Store gradient norm change
+        if len(self.gradient_norm_changes) > 0:
+            prev_norm = self.gradient_norm_changes[-1][1]
+            change = grad_norm - prev_norm
+            self.gradient_norm_changes.append((batch_idx, change))
+        else:
+            self.gradient_norm_changes.append((batch_idx, grad_norm))
         
         return loss
 
+    def get_gradient_norm(self):
+        total_norm = 0.0
+        for p in self.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+        return total_norm ** 0.5
+
     def validation_step(self, batch, batch_idx):
+        if self.do_debug_mode:
+            logger.debug(f"Validation step - Batch keys: {batch.keys() if batch is not None else 'None'}")
         outputs = self.model(batch, labels=batch['labels'])
         loss = outputs.loss
+
+        if self.do_debug_mode:
+            # Add learning rate to debug info
+            if outputs.debug_info is not None:
+                outputs.debug_info["learning_rate"] = self.trainer.optimizers[0].param_groups[0]['lr']
+            
+            logger.debug(f"Model outputs: {outputs}")
+            logger.debug(f"Loss: {loss}")
         
         if loss is not None:
             if self.do_debug_mode:
@@ -309,7 +368,12 @@ class ESTForStreamClassificationLM(L.LightningModule):
                 logger.debug(f"Validation step - Loss: {loss.item()}")
 
             self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-            
+            self.log('val_accuracy', outputs.accuracy, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+            self.log('val_auc', outputs.auc, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+
+            if batch_idx % 100 == 0:
+                logger.info(f"Validation step {batch_idx}: val_loss={loss.item():.4f}, val_accuracy={outputs.accuracy:.4f}")
+
             if outputs.accuracy is not None:
                 self.log('val_accuracy', outputs.accuracy, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
             
@@ -319,6 +383,11 @@ class ESTForStreamClassificationLM(L.LightningModule):
                 'accuracy': outputs.accuracy if outputs.accuracy is not None else 0.0,
                 'auc': outputs.auc if outputs.auc is not None else 0.0,
             })
+                
+            # Log debugging information
+            if outputs.debug_info:
+                for key, value in outputs.debug_info.items():
+                    self._accumulate_metrics('val', {f'debug_{key}': value})
         
         return loss
 
@@ -342,36 +411,64 @@ class ESTForStreamClassificationLM(L.LightningModule):
 
     def on_train_epoch_end(self):
         self._log_epoch_metrics('train')
+        if self.do_debug_mode:
+            self.log_gradient_outliers()
+
+    def log_gradient_outliers(self):
+        if not self.gradient_norm_changes:
+            return
+
+        # Sort changes by absolute value, descending
+        sorted_changes = sorted(self.gradient_norm_changes, key=lambda x: abs(x[1]), reverse=True)
+        
+        # Log top outliers
+        logger.info(f"Top {self.max_outliers_to_log} gradient norm change outliers:")
+        for batch_idx, change in sorted_changes[:self.max_outliers_to_log]:
+            logger.info(f"Batch {batch_idx}: gradient norm change of {change:.4f}")
+
+        # Calculate and log statistics
+        changes = [change for _, change in self.gradient_norm_changes]
+        mean_change = np.mean(changes)
+        std_change = np.std(changes)
+        logger.info(f"Gradient norm change statistics - Mean: {mean_change:.4f}, Std: {std_change:.4f}")
+
+        # Log subjects with changes more than 3 standard deviations from the mean
+        significant_outliers = [(batch_idx, change) for batch_idx, change in self.gradient_norm_changes if abs(change - mean_change) > 3 * std_change]
+        logger.info(f"Batches with gradient norm changes > 3 std devs from mean:")
+        for batch_idx, change in significant_outliers:
+            logger.info(f"Batch {batch_idx}: gradient norm change of {change:.4f}")
+
+        # Clear the list for the next epoch
+        self.gradient_norm_changes.clear()
 
     def on_validation_epoch_end(self):
         self._log_epoch_metrics('val')
 
-    def on_after_backward(self):
-        # Apply grad_value clipping if enabled
-        if self.use_grad_value_clipping:
-            torch.nn.utils.clip_grad_value_(self.parameters(), self.clip_grad_value)
-        
-        # Log gradient norm
-        if self.global_step % 100 == 0:
-            grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=5.0)
-            self.log('grad_norm', grad_norm)
-
     def test_step(self, batch, batch_idx):
-        logger.debug(f"Test step - Batch keys: {batch.keys() if batch is not None else 'None'}")
+        if self.do_debug_mode:
+            logger.debug(f"Test step - Batch keys: {batch.keys() if batch is not None else 'None'}")
         if batch is None:
             self.log('test_loss', None)
             return None
         
         outputs = self.model(batch, labels=batch['labels'])
         loss = outputs.loss
+
+        if self.do_debug_mode:
+            # Add learning rate to debug info
+            if outputs.debug_info is not None:
+                outputs.debug_info["learning_rate"] = self.trainer.optimizers[0].param_groups[0]['lr']
+            
+            logger.debug(f"Model outputs: {outputs}")
+            logger.debug(f"Loss: {loss}")
         
-        if loss is not None:
-            # Accumulate metrics
-            self._accumulate_metrics('test', {
-                'loss': loss.item(),
-                'accuracy': outputs.accuracy,
-                'auc': outputs.auc if outputs.auc is not None else BinaryAUROC()(outputs.preds, batch['labels']).item(),
-            })
+            if loss is not None:
+                # Accumulate metrics
+                self._accumulate_metrics('test', {
+                    'loss': loss.item(),
+                    'accuracy': outputs.accuracy,
+                    'auc': outputs.auc if outputs.auc is not None else BinaryAUROC()(outputs.preds, batch['labels']).item(),
+                })
         
         # Log debugging information
         if outputs.debug_info:
@@ -409,9 +506,6 @@ class ESTForStreamClassificationLM(L.LightningModule):
         
         return outputs.last_hidden_state if hasattr(outputs, 'last_hidden_state') else outputs
 
-    def on_train_epoch_end(self):
-        self._log_epoch_metrics('train')
-
     def on_test_epoch_end(self):
         self._log_epoch_metrics('test')
 
@@ -436,6 +530,10 @@ class ESTForStreamClassificationLM(L.LightningModule):
             betas=(0.9, 0.999),
             eps=1e-8,
         )
+
+        if self.use_grad_value_clipping:
+            for param_group in optimizer.param_groups:
+                param_group['clip_value'] = self.clip_grad_value
 
         # Initialize scheduler
         if self.use_lr_scheduler:
@@ -477,33 +575,33 @@ class ESTForStreamClassificationLM(L.LightningModule):
                 "frequency": 1,
                 "monitor": "val_loss" if self.lr_scheduler_type == "reduce_on_plateau" else None,
             }
-
             return {"optimizer": optimizer, "lr_scheduler": scheduler_config}
         else:
             return optimizer
 
-@hydra_dataclass
+@dataclass
 class FinetuneConfig:
-    experiment_dir: str | Path | None = "${load_from_model_dir}/finetuning"
-    load_from_model_dir: str | Path | None = omegaconf.MISSING
-    task_df_name: str | None = omegaconf.MISSING
+    experiment_dir: Optional[Union[str, Path]] = "${load_from_model_dir}/finetuning"
+    load_from_model_dir: Optional[Union[str, Path]] = omegaconf.MISSING
+    task_df_name: Optional[str] = omegaconf.MISSING
     optimization_config_path: str = omegaconf.MISSING
-    pretrain_config_path: str | None = None
-    dataset_path: str | None = None
-    pretraining_metrics_config: dict[str, Any] | None = None
-    final_validation_metrics_config: dict[str, Any] | None = None
-    do_final_validation_metrics_config: dict[str, Any] | None = None
+    vocabulary_config: Any = field(default_factory=VocabularyConfig)  # Changed to Any
+    pretrain_config_path: Optional[str] = None
+    dataset_path: Optional[str] = None
+    pretraining_metrics_config: Optional[Dict[str, Any]] = None
+    final_validation_metrics_config: Optional[Dict[str, Any]] = None
+    do_final_validation_metrics_config: Optional[Dict[str, Any]] = None
     do_final_validation_on_metrics: bool = False
     pretrained_weights_fp: Path | str | None = "skip"
 
-    save_dir: str | None = (
+    save_dir: Optional[str] = (
         "${experiment_dir}/${task_df_name}/"
         "subset_size_${data_config.train_subset_size}/"
         "subset_seed_${data_config.train_subset_seed}/"
         "${now:%Y-%m-%d_%H-%M-%S}"
     )
 
-    wandb_logger_kwargs: dict[str, Any] = dataclasses.field(
+    wandb_logger_kwargs: Dict[str, Any] = field(
         default_factory=lambda: {
             "name": "${task_df_name}_finetuning",
             "project": None,
@@ -511,7 +609,7 @@ class FinetuneConfig:
         }
     )
 
-    wandb_experiment_config_kwargs: dict[str, Any] = dataclasses.field(
+    wandb_experiment_config_kwargs: Dict[str, Any] = field(
         default_factory=lambda: {
             "save_dir": "${save_dir}",
         }
@@ -520,7 +618,7 @@ class FinetuneConfig:
     do_overwrite: bool = False
     seed: int = 1
 
-    config: dict[str, Any] = dataclasses.field(
+    config: Dict[str, Any] = field(
         default_factory=lambda: {
             **{k: None for k in StructuredTransformerConfig().to_dict().keys()},
             "task_specific_params": {
@@ -530,7 +628,7 @@ class FinetuneConfig:
         }
     )
 
-    optimization_config: Dict[str, Any] = dataclasses.field(
+    optimization_config: Dict[str, Any] = field(
         default_factory=lambda: {
             'batch_size': 32,
             'validation_batch_size': 64,
@@ -540,7 +638,7 @@ class FinetuneConfig:
         }
     )
 
-    data_config: dict[str, Any] | None = dataclasses.field(
+    data_config: Optional[Dict[str, Any]] = field(
         default_factory=lambda: {
             **{k: None for k in PytorchDatasetConfig().to_dict().keys()},
             "subsequence_sampling_strategy": SubsequenceSamplingStrategy.TO_END,
@@ -552,9 +650,9 @@ class FinetuneConfig:
         }
     )
 
-    data_config_path: str | None = None
+    data_config_path: Optional[str] = None
     
-    trainer_config: dict[str, Any] = dataclasses.field(
+    trainer_config: Dict[str, Any] = field(
         default_factory=lambda: {
             "accelerator": "auto",
             "devices": "auto",
@@ -564,6 +662,14 @@ class FinetuneConfig:
         }
     )
     do_use_filesystem_sharing: bool = True
+
+    def __post_init__(self):
+        if isinstance(self.save_dir, str):
+            self.save_dir = Path(self.save_dir)
+        if isinstance(self.load_from_model_dir, str):
+            self.load_from_model_dir = Path(self.load_from_model_dir)
+        if isinstance(self.pretrained_weights_fp, str) and self.pretrained_weights_fp != "skip":
+            self.pretrained_weights_fp = Path(self.pretrained_weights_fp)
 
     def to_dict(self):
         return dataclasses.asdict(self)
@@ -795,7 +901,6 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, wandb_logger
             logger.info(f"Item {i}: {item}")
 
         logger.info("Creating data loaders")
-
         collate_fn = CollateFunction(config.vocab_size)
         
         def create_dataloader(dataset, batch_size, shuffle):
@@ -804,23 +909,13 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, wandb_logger
                 batch_size=batch_size,
                 collate_fn=collate_fn,
                 shuffle=shuffle,
-                num_workers=0,  # Set to 0 to avoid multiprocessing
+                num_workers=0,  
                 pin_memory=True
             )
 
         train_dataloader = create_dataloader(train_pyd, optimization_config['batch_size'], True)
         tuning_dataloader = create_dataloader(tuning_pyd, optimization_config['validation_batch_size'], False)
         held_out_dataloader = create_dataloader(held_out_pyd, optimization_config['validation_batch_size'], False)
-
-        for i, batch in enumerate(train_dataloader):
-            if i < 5:  # Check the first 5 batches
-                logger.info(f"Batch {i} shape: {batch['dynamic_indices'].shape}")
-                logger.info(f"Batch {i} unique values: {torch.unique(batch['dynamic_indices'])}")
-                for row in range(min(5, batch['dynamic_indices'].size(0))):  # Check the first 5 rows of each batch
-                    logger.info(f"Batch {i}, Row {row}, dynamic_indices: {batch['dynamic_indices'][row]}")
-                    logger.info(f"Batch {i}, Row {row}, non-zero indices: {batch['dynamic_indices'][row].nonzero().flatten()}")
-            else:
-                break
 
         callbacks = [
             LearningRateMonitor(logging_interval="step"),
@@ -848,9 +943,11 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, wandb_logger
             **cfg.trainer_config,
             callbacks=callbacks,
             logger=wandb_logger,
-            precision="16-mixed",
-            accumulate_grad_batches=optimization_config.get('gradient_accumulation', 1),
+            accumulate_grad_batches=optimization_config.get('gradient_accumulation', 4),
             max_epochs=optimization_config.get('max_epochs', 100),
+            gradient_clip_val=config.max_grad_norm if not optimization_config.get('use_grad_value_clipping', False) else optimization_config.get('clip_grad_value', None),
+            gradient_clip_algorithm="norm" if not optimization_config.get('use_grad_value_clipping', False) else "value",
+            enable_progress_bar=True,
         )
 
         logger.info("Starting training")

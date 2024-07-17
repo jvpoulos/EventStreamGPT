@@ -1,5 +1,6 @@
 """A model for fine-tuning on classification tasks."""
 import torch
+import math
 from torch import nn
 import torch.nn.functional as F
 from torch.nn import LayerNorm
@@ -35,8 +36,68 @@ class CustomConditionallyIndependentPointProcessTransformer(ConditionallyIndepen
             config,
             vocabulary_config.vocab_sizes_by_measurement,
             oov_index=oov_index,
-            do_use_sinusoidal=config.do_use_sinusoidal  # Pass the attribute here
+            do_use_sinusoidal=config.do_use_sinusoidal
         )
+
+        self.initialize_weights()
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.LayerNorm):
+            nn.init.ones_(module.weight)
+            nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            embedding_dim = module.embedding_dim
+            std = math.sqrt(1.0 / embedding_dim)
+            nn.init.normal_(module.weight, mean=0, std=std)
+
+    def _init_input_embeddings(self):
+        if hasattr(self.input_layer, 'data_embedding_layer'):
+            data_embedding_layer = self.input_layer.data_embedding_layer
+            if hasattr(data_embedding_layer, 'embedding'):
+                embedding = data_embedding_layer.embedding
+                embedding_dim = embedding.embedding_dim
+                std = math.sqrt(1.0 / embedding_dim)
+                nn.init.normal_(embedding.weight, mean=0, std=std)
+            elif hasattr(data_embedding_layer, 'categorical_embedding'):
+                embedding = data_embedding_layer.categorical_embedding
+                embedding_dim = embedding.embedding_dim
+                std = math.sqrt(1.0 / embedding_dim)
+                nn.init.normal_(embedding.weight, mean=0, std=std)
+
+        if hasattr(self.input_layer, 'time_embedding_layer'):
+            if isinstance(self.input_layer.time_embedding_layer, nn.Embedding):
+                embedding_dim = self.input_layer.time_embedding_layer.embedding_dim
+                std = math.sqrt(1.0 / embedding_dim)
+                nn.init.normal_(self.input_layer.time_embedding_layer.weight, mean=0, std=std)
+            elif hasattr(self.input_layer.time_embedding_layer, 'sin_div_term') and \
+                 hasattr(self.input_layer.time_embedding_layer, 'cos_div_term'):
+                # For learnable sinusoidal embeddings
+                nn.init.normal_(self.input_layer.time_embedding_layer.sin_div_term)
+                nn.init.normal_(self.input_layer.time_embedding_layer.cos_div_term)
+
+    def initialize_weights(self):
+        # Apply Xavier initialization to all parameters except embeddings
+        self.apply(self._init_weights)
+        
+        # Apply Gaussian initialization to input embeddings
+        self._init_input_embeddings()
+
+        # Initialize other components if needed
+        if hasattr(self, 'encoder'):
+            if hasattr(self.encoder, 'initialize_weights'):
+                self.encoder.initialize_weights()
+            else:
+                self.encoder.apply(self._init_weights)
+
+        if hasattr(self, 'decoder'):
+            if hasattr(self.decoder, 'initialize_weights'):
+                self.decoder.initialize_weights()
+            else:
+                self.decoder.apply(self._init_weights)
 
 class ESTForStreamClassification(StructuredTransformerPreTrainedModel):
     def __init__(self, config: StructuredTransformerConfig, vocabulary_config: VocabularyConfig, optimization_config: OptimizationConfig):
@@ -52,29 +113,11 @@ class ESTForStreamClassification(StructuredTransformerPreTrainedModel):
         
         self.pooling_method = config.task_specific_params["pooling_method"]
         
-        # Output layer for binary classification
         self.logit_layer = torch.nn.Linear(config.hidden_size, 1)
-        
-        # Loss function
         self.criteria = torch.nn.BCEWithLogitsLoss()
-        
-        # Initialize weights and apply final processing
-        self.post_init()
-
-        # Initialize AUROC
-        self.auroc = BinaryAUROC()
-
-        # Initialize gradient clipping
-        self.use_grad_value_clipping = optimization_config.use_grad_value_clipping
-        self.clip_grad_value = optimization_config.clip_grad_value
-
-        # Initialize gradient clipping
-        self.max_grad_norm = getattr(config, 'max_grad_norm', 1.0)
-        self.use_grad_value_clipping = self.optimization_config.use_grad_value_clipping
-
-        # Initialize dropout
         self.dropout = torch.nn.Dropout(config.intermediate_dropout)
-
+        self.static_encoder = nn.Linear(8, config.hidden_size)
+        
         # Add embeddings for categorical variables
         self.categorical_embeddings = nn.ModuleDict({
             'Female': nn.Embedding(2, config.hidden_size),
@@ -86,24 +129,67 @@ class ESTForStreamClassification(StructuredTransformerPreTrainedModel):
         
         # Linear layer for continuous variables
         self.continuous_encoder = nn.Linear(3, config.hidden_size)
-        
-        # Adjust the input size of the first layer in self.intermediate
+
         self.intermediate = nn.Sequential(
             nn.Linear(config.hidden_size, config.hidden_size),
             nn.ReLU(),
-            LayerNorm(config.hidden_size),
+            nn.LayerNorm(config.hidden_size),
             self.dropout
         )
 
         self.static_weight = nn.Parameter(torch.tensor(config.static_embedding_weight))
         self.dynamic_weight = nn.Parameter(torch.tensor(config.dynamic_embedding_weight))
 
-        @classmethod
-        def from_pretrained(cls, pretrained_weights_fp, config, vocabulary_config, optimization_config):
-            model = cls(config, vocabulary_config, optimization_config)
-            # Load pretrained weights here
-            return model
+        self.apply(self._init_weights)
+
+        # Initialize AUROC
+        self.auroc = BinaryAUROC()
+
+        self.max_grad_norm = getattr(config, 'max_grad_norm', 1.0)
+        self.use_grad_value_clipping = getattr(optimization_config, 'use_grad_value_clipping', False)
+        self.clip_grad_value = getattr(optimization_config, 'clip_grad_value', 1.0)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.LayerNorm):
+            nn.init.ones_(module.weight)
+            nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            embedding_dim = module.embedding_dim
+            std = math.sqrt(1.0 / embedding_dim)
+            nn.init.normal_(module.weight, mean=0, std=std)
+
+    def _init_input_embeddings(self):
+        for embedding in self.categorical_embeddings.values():
+            embedding_dim = embedding.embedding_dim
+            std = math.sqrt(1.0 / embedding_dim)
+            nn.init.normal_(embedding.weight, mean=0, std=std)
+
+        # Initialize the continuous encoder (which is essentially an embedding for numerical values)
+        nn.init.normal_(self.continuous_encoder.weight, mean=0, std=math.sqrt(1.0 / self.config.numerical_embedding_dim))
+        if self.continuous_encoder.bias is not None:
+            nn.init.zeros_(self.continuous_encoder.bias)
+
+    def initialize_weights(self):
+        # Apply Xavier initialization to all parameters except embeddings
+        self.apply(self._init_weights)
         
+        # Apply Gaussian initialization to input embeddings
+        self._init_input_embeddings()
+
+        # Initialize the encoder separately
+        if hasattr(self.encoder, 'initialize_weights'):
+            self.encoder.initialize_weights()
+
+    @classmethod
+    def from_pretrained(cls, pretrained_weights_fp, config, vocabulary_config, optimization_config):
+        model = cls(config, vocabulary_config, optimization_config)
+        # Load pretrained weights here
+        return model
+
     def forward(self, batch: dict, labels=None):
         device = self.logit_layer.weight.device
         
