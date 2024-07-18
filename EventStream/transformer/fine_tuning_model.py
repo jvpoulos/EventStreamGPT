@@ -130,6 +130,9 @@ class ESTForStreamClassification(StructuredTransformerPreTrainedModel):
         # Linear layer for continuous variables
         self.continuous_encoder = nn.Linear(3, config.hidden_size)
 
+        # Add a linear layer for dynamic_values
+        self.dynamic_values_encoder = nn.Linear(1, config.hidden_size)
+
         self.intermediate = nn.Sequential(
             nn.Linear(config.hidden_size, config.hidden_size),
             nn.ReLU(),
@@ -196,6 +199,7 @@ class ESTForStreamClassification(StructuredTransformerPreTrainedModel):
         # Process dynamic data
         dynamic_indices = batch['dynamic_indices'].to(device)
         dynamic_counts = batch['dynamic_counts'].to(device)
+        dynamic_values = batch['dynamic_values'].to(device)
         
         # Validate vocab size
         max_index = dynamic_indices.max().item()
@@ -230,16 +234,20 @@ class ESTForStreamClassification(StructuredTransformerPreTrainedModel):
         static_cat_embed = torch.stack(static_cat_embeds, dim=1).mean(dim=1)
         static_num_embed = self.continuous_encoder(static_continuous)
 
+        # Encode dynamic_values
+        dynamic_values_embed = self.dynamic_values_encoder(dynamic_values.unsqueeze(-1))
+        pooled_dynamic_values = dynamic_values_embed.mean(dim=1)  # or use max pooling if preferred
+
         # Combine static embeddings
         static_embed = static_cat_embed + static_num_embed
 
         # Combine dynamic and static embeddings
-        combined_embed = self.static_weight * static_embed + self.dynamic_weight * pooled_dynamic
+        combined_embed = self.static_weight * static_embed + self.dynamic_weight * (pooled_dynamic + pooled_dynamic_values)
         
         # Apply intermediate layers and dropout
         intermediate = self.dropout(self.intermediate(combined_embed))
         
-       # Get logits and probabilities
+        # Get logits and probabilities
         logits = self.logit_layer(intermediate).squeeze(-1)  # Ensure logits are squeezed
         probs = torch.sigmoid(logits)
         

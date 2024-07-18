@@ -171,13 +171,15 @@ class ESTForStreamClassificationLM(L.LightningModule):
         else:
             self.model = ESTForStreamClassification.from_pretrained(pretrained_weights_fp, config=config, vocabulary_config=vocabulary_config, optimization_config=self.optimization_config)
 
-    def on_before_optimizer_step(self, optimizer):
-        self.grad_norm_before = self.get_gradient_norm()
-        self.log('grad_norm_before', self.grad_norm_before, on_step=True, on_epoch=False, prog_bar=False, logger=True)
+        self.gradient_stats = {
+            'before_norm': [],
+            'after_norm': [],
+            'after_clip': []
+        }
+        self.metric_accumulator = defaultdict(list)
 
-    def on_after_optimizer_step(self, optimizer):
-        self.grad_norm_after = self.get_gradient_norm()
-        self.log('grad_norm_after', self.grad_norm_after, on_step=True, on_epoch=False, prog_bar=False, logger=True)
+    def on_train_start(self):
+        self.gradient_stats = {k: [] for k in self.gradient_stats}
 
     def get_gradient_norm(self):
         total_norm = 0.0
@@ -186,6 +188,14 @@ class ESTForStreamClassificationLM(L.LightningModule):
                 param_norm = p.grad.data.norm(2)
                 total_norm += param_norm.item() ** 2
         return total_norm ** 0.5
+
+    def on_before_optimizer_step(self, optimizer):
+        self.grad_norm_before = self.get_gradient_norm()
+        self.log('grad_norm_before', self.grad_norm_before, on_step=True, on_epoch=False, prog_bar=False, logger=True)
+
+    def on_after_optimizer_step(self, optimizer):
+        self.grad_norm_after = self.get_gradient_norm()
+        self.log('grad_norm_after', self.grad_norm_after, on_step=True, on_epoch=False, prog_bar=False, logger=True)
         
     def __reduce__(self):
         return (self.__class__, (self.config, self.optimization_config, self.cfg))
@@ -282,114 +292,52 @@ class ESTForStreamClassificationLM(L.LightningModule):
                     f"with preds ({str_summary(preds)}) and labels ({str_summary(labels)}): {e}."
                 )
 
-    def log_metrics(self, results: StreamClassificationModelOutput, skip_metrics: Sequence[str], prefix: str):
-        """Logs metric results for a given output result."""
-
-        if results.labels is None:
-            if results.loss is not None:
-                self.log(f"{prefix}_loss", results.loss)
-            return
-
-        self._log_metric_dict(
-            preds=results.preds,
-            labels=results.labels,
-            metrics=self.metrics,
-            skip_metrics=skip_metrics,
-            prefix=prefix,
-        )
-
-        if results.loss is not None:
-            self.log(f"{prefix}_loss", results.loss)
+    def log_metrics(self, prefix, outputs):
+        metrics = {
+            f'{prefix}_loss': outputs.loss,
+            f'{prefix}_accuracy': outputs.accuracy,
+            f'{prefix}_auc': outputs.auc
+        }
+        for name, value in metrics.items():
+            self.metric_accumulator[name].append(value.detach().cpu().item() if isinstance(value, torch.Tensor) else value)
+        
+        self.log_dict(metrics, on_step=True, on_epoch=False, prog_bar=True, logger=True)
 
     def training_step(self, batch, batch_idx):
         outputs = self.model(batch, labels=batch['labels'])
         loss = outputs.loss
 
-        # Check for NaN or Inf values
         if torch.isnan(loss) or torch.isinf(loss):
             logger.error(f"NaN or Inf loss detected: {loss}")
             return None
 
-        # Calculate gradient norm (this will be after potential clipping by PyTorch Lightning)
-        grad_norm = self.get_gradient_norm()
+        # Log gradients before normalization
+        self.log_gradients('before_norm')
 
-        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log('train_accuracy', outputs.accuracy, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log('train_auc', outputs.auc, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log('grad_norm', grad_norm, on_step=True, on_epoch=False, prog_bar=False, logger=True)
+        # Manually compute gradient norm and clip if necessary
+        if self.trainer.gradient_clip_val is not None:
+            torch.nn.utils.clip_grad_norm_(self.parameters(), self.trainer.gradient_clip_val)
         
-        log_message = f"Step {batch_idx}: train_loss={loss.item():.4f}, train_accuracy={outputs.accuracy:.4f}, grad_norm={grad_norm:.4f}"
-        logger.info(log_message)
+        # Log gradients after normalization/clipping
+        self.log_gradients('after_clip')
 
-        # Accumulate metrics
-        self._accumulate_metrics('train', {
-            'loss': loss.item(),
-            'accuracy': outputs.accuracy if outputs.accuracy is not None else 0.0,
-            'auc': outputs.auc if outputs.auc is not None else 0.0,
-            'grad_norm': grad_norm,
-        })
-
-        # Store gradient norm change
-        if len(self.gradient_norm_changes) > 0:
-            prev_norm = self.gradient_norm_changes[-1][1]
-            change = grad_norm - prev_norm
-            self.gradient_norm_changes.append((batch_idx, change))
-        else:
-            self.gradient_norm_changes.append((batch_idx, grad_norm))
+        self.log_metrics('train', outputs)
         
         return loss
 
-    def get_gradient_norm(self):
-        total_norm = 0.0
+    def log_gradients(self, stage):
+        total_norm = 0
         for p in self.parameters():
             if p.grad is not None:
                 param_norm = p.grad.data.norm(2)
                 total_norm += param_norm.item() ** 2
-        return total_norm ** 0.5
+        total_norm = total_norm ** 0.5
+        self.gradient_stats[stage].append(total_norm)
 
     def validation_step(self, batch, batch_idx):
-        if self.do_debug_mode:
-            logger.debug(f"Validation step - Batch keys: {batch.keys() if batch is not None else 'None'}")
         outputs = self.model(batch, labels=batch['labels'])
-        loss = outputs.loss
-
-        if self.do_debug_mode:
-            # Add learning rate to debug info
-            if outputs.debug_info is not None:
-                outputs.debug_info["learning_rate"] = self.trainer.optimizers[0].param_groups[0]['lr']
-            
-            logger.debug(f"Model outputs: {outputs}")
-            logger.debug(f"Loss: {loss}")
-        
-        if loss is not None:
-            if self.do_debug_mode:
-                logger.debug(f"Validation step - Logits shape: {outputs.preds.shape}")
-                logger.debug(f"Validation step - Labels shape: {outputs.labels.shape}")
-                logger.debug(f"Validation step - Loss: {loss.item()}")
-
-            self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-            self.log('val_accuracy', outputs.accuracy, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-            self.log('val_auc', outputs.auc, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-
-            if batch_idx % 100 == 0:
-                logger.info(f"Validation step {batch_idx}: val_loss={loss.item():.4f}, val_accuracy={outputs.accuracy:.4f}")
-
-            if outputs.accuracy is not None:
-                self.log('val_accuracy', outputs.accuracy, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-            
-            # Accumulate metrics
-            self._accumulate_metrics('val', {
-                'loss': loss.item(),
-                'accuracy': outputs.accuracy if outputs.accuracy is not None else 0.0,
-                'auc': outputs.auc if outputs.auc is not None else 0.0,
-            })
-                
-            # Log debugging information
-            if outputs.debug_info:
-                for key, value in outputs.debug_info.items():
-                    self._accumulate_metrics('val', {f'debug_{key}': value})
-        
-        return loss
+        self.log_metrics('val', outputs)
+        return outputs.loss
 
     def _accumulate_metrics(self, prefix, metrics):
         for key, value in metrics.items():
@@ -410,39 +358,38 @@ class ESTForStreamClassificationLM(L.LightningModule):
         self.__dict__[f'{prefix}_metrics'].clear()
 
     def on_train_epoch_end(self):
-        self._log_epoch_metrics('train')
-        if self.do_debug_mode:
-            self.log_gradient_outliers()
+        self.log_accumulated_metrics('train')
+        self.log_gradient_statistics()
+        self.gradient_stats = {k: [] for k in self.gradient_stats}
 
-    def log_gradient_outliers(self):
-        if not self.gradient_norm_changes:
-            return
+    def log_accumulated_metrics(self, prefix):
+        for name, values in self.metric_accumulator.items():
+            if name.startswith(prefix):
+                self.log(f'{name}_epoch', sum(values) / len(values), on_epoch=True, prog_bar=True, logger=True)
+        self.metric_accumulator = defaultdict(list)
 
-        # Sort changes by absolute value, descending
-        sorted_changes = sorted(self.gradient_norm_changes, key=lambda x: abs(x[1]), reverse=True)
-        
-        # Log top outliers
-        logger.info(f"Top {self.max_outliers_to_log} gradient norm change outliers:")
-        for batch_idx, change in sorted_changes[:self.max_outliers_to_log]:
-            logger.info(f"Batch {batch_idx}: gradient norm change of {change:.4f}")
+    def log_gradient_statistics(self):
+        for stage, norms in self.gradient_stats.items():
+            if norms:
+                mean_norm = sum(norms) / len(norms)
+                max_norm = max(norms)
+                min_norm = min(norms)
+                self.log(f'grad_norm_{stage}_mean', mean_norm, on_epoch=True, logger=True)
+                self.log(f'grad_norm_{stage}_max', max_norm, on_epoch=True, logger=True)
+                self.log(f'grad_norm_{stage}_min', min_norm, on_epoch=True, logger=True)
 
-        # Calculate and log statistics
-        changes = [change for _, change in self.gradient_norm_changes]
-        mean_change = np.mean(changes)
-        std_change = np.std(changes)
-        logger.info(f"Gradient norm change statistics - Mean: {mean_change:.4f}, Std: {std_change:.4f}")
-
-        # Log subjects with changes more than 3 standard deviations from the mean
-        significant_outliers = [(batch_idx, change) for batch_idx, change in self.gradient_norm_changes if abs(change - mean_change) > 3 * std_change]
-        logger.info(f"Batches with gradient norm changes > 3 std devs from mean:")
-        for batch_idx, change in significant_outliers:
-            logger.info(f"Batch {batch_idx}: gradient norm change of {change:.4f}")
-
-        # Clear the list for the next epoch
-        self.gradient_norm_changes.clear()
+        # Log gradient outliers
+        all_norms = self.gradient_stats['before_norm']
+        if all_norms:
+            mean = sum(all_norms) / len(all_norms)
+            std = (sum((x - mean) ** 2 for x in all_norms) / len(all_norms)) ** 0.5
+            outliers = [norm for norm in all_norms if abs(norm - mean) > 3 * std]
+            self.log('gradient_outliers_count', len(outliers), on_epoch=True, logger=True)
+            if outliers:
+                self.log('max_gradient_outlier', max(outliers), on_epoch=True, logger=True)
 
     def on_validation_epoch_end(self):
-        self._log_epoch_metrics('val')
+        self.log_accumulated_metrics('val')
 
     def test_step(self, batch, batch_idx):
         if self.do_debug_mode:
@@ -798,15 +745,19 @@ class CollateFunction:
 
         dynamic_indices = torch.zeros((len(valid_items), max_seq_len), dtype=torch.long)
         dynamic_counts = torch.zeros((len(valid_items), max_seq_len), dtype=torch.float32)
+        dynamic_values = torch.zeros((len(valid_items), max_seq_len), dtype=torch.float32)
 
         for i, item in enumerate(valid_items):
             seq_len = item['dynamic_indices'].size(0)
             dynamic_indices[i, :seq_len] = item['dynamic_indices']
             dynamic_counts[i, :seq_len] = item['dynamic_counts'][:seq_len]
+            if 'dynamic_values' in item:
+                dynamic_values[i, :seq_len] = item['dynamic_values'][:seq_len]
 
         collated_batch = {
             'dynamic_indices': dynamic_indices,
             'dynamic_counts': dynamic_counts,
+            'dynamic_values': dynamic_values,
             'labels': torch.stack([self.safe_tensor_conversion(item.get('labels', 0), torch.float32) for item in valid_items]).squeeze(),
             'InitialA1c': torch.tensor([self.safe_float_conversion(item.get('InitialA1c', 0.0)) for item in valid_items], dtype=torch.float32),
             'Female': torch.tensor([self.safe_int_conversion(item.get('Female', 0)) for item in valid_items], dtype=torch.long),
