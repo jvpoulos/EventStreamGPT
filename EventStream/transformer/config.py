@@ -530,6 +530,8 @@ class StructuredTransformerConfig(PretrainedConfig):
         layer_norm_epsilon: float = 1e-5,
         do_full_block_in_dep_graph_attention: bool | None = True,
         do_full_block_in_seq_attention: bool | None = False,
+        use_batch_norm: bool = False,
+        use_layer_norm: bool = True,
         # Model output configuration
         TTE_generation_layer_type: TimeToEventGenerationHeadType = "exponential",
         TTE_lognormal_generation_num_components: int | None = None,
@@ -636,6 +638,9 @@ class StructuredTransformerConfig(PretrainedConfig):
         self.numerical_embedding_weight = numerical_embedding_weight
         self.do_normalize_by_measurement_index = do_normalize_by_measurement_index
         self.do_use_learnable_sinusoidal_ATE = do_use_learnable_sinusoidal_ATE
+
+        self.use_batch_norm = use_batch_norm
+        self.use_layer_norm = use_layer_norm
 
         missing_param_err_tmpl = f"For a {structured_event_processing_mode} model, {{}} should not be None"
         extra_param_err_tmpl = (

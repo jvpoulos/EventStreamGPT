@@ -106,6 +106,10 @@ class InnerSelfAttention(nn.Module):
     ):
         super().__init__()
         self.config = config  # Store the config as an attribute
+        self.attention_type = attention_type
+        self.window_size = window_size
+        self.causal = attention_type in ["local", "global"]  # Set causal based on attention type
+
 
         max_seq_len = config.max_seq_len
         self.window_size = window_size
@@ -193,7 +197,7 @@ class InnerSelfAttention(nn.Module):
             # Call Flash Attention
             context = flash_attn_qkvpacked_func(
                 qkv,
-                dropout_p=self.drop.p if self.training else 0.0,
+                dropout_p=self.attn_dropout.p if self.training else 0.0,
                 softmax_scale=None,  # Let the function use default scale
                 causal=self.causal
             )
@@ -786,7 +790,10 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
             [InnerBlock(config, layer_id=i, is_seq=True) for i in range(config.num_hidden_layers)]
         )
 
-        self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
+        if config.use_layer_norm:
+            self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
+        if config.use_batch_norm:
+            self.bn_f = nn.BatchNorm1d(self.embed_dim)
 
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
@@ -1063,35 +1070,13 @@ class NestedAttentionPointProcessTransformer(StructuredTransformerPreTrainedMode
         dep_graph_past: tuple[torch.FloatTensor] | None = None,
         dep_graph_el_generation_target: int | None = None,
     ) -> tuple[torch.Tensor] | TransformerOutputWithPast:
-        """Performs a forward pass on the transformer model.
-
-        Args:
-            batch: A PytorchBatch instance containing input data.
-            input_embeds: Precomputed embeddings for the input data. Currently unused.
-            past: Past hidden states for more efficient decoding.
-            seq_attention_mask: Mask for the sequential attention mechanism.
-            head_mask: Mask to nullify selected heads of the self-attention module.
-            use_cache: Specifies whether caching should be used.
-            output_attentions: Specifies whether attention probabilities should be returned in the output.
-            output_hidden_states: Specifies whether hidden states should be returned in the output.
-            return_dict: Specifies whether the output should be an object with key names (True) or a tuple.
-
-        Returns:
-            A tuple containing hidden states, or a TransformerOutputWithPast object if return_dict is True.
-        """
-
-        output_attentions = (
-            output_attentions if output_attentions is not None else self.config.output_attentions
-        )
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         if input_embeds is None:
             assert batch is not None
-
             input_embeds = self.input_layer(
                 batch, dep_graph_el_generation_target=dep_graph_el_generation_target
             )
@@ -1103,39 +1088,21 @@ class NestedAttentionPointProcessTransformer(StructuredTransformerPreTrainedMode
         if seq_attention_mask is None and batch is not None and batch.get("event_mask", None) is not None:
             seq_attention_mask = expand_mask(batch["event_mask"], input_embeds.dtype)
 
-        # Prepare head mask if needed
-        # 1.0 in head_mask indicate we keep the head
-        # attention_probs has shape bsz x num_heads x N x N
-        # head_mask has shape n_layer x batch x num_heads x N x N
         head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
 
         hidden_states = input_embeds
         bsz, seq_len, dep_graph_len, hidden_size = hidden_states.shape
 
         presents = {"seq_past": (), "dep_graph_past": ()} if use_cache else None
-        if output_attentions:
-            all_self_attentions = {"seq_attentions": (), "dep_graph_attentions": ()}
-        else:
-            all_self_attentions = None
+        all_self_attentions = {"seq_attentions": (), "dep_graph_attentions": ()} if output_attentions else None
 
-        # Should we update the sequence cache of past key/values?
         update_seq_cache = False
-        # Should we update the dependency graph cache of past key/values?
         update_dep_graph_cache = False
-        # Should we re-set the dependency graph cache at the end to just the final element (used when
-        # generating new events, to initialize the dependency graph sequence with an appropriate history
-        # key/value embedding)?
         re_set_dep_graph_cache = False
-        # Are we generating new dep_graph_elements, and therefore don't need to re-compute contextualized
-        # history / event embeddings?
         prepend_graph_with_history_embeddings = True
         update_last_graph_el_to_history_embedding = True
 
         if use_cache:
-            # We only want to update the dependency graph cache when we're generating new dependency graph
-            # elements. Otherwise, it will be invalid as it is for past sequence elements. Conversely, we only
-            # want to update the sequence cache if we're generating a new sequence element, as otherwise it
-            # will be based on incomplete events and the new elements will be not used besides.
             match dep_graph_el_generation_target:
                 case int() if dep_graph_el_generation_target > 0:
                     update_dep_graph_cache = True
@@ -1148,10 +1115,8 @@ class NestedAttentionPointProcessTransformer(StructuredTransformerPreTrainedMode
                     update_last_graph_el_to_history_embedding = False
                 case int() if dep_graph_el_generation_target == 0:
                     update_seq_cache = True
-                    # We need to update it to re-set it to the right target at the end.
                     update_dep_graph_cache = True
                     re_set_dep_graph_cache = True
-
                     prepend_graph_with_history_embeddings = False
                     update_last_graph_el_to_history_embedding = True
                 case None:
@@ -1174,10 +1139,8 @@ class NestedAttentionPointProcessTransformer(StructuredTransformerPreTrainedMode
             prepend_graph_with_history_embeddings or update_last_graph_el_to_history_embedding
         )
 
-        if past is None:
-            past = tuple([None] * len(self.h))
-        if dep_graph_past is None:
-            dep_graph_past = tuple([None] * len(self.h))
+        past = tuple([None] * len(self.h)) if past is None else past
+        dep_graph_past = tuple([None] * len(self.h)) if dep_graph_past is None else dep_graph_past
 
         all_hidden_states = () if output_hidden_states else None
         for i, (block, layer_past, dep_graph_layer_past) in enumerate(zip(self.h, past, dep_graph_past)):
@@ -1191,8 +1154,8 @@ class NestedAttentionPointProcessTransformer(StructuredTransformerPreTrainedMode
                         "Setting `use_cache=False`..."
                     )
                     use_cache = False
-                    prepend_graph_with_history_embeddings = (True,)
-                    update_last_graph_el_to_history_embedding = (True,)
+                    prepend_graph_with_history_embeddings = True
+                    update_last_graph_el_to_history_embedding = True
                     update_seq_cache = False
                     update_dep_graph_cache = False
                     re_set_dep_graph_cache = False
@@ -1200,7 +1163,6 @@ class NestedAttentionPointProcessTransformer(StructuredTransformerPreTrainedMode
                 def create_custom_forward(module):
                     def custom_forward(*inputs):
                         return module(*inputs)
-
                     return custom_forward
 
                 args = (
@@ -1261,10 +1223,18 @@ class NestedAttentionPointProcessTransformer(StructuredTransformerPreTrainedMode
                     extra_return_info["dep_graph_module"]["attn_weights"],
                 )
 
-        hidden_states = self.ln_f(hidden_states)
+        # Apply layer normalization if configured
+        if self.config.use_layer_norm:
+            hidden_states = self.ln_f(hidden_states)
+        
+        # Apply batch normalization if configured
+        if self.config.use_batch_norm:
+            hidden_states = hidden_states.permute(0, 3, 1, 2)  # [bsz, hidden_size, seq_len, dep_graph_len]
+            hidden_states = self.bn_f(hidden_states)
+            hidden_states = hidden_states.permute(0, 2, 3, 1)  # [bsz, seq_len, dep_graph_len, hidden_size]
 
         hidden_states = hidden_states.view(input_embeds.size())
-        # Add last hidden state
+        
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
 
@@ -1272,12 +1242,7 @@ class NestedAttentionPointProcessTransformer(StructuredTransformerPreTrainedMode
             if not update_seq_cache:
                 presents["seq_past"] = past
             if re_set_dep_graph_cache:
-                # We need to re-set the dependency graph past to just have a single entry corresponding to the
-                # contextualized history key/value.
                 def reshape_to_last_dep_graph_el(t: torch.FloatTensor) -> torch.FloatTensor:
-                    # t is of shape (bsz * seq_len, num_heads, dep_graph_len, hidden_size)
-                    # We need to produce (bsz, num_heads, 1, hidden_size)
-
                     want_shape = (
                         bsz * seq_len,
                         self.config.num_attention_heads,

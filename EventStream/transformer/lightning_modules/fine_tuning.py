@@ -4,6 +4,7 @@ import json
 import os
 import random
 from collections.abc import Sequence
+from collections import defaultdict
 from pathlib import Path
 import pathlib
 from typing import Dict, Any, Union, Optional
@@ -120,6 +121,7 @@ class ESTForStreamClassificationLM(L.LightningModule):
         
         self.gradient_norm_changes = []
         self.max_outliers_to_log = 10
+        self.batch_indices = []  # Store batch indices instead of subject_ids
 
         # Initialize metrics dictionaries
         self.train_metrics = {}
@@ -180,7 +182,7 @@ class ESTForStreamClassificationLM(L.LightningModule):
 
     def on_train_start(self):
         self.gradient_stats = {k: [] for k in self.gradient_stats}
-
+    
     def get_gradient_norm(self):
         total_norm = 0.0
         for p in self.parameters():
@@ -197,6 +199,10 @@ class ESTForStreamClassificationLM(L.LightningModule):
         self.grad_norm_after = self.get_gradient_norm()
         self.log('grad_norm_after', self.grad_norm_after, on_step=True, on_epoch=False, prog_bar=False, logger=True)
         
+        # Calculate and store gradient norm change
+        grad_norm_change = self.grad_norm_after - self.grad_norm_before
+        self.gradient_norm_changes.append((grad_norm_change, self.batch_indices[-1]))
+
     def __reduce__(self):
         return (self.__class__, (self.config, self.optimization_config, self.cfg))
 
@@ -293,15 +299,31 @@ class ESTForStreamClassificationLM(L.LightningModule):
                 )
 
     def log_metrics(self, prefix, outputs):
-        metrics = {
-            f'{prefix}_loss': outputs.loss,
-            f'{prefix}_accuracy': outputs.accuracy,
-            f'{prefix}_auc': outputs.auc
-        }
-        for name, value in metrics.items():
-            self.metric_accumulator[name].append(value.detach().cpu().item() if isinstance(value, torch.Tensor) else value)
+        metrics = {}
         
-        self.log_dict(metrics, on_step=True, on_epoch=False, prog_bar=True, logger=True)
+        if hasattr(outputs, 'loss') and outputs.loss is not None:
+            metrics[f'{prefix}_loss'] = outputs.loss
+        
+        if hasattr(outputs, 'accuracy') and outputs.accuracy is not None:
+            metrics[f'{prefix}_accuracy'] = outputs.accuracy
+        
+        if hasattr(outputs, 'auc') and outputs.auc is not None:
+            metrics[f'{prefix}_auc'] = outputs.auc
+
+        for name, value in metrics.items():
+            if isinstance(value, torch.Tensor):
+                value = value.detach().cpu().item()
+            self.metric_accumulator[name].append(value)
+        
+        # Log all metrics at once
+        self.log_dict(metrics, on_step=(prefix == 'train'), on_epoch=True, prog_bar=True, logger=True)
+
+        # For validation, we only want to log the loss on_epoch
+        if prefix == 'val':
+            self.log(f'{prefix}_loss', metrics[f'{prefix}_loss'], on_step=False, on_epoch=True, prog_bar=True, logger=True)
+
+    def on_train_epoch_start(self):
+        self.batch_indices = []  # Reset for new epoch
 
     def training_step(self, batch, batch_idx):
         outputs = self.model(batch, labels=batch['labels'])
@@ -310,6 +332,9 @@ class ESTForStreamClassificationLM(L.LightningModule):
         if torch.isnan(loss) or torch.isinf(loss):
             logger.error(f"NaN or Inf loss detected: {loss}")
             return None
+
+        # Store batch index
+        self.batch_indices.append(batch_idx)
 
         # Log gradients before normalization
         self.log_gradients('before_norm')
@@ -321,8 +346,38 @@ class ESTForStreamClassificationLM(L.LightningModule):
         # Log gradients after normalization/clipping
         self.log_gradients('after_clip')
 
+        # Use the updated log_metrics function
         self.log_metrics('train', outputs)
         
+        return loss
+
+    def test_step(self, batch, batch_idx):
+        if self.do_debug_mode:
+            logger.debug(f"Test step - Batch keys: {batch.keys() if batch is not None else 'None'}")
+        
+        if batch is None:
+            logger.warning("Received None batch in test_step")
+            return None
+        
+        outputs = self.model(batch, labels=batch['labels'])
+        loss = outputs.loss
+
+        if self.do_debug_mode:
+            # Add learning rate to debug info
+            if hasattr(outputs, 'debug_info') and outputs.debug_info is not None:
+                outputs.debug_info["learning_rate"] = self.trainer.optimizers[0].param_groups[0]['lr']
+            
+            logger.debug(f"Model outputs: {outputs}")
+            logger.debug(f"Loss: {loss}")
+
+        # Use the updated log_metrics function
+        self.log_metrics('test', outputs)
+
+        # Log additional debugging information
+        if hasattr(outputs, 'debug_info') and outputs.debug_info:
+            for key, value in outputs.debug_info.items():
+                self.log(f'test_debug_{key}', value, on_step=False, on_epoch=True)
+
         return loss
 
     def log_gradients(self, stage):
@@ -359,7 +414,11 @@ class ESTForStreamClassificationLM(L.LightningModule):
 
     def on_train_epoch_end(self):
         self.log_accumulated_metrics('train')
+        # Log gradient statistics
         self.log_gradient_statistics()
+        
+        # Log subject_ids with highest gradient increases
+        self.log_gradient_instability()
         self.gradient_stats = {k: [] for k in self.gradient_stats}
 
     def log_accumulated_metrics(self, prefix):
@@ -378,51 +437,23 @@ class ESTForStreamClassificationLM(L.LightningModule):
                 self.log(f'grad_norm_{stage}_max', max_norm, on_epoch=True, logger=True)
                 self.log(f'grad_norm_{stage}_min', min_norm, on_epoch=True, logger=True)
 
-        # Log gradient outliers
-        all_norms = self.gradient_stats['before_norm']
-        if all_norms:
-            mean = sum(all_norms) / len(all_norms)
-            std = (sum((x - mean) ** 2 for x in all_norms) / len(all_norms)) ** 0.5
-            outliers = [norm for norm in all_norms if abs(norm - mean) > 3 * std]
-            self.log('gradient_outliers_count', len(outliers), on_epoch=True, logger=True)
-            if outliers:
-                self.log('max_gradient_outlier', max(outliers), on_epoch=True, logger=True)
+    def log_gradient_instability(self):
+        # Sort gradient changes and get top outliers
+        sorted_changes = sorted(self.gradient_norm_changes, key=lambda x: x[0], reverse=True)
+        top_outliers = sorted_changes[:self.max_outliers_to_log]
+
+        # Log batch indices of top outliers
+        for i, (change, batch_idx) in enumerate(top_outliers):
+            self.logger.experiment.log({f"gradient_instability/top_{i+1}": {
+                "change": change,
+                "batch_idx": batch_idx
+            }})
+
+        # Reset for next epoch
+        self.gradient_norm_changes = []
 
     def on_validation_epoch_end(self):
         self.log_accumulated_metrics('val')
-
-    def test_step(self, batch, batch_idx):
-        if self.do_debug_mode:
-            logger.debug(f"Test step - Batch keys: {batch.keys() if batch is not None else 'None'}")
-        if batch is None:
-            self.log('test_loss', None)
-            return None
-        
-        outputs = self.model(batch, labels=batch['labels'])
-        loss = outputs.loss
-
-        if self.do_debug_mode:
-            # Add learning rate to debug info
-            if outputs.debug_info is not None:
-                outputs.debug_info["learning_rate"] = self.trainer.optimizers[0].param_groups[0]['lr']
-            
-            logger.debug(f"Model outputs: {outputs}")
-            logger.debug(f"Loss: {loss}")
-        
-            if loss is not None:
-                # Accumulate metrics
-                self._accumulate_metrics('test', {
-                    'loss': loss.item(),
-                    'accuracy': outputs.accuracy,
-                    'auc': outputs.auc if outputs.auc is not None else BinaryAUROC()(outputs.preds, batch['labels']).item(),
-                })
-        
-        # Log debugging information
-        if outputs.debug_info:
-            for key, value in outputs.debug_info.items():
-                self._accumulate_metrics('test', {f'debug_{key}': value})
-        
-        return loss
 
     def _load_code_mapping(self):
         mapping_file = Path("data/code_mapping.json")
@@ -577,11 +608,12 @@ class FinetuneConfig:
 
     optimization_config: Dict[str, Any] = field(
         default_factory=lambda: {
-            'batch_size': 32,
-            'validation_batch_size': 64,
+            'batch_size': 128,
+            'validation_batch_size': 256,
             'num_dataloader_workers': 4,
             'max_epochs': 100,
-            'gradient_accumulation': 1,
+            'gradient_accumulation': 2,
+            'patience': 10,
         }
     )
 
@@ -742,22 +774,23 @@ class CollateFunction:
             raise ValueError("No valid items in batch")
 
         max_seq_len = max(item['dynamic_indices'].size(0) for item in valid_items)
-
         dynamic_indices = torch.zeros((len(valid_items), max_seq_len), dtype=torch.long)
         dynamic_counts = torch.zeros((len(valid_items), max_seq_len), dtype=torch.float32)
-        dynamic_values = torch.zeros((len(valid_items), max_seq_len), dtype=torch.float32)
+
+        dynamic_values = None
+        if 'dynamic_values' in valid_items[0]:
+            dynamic_values = torch.zeros((len(valid_items), max_seq_len), dtype=torch.float32)
 
         for i, item in enumerate(valid_items):
             seq_len = item['dynamic_indices'].size(0)
             dynamic_indices[i, :seq_len] = item['dynamic_indices']
             dynamic_counts[i, :seq_len] = item['dynamic_counts'][:seq_len]
-            if 'dynamic_values' in item:
+            if dynamic_values is not None and 'dynamic_values' in item:
                 dynamic_values[i, :seq_len] = item['dynamic_values'][:seq_len]
 
         collated_batch = {
             'dynamic_indices': dynamic_indices,
             'dynamic_counts': dynamic_counts,
-            'dynamic_values': dynamic_values,
             'labels': torch.stack([self.safe_tensor_conversion(item.get('labels', 0), torch.float32) for item in valid_items]).squeeze(),
             'InitialA1c': torch.tensor([self.safe_float_conversion(item.get('InitialA1c', 0.0)) for item in valid_items], dtype=torch.float32),
             'Female': torch.tensor([self.safe_int_conversion(item.get('Female', 0)) for item in valid_items], dtype=torch.long),
@@ -768,6 +801,9 @@ class CollateFunction:
             'SDI_score': torch.tensor([self.safe_float_conversion(item.get('SDI_score', 0.0)) for item in valid_items], dtype=torch.float32),
             'Veteran': torch.tensor([self.safe_int_conversion(item.get('Veteran', 0)) for item in valid_items], dtype=torch.long),
         }
+
+        if dynamic_values is not None:
+            collated_batch['dynamic_values'] = dynamic_values
 
         return collated_batch
 
@@ -819,12 +855,13 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, wandb_logger
     logger = logging.getLogger(__name__)
 
     try:
-        if wandb_logger is None:
+        if wandb.run is None:
             wandb.init(project=cfg.wandb_logger_kwargs.get('project', 'default_project'),
                        name=cfg.wandb_logger_kwargs.get('name', 'default_run'),
                        config=cfg.to_dict())
-        else:
-            wandb.init(config=cfg.to_dict())
+            wandb_logger = WandbLogger(experiment=wandb.run)
+        elif wandb_logger is None:
+            wandb_logger = WandbLogger(experiment=wandb.run)
 
         L.seed_everything(cfg.seed)
 
@@ -872,8 +909,8 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, wandb_logger
             LearningRateMonitor(logging_interval="step"),
             ModelCheckpoint(
                 dirpath=cfg.save_dir / "checkpoints",
-                filename="{epoch}-{val_loss:.2f}",
-                monitor="val_loss",
+                filename="{epoch}-{val_loss_epoch:.2f}",
+                monitor="val_loss_epoch", 
                 mode="min",
                 save_top_k=1,
                 save_weights_only=True,
@@ -885,7 +922,8 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, wandb_logger
                 min_delta=0.00,
                 patience=cfg.optimization_config['patience'],
                 verbose=True,
-                mode='max'
+                mode='max',
+                check_finite=True
             )
         ]
 
@@ -895,7 +933,7 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, wandb_logger
             callbacks=callbacks,
             logger=wandb_logger,
             accumulate_grad_batches=optimization_config.get('gradient_accumulation', 4),
-            max_epochs=optimization_config.get('max_epochs', 100),
+            max_epochs=optimization_config.get('max_epochs', 100),  # Ensure this is correctly passed
             gradient_clip_val=config.max_grad_norm if not optimization_config.get('use_grad_value_clipping', False) else optimization_config.get('clip_grad_value', None),
             gradient_clip_algorithm="norm" if not optimization_config.get('use_grad_value_clipping', False) else "value",
             enable_progress_bar=True,
@@ -916,5 +954,7 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, wandb_logger
     except Exception as e:
         logger.exception(f"An error occurred during training: {str(e)}")
         return None, None, None
+    finally:
+        pass
 
 __all__ = ['FinetuneConfig', 'train']

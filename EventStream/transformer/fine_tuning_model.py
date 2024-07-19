@@ -133,10 +133,15 @@ class ESTForStreamClassification(StructuredTransformerPreTrainedModel):
         # Add a linear layer for dynamic_values
         self.dynamic_values_encoder = nn.Linear(1, config.hidden_size)
 
+        # Create normalization layers
+        self.layer_norm = nn.LayerNorm(config.hidden_size) if config.use_layer_norm else nn.Identity()
+        self.batch_norm = nn.BatchNorm1d(config.hidden_size) if config.use_batch_norm else nn.Identity()
+
         self.intermediate = nn.Sequential(
             nn.Linear(config.hidden_size, config.hidden_size),
             nn.ReLU(),
-            nn.LayerNorm(config.hidden_size),
+            self.layer_norm,
+            self.batch_norm,
             self.dropout
         )
 
@@ -158,6 +163,9 @@ class ESTForStreamClassification(StructuredTransformerPreTrainedModel):
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.LayerNorm):
+            nn.init.ones_(module.weight)
+            nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.BatchNorm1d):
             nn.init.ones_(module.weight)
             nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
@@ -199,7 +207,13 @@ class ESTForStreamClassification(StructuredTransformerPreTrainedModel):
         # Process dynamic data
         dynamic_indices = batch['dynamic_indices'].to(device)
         dynamic_counts = batch['dynamic_counts'].to(device)
-        dynamic_values = batch['dynamic_values'].to(device)
+        
+        # Check if dynamic_values is present in the batch
+        if 'dynamic_values' in batch:
+            dynamic_values = batch['dynamic_values'].to(device)
+        else:
+            # If not present, create a tensor of zeros with the same shape as dynamic_indices
+            dynamic_values = torch.zeros_like(dynamic_indices, dtype=torch.float32).to(device)
         
         # Validate vocab size
         max_index = dynamic_indices.max().item()
@@ -245,7 +259,7 @@ class ESTForStreamClassification(StructuredTransformerPreTrainedModel):
         combined_embed = self.static_weight * static_embed + self.dynamic_weight * (pooled_dynamic + pooled_dynamic_values)
         
         # Apply intermediate layers and dropout
-        intermediate = self.dropout(self.intermediate(combined_embed))
+        intermediate = self.intermediate(combined_embed)
         
         # Get logits and probabilities
         logits = self.logit_layer(intermediate).squeeze(-1)  # Ensure logits are squeezed
@@ -289,7 +303,7 @@ class ESTForStreamClassification(StructuredTransformerPreTrainedModel):
             auc=auc,
             debug_info=debug_info
         )
-    
+
     @property
     def _uses_dep_graph(self):
         return self.config.structured_event_processing_mode == StructuredEventProcessingMode.NESTED_ATTENTION
