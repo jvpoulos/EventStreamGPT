@@ -855,13 +855,14 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, wandb_logger
     logger = logging.getLogger(__name__)
 
     try:
+        # Always initialize wandb
         if wandb.run is None:
             wandb.init(project=cfg.wandb_logger_kwargs.get('project', 'default_project'),
                        name=cfg.wandb_logger_kwargs.get('name', 'default_run'),
                        config=cfg.to_dict())
-            wandb_logger = WandbLogger(experiment=wandb.run)
-        elif wandb_logger is None:
-            wandb_logger = WandbLogger(experiment=wandb.run)
+        
+        # Always create a new WandbLogger
+        wandb_logger = WandbLogger(experiment=wandb.run)
 
         L.seed_everything(cfg.seed)
 
