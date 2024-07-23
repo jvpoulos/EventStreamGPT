@@ -107,7 +107,7 @@ class Dataset(DatasetBase):
         
         self.subjects_df = subjects_df
         self.events_df = events_df
-        self.dynamic_measurements_df = dynamic_measurements_df
+        self._dynamic_measurements_df = dynamic_measurements_df
         
         # Create the code mapping if not provided
         self.code_mapping = code_mapping or self._create_code_mapping()
@@ -1157,8 +1157,8 @@ class Dataset(DatasetBase):
         all_codes = set()
 
         # Collect codes from dynamic_indices in dynamic_measurements_df
-        if self.dynamic_measurements_df is not None and 'dynamic_indices' in self.dynamic_measurements_df.columns:
-            all_codes.update(self.dynamic_measurements_df['dynamic_indices'].cast(pl.Utf8).unique().to_list())
+        if self._dynamic_measurements_df is not None and 'dynamic_indices' in self._dynamic_measurements_df.columns:
+            all_codes.update(self._dynamic_measurements_df['dynamic_indices'].cast(pl.Utf8).unique().to_list())
 
         # Remove None values and convert to strings
         all_codes = {str(code) for code in all_codes if code is not None}

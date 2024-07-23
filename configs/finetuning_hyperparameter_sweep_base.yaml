@@ -2,14 +2,209 @@ defaults:
   - parameters: finetuning
   - _self_
 
-entity: null
-project: null
+entity: "diabetes_finetune_sweep"
+project: "diabetes_finetune"
 program: finetune.py
 method: bayes
 name: EST_FT_sweep
 metric:
   goal: minimize
-  name: tuning_loss
+  name: val_auc_epoch
 early_terminate:
   type: hyperband
   min_iter: 1000
+
+parameters:
+  do_overwrite:
+    value: false
+  seed:
+    value: 42
+  save_dir:
+    value: "./experiments/finetune/${now:%Y-%m-%d_%H-%M-%S}"
+  dataset_path:
+    value: null
+  config:
+    _target_:
+      value: EventStream.transformer.config.StructuredTransformerConfig
+    use_batch_norm:
+      value: [true, false]
+    use_layer_norm:
+      value: true
+    use_flash_attention:
+      value: true
+    problem_type:
+      value: "single_label_classification"
+    num_labels:
+      value: 2
+    do_use_learnable_sinusoidal_ATE:
+      values: [true, false]
+    do_split_embeddings:
+      values: [true, false]
+    categorical_embedding_dim:
+      values: [32, 64, 128]
+    numerical_embedding_dim:
+      values: [32, 64, 128]
+    static_embedding_mode:
+      value: sum_all
+    categorical_embedding_weight:
+      values: [0.1, 0.3, 0.5]
+    numerical_embedding_weight:
+      values: [0.3, 0.5, 0.7]
+    static_embedding_weight:
+      values: [0.3, 0.4, 0.6]
+    dynamic_embedding_weight:
+      values: [0.3, 0.5, 0.7]
+    do_normalize_by_measurement_index:
+      value: false
+    structured_event_processing_mode:
+      value: conditionally_independent
+    num_hidden_layers:
+      values: [4, 6, 8]
+    seq_attention_types:
+      value: ["global", "local"]
+    seq_window_size:
+      distribution: int_uniform
+      values: [168, 336, 504]
+    head_dim:
+      values: [16, 32, 64]
+    num_attention_heads:
+      values: [4, 8, 12]
+    max_grad_norm:
+      value: 1
+    intermediate_dropout:
+      distribution: uniform
+      min: 0.1
+      max: 0.5
+    attention_dropout:
+      values: [0.1, 0.3, 0.5]
+    input_dropout:
+      values: [0.1, 0.3, 0.5]
+    resid_dropout:
+      values: [0.1, 0.3, 0.5]
+    hidden_size:
+      value: ${config.head_dim} * ${config.num_attention_heads}
+    intermediate_size:
+      values: [256, 512, 1024]
+    task_specific_params:
+      pooling_method:
+        values: ["max", "mean"]
+
+  optimization_config:
+    init_lr:
+      distribution: log_uniform
+      min: 1e-5
+      max: 1e-2
+    end_lr:
+      distribution: log_uniform
+      min: 1e-7
+      max: 1e-4
+    end_lr_frac_of_init_lr:
+      value: ${optimization_config.end_lr} / ${optimization_config.init_lr}
+    max_epochs:
+      value: 100
+    batch_size:
+      values: [256, 512, 1024]
+    validation_batch_size:
+      ${optimization_config.batch_size}
+    lr_frac_warmup_steps:
+      value: 0.05
+    lr_decay_power:
+      distribution: uniform
+      min: 0.01
+      max: 1.0
+    weight_decay:
+      values: [0.00, 0.01, 0.03]
+    clip_grad_value:
+      values: [0.0, 1.0, 5.0]
+    use_grad_value_clipping:
+      values: [true, false]
+    patience:
+      value: 10
+    gradient_accumulation:
+      values: [1, 2, 4]
+    num_dataloader_workers:
+      value: 13
+    lr_num_warmup_steps:
+      value: 200
+    max_training_steps:
+      value: 316500
+    use_lr_scheduler:
+      value: true
+    lr_scheduler_type:
+      values: ["cosine", "linear", "one_cycle", "reduce_on_plateau"]
+
+  data_config:
+    save_dir:
+      value: "./data"
+    dl_reps_dir:
+      value: "data/DL_reps"
+    dataset_path:
+      value: null
+    max_seq_len:
+      value: max(${config.seq_window_size} * 2, 512)
+    subsequence_sampling_strategy:
+      value: to_end
+    min_seq_len:
+      value: min(${config.seq_window_size} // 2, 16)
+    train_subset_size:
+      value: "FULL"
+    train_subset_seed:
+      value: null
+    task_df_name:
+      value: "a1c_greater_than_7"
+    seq_padding_side:
+      value: right
+    do_include_subject_id:
+      value: false
+    do_include_start_time_min:
+      value: false
+    do_include_subsequence_indices:
+      value: false
+
+  trainer_config:
+    accelerator:
+      value: auto
+    devices:
+      value: 3
+    precision:
+      value: "16-mixed"
+    detect_anomaly:
+      value: false
+    log_every_n_steps:
+      value: 100
+    strategy:
+      value: "ddp_find_unused_parameters_true"
+
+  experiment_dir:
+    value: "./experiments"
+
+  wandb_logger_kwargs:
+    name:
+      value: "jvpoulos"
+    project:
+      value: "diabetes_finetune"
+    team:
+      value: null
+    log_model:
+      value: false
+    do_log_graph:
+      value: false
+
+  wandb_experiment_config_kwargs:
+    entity:
+      value: "sweep"
+    project:
+      value: "diabetes_finetune_sweep"
+    team:
+      value: null
+    log_model:
+      value: false
+    do_log_graph:
+      value: false
+
+  do_final_validation_on_metrics:
+    value: false
+  do_use_filesystem_sharing:
+    value: false
+  do_debug_mode:
+    value: false

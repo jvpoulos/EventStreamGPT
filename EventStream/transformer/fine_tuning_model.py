@@ -32,13 +32,12 @@ class CustomConditionallyIndependentPointProcessTransformer(ConditionallyIndepen
         print(f"CustomConditionallyIndependentPointProcessTransformer: oov_index = {oov_index}")
         super().__init__(config, vocabulary_config, oov_index=oov_index)
 
-        self.input_layer = ConditionallyIndependentPointProcessInputLayer(
-            config,
-            vocabulary_config.vocab_sizes_by_measurement,
-            oov_index=oov_index,
-            do_use_sinusoidal=config.do_use_sinusoidal
-        )
+        if config.use_layer_norm:
+            self.ln_f = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        else:
+            self.ln_f = nn.Identity()  # Use Identity if layer norm is not required
 
+        # Initialize weights
         self.initialize_weights()
 
     def _init_weights(self, module):
