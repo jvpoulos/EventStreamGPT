@@ -237,7 +237,7 @@ class CIPPTForGenerativeSequenceModeling(StructuredGenerationMixin, StructuredTr
 def forward(
     self,
     dynamic_indices: torch.Tensor,
-    dynamic_counts: torch.Tensor | None = None,
+    dynamic_values: torch.Tensor | None = None,
     batch: PytorchBatch | None = None,
     input_embeds: torch.Tensor | None = None,
     past: tuple[torch.FloatTensor] | None = None,
@@ -257,7 +257,7 @@ def forward(
     if batch is None:
         batch = PytorchBatch(
             dynamic_indices=dynamic_indices,
-            dynamic_counts=dynamic_counts,
+            dynamic_values=dynamic_values,
         )
 
     if input_embeds is None:
@@ -278,10 +278,8 @@ def forward(
 
     if use_cache:
         output['past_key_values'] = encoded.past_key_values
-
     if output_attentions:
         output['attentions'] = encoded.attentions
-
     if output_hidden_states:
         output['hidden_states'] = encoded.hidden_states
 

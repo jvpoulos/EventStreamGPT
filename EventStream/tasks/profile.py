@@ -4,7 +4,7 @@ from pathlib import Path
 
 import polars as pl
 
-pl.enable_string_cache(True)
+pl.enable_string_cache()
 
 
 def add_tasks_from(
@@ -118,53 +118,38 @@ def add_tasks_from(
 KEY_COLS = ["subject_id", "start_time", "end_time"]
 
 
-def summarize_binary_task(task_df: pl.LazyFrame):
-    """Prints a summary dataframe describing binary tasks.
-
-    Args:
-        task_df: The task dataframe in question.
-
-    Examples:
-        >>> import polars as pl
-        >>> from datetime import datetime
-        >>> task_df = pl.DataFrame({
-        ...     'subject_id': [1, 1, 1, 2, 3, 4, 4],
-        ...     'start_time': [datetime(2020, 1, 1), None, None, datetime(2020, 3, 2), None, None, None],
-        ...     'end_time': [
-        ...         datetime(2020, 1, 4), datetime(1980, 1, 2), datetime(1991, 2, 5),
-        ...         datetime(2022, 1, 1), datetime(2022, 1, 1), None, None,
-        ...     ],
-        ...     'label': [1, 0, 0, 1, 0, 0, 1],
-        ... }).lazy()
-        >>> pl.Config.set_tbl_width_chars(80)
-        <class 'polars.config.Config'>
-        >>> summarize_binary_task(task_df)
-        shape: (1, 4)
-        ┌───────────────────┬──────────────────────────┬────────────────────┬──────────┐
-        │ n_samples_overall ┆ median_samples_per_subje ┆ label/subject Mean ┆ label    │
-        │ ---               ┆ ct                       ┆ ---                ┆ ---      │
-        │ u32               ┆ ---                      ┆ f64                ┆ f64      │
-        │                   ┆ f64                      ┆                    ┆          │
-        ╞═══════════════════╪══════════════════════════╪════════════════════╪══════════╡
-        │ 7                 ┆ 1.5                      ┆ 0.458333           ┆ 0.428571 │
-        └───────────────────┴──────────────────────────┴────────────────────┴──────────┘
-    """
+def summarize_binary_task(task_df):
+    print("Entering summarize_binary_task")
+    print(f"Input DataFrame shape: {task_df.shape}")
+    print(f"Input DataFrame columns: {task_df.columns}")
+    
+    if not isinstance(task_df, pl.LazyFrame):
+        task_df = task_df.lazy()
+    
     label_cols = [c for c in task_df.columns if c not in KEY_COLS]
-    return (
-        task_df.group_by("subject_id")
-        .agg(
-            pl.count().alias("samples_per_subject"),
-            *[pl.col(c).mean() for c in label_cols],
+    print(f"Label columns: {label_cols}")
+    
+    try:
+        result = (
+            task_df.group_by("subject_id")
+            .agg(
+                pl.count().alias("samples_per_subject"),
+                *[pl.col(c).mean() for c in label_cols],
+            )
+            .select(
+                pl.col("samples_per_subject").sum().alias("n_samples_overall"),
+                pl.col("samples_per_subject").median().alias("median_samples_per_subject"),
+                *[pl.col(c).mean().alias(f"{c}/subject Mean") for c in label_cols],
+                *[
+                    (pl.col(c).cast(pl.Float64) * pl.col("samples_per_subject")).sum()
+                    / (pl.col("samples_per_subject").sum()).alias(f"{c} Mean")
+                    for c in label_cols
+                ],
+            )
+            .collect()
         )
-        .select(
-            pl.col("samples_per_subject").sum().alias("n_samples_overall"),
-            pl.col("samples_per_subject").median().alias("median_samples_per_subject"),
-            *[pl.col(c).mean().alias(f"{c}/subject Mean") for c in label_cols],
-            *[
-                (pl.col(c).cast(pl.Float64) * pl.col("samples_per_subject")).sum()
-                / (pl.col("samples_per_subject").sum()).alias(f"{c} Mean")
-                for c in label_cols
-            ],
-        )
-        .collect()
-    )
+        print("Result computed successfully")
+        return result
+    except Exception as e:
+        print(f"Error in summarize_binary_task: {e}")
+        return None

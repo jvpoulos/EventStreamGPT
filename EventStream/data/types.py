@@ -170,8 +170,7 @@ class PytorchBatch:
     subject_id: torch.LongTensor | None = None
 
     stream_labels: dict[str, torch.FloatTensor | torch.LongTensor] | None = None
-    dynamic_counts: torch.Tensor | None = None  # Add this line
-    event_type: torch.Tensor | None = None  # Add this line
+    event_type: torch.Tensor | None = None
 
     @property
     def device(self) -> torch.device:
@@ -268,7 +267,6 @@ class PytorchBatch:
                 else {k: v[batch_index] for k, v in self.stream_labels.items()}
             ),
             time=None if self.time is None else self.time[batch_index, seq_index],
-            dynamic_counts=self.dynamic_counts[batch_index, seq_index] if self.dynamic_counts is not None else None,  # Add this line
             event_type=self.event_type[batch_index, seq_index] if self.event_type is not None else None,  # Add this line
         )
 

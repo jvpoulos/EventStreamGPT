@@ -748,17 +748,18 @@ class ConditionallyIndependentPointProcessInputLayer(torch.nn.Module):
     def forward(self, batch: PytorchBatch | torch.Tensor) -> torch.Tensor:
         if isinstance(batch, torch.Tensor):
             dynamic_indices = batch
-            dynamic_counts = torch.ones_like(dynamic_indices, dtype=torch.float)
+            dynamic_values = None
         elif isinstance(batch, PytorchBatch):
             dynamic_indices = batch.dynamic_indices
-            dynamic_counts = batch.dynamic_counts
+            dynamic_values = getattr(batch, 'dynamic_values', None)
         else:
             raise TypeError("Input 'batch' should be a PytorchBatch object or a Tensor.")
 
         data_embed: torch.Tensor = self.data_embedding_layer(dynamic_indices)
         
-        # Multiply by counts
-        data_embed = data_embed * dynamic_counts.unsqueeze(-1)
+        if dynamic_values is not None:
+            # Incorporate dynamic_values into the embedding
+            data_embed = data_embed + self.dynamic_values_encoder(dynamic_values.unsqueeze(-1))
         
         # Add a small epsilon to avoid division by zero
         epsilon = 1e-8

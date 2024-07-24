@@ -171,7 +171,7 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
         if self.cached_data.is_empty():
             raise ValueError(f"Cached data is empty for split '{split}'")
 
-        required_columns = ["subject_id", "dynamic_indices", "dynamic_counts"]
+        required_columns = ["subject_id", "dynamic_indices"]
         missing_columns = [col for col in required_columns if col not in self.cached_data.columns]
         if missing_columns:
             raise ValueError(f"Required columns {missing_columns} are missing in the cached data for split '{split}'")
@@ -512,10 +512,6 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
             if 'dynamic_indices' in full_subj_data:
                 full_subj_data['dynamic_indices'] = torch.tensor(full_subj_data['dynamic_indices'], dtype=torch.long)
             
-            # Convert dynamic_counts to tensor
-            if 'dynamic_counts' in full_subj_data:
-                full_subj_data['dynamic_counts'] = torch.tensor(full_subj_data['dynamic_counts'], dtype=torch.long)
-            
             # Convert dynamic_values to tensor, keeping it as float
             if 'dynamic_values' in full_subj_data:
                 full_subj_data['dynamic_values'] = torch.tensor(full_subj_data['dynamic_values'], dtype=torch.float)
@@ -738,7 +734,7 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
                     torch.nn.functional.pad(dynamic_counts_event_type, (0, seq_delta), value=0)
                 )
 
-            for k in ("dynamic_indices", "dynamic_counts"):
+            for k in ("dynamic_indices"):
                 values = e.get(k, [])
                 if not values:
                     continue
@@ -836,19 +832,16 @@ def collate(self, batch):
     
     # Initialize the tensors with the correct shape
     dynamic_indices = torch.zeros((len(valid_items), max_seq_len), dtype=torch.long, device=device)
-    dynamic_counts = torch.zeros((len(valid_items), max_seq_len), dtype=torch.long, device=device)
     dynamic_values = torch.zeros((len(valid_items), max_seq_len), dtype=torch.float, device=device)
     
     # Populate the tensors with the data from valid items
     for i, item in enumerate(valid_items):
         seq_len = len(item["dynamic_indices"])
         dynamic_indices[i, :seq_len] = item["dynamic_indices"]
-        dynamic_counts[i, :seq_len] = item["dynamic_counts"]
         dynamic_values[i, :seq_len] = item["dynamic_values"]
     
     out_batch = {
         "dynamic_indices": dynamic_indices,
-        "dynamic_counts": dynamic_counts,
         "dynamic_values": dynamic_values,
     }
     

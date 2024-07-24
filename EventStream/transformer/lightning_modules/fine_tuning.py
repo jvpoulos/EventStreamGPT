@@ -463,22 +463,22 @@ class ESTForStreamClassificationLM(L.LightningModule):
         else:
             raise FileNotFoundError("Code mapping file not found. Please run preprocessing first.")
 
-
     def forward(self, batch, **kwargs):
         if not isinstance(batch, dict):
             raise TypeError("Input 'batch' should be a dictionary.")
         
         dynamic_indices = batch.get("dynamic_indices")
-        dynamic_counts = batch.get("dynamic_counts")
+        dynamic_values = batch.get("dynamic_values")
         
         if dynamic_indices is None:
             raise ValueError("'dynamic_indices' must be provided in the batch.")
 
         if 'dynamic_indices' in batch:
             batch['dynamic_indices'] = batch['dynamic_indices'].long()
+
         outputs = self.model(
             dynamic_indices=dynamic_indices,
-            dynamic_counts=dynamic_counts,
+            dynamic_values=dynamic_values,
             **kwargs
         )
         
@@ -775,7 +775,6 @@ class CollateFunction:
 
         max_seq_len = max(item['dynamic_indices'].size(0) for item in valid_items)
         dynamic_indices = torch.zeros((len(valid_items), max_seq_len), dtype=torch.long)
-        dynamic_counts = torch.zeros((len(valid_items), max_seq_len), dtype=torch.float32)
 
         dynamic_values = None
         if 'dynamic_values' in valid_items[0]:
@@ -784,13 +783,11 @@ class CollateFunction:
         for i, item in enumerate(valid_items):
             seq_len = item['dynamic_indices'].size(0)
             dynamic_indices[i, :seq_len] = item['dynamic_indices']
-            dynamic_counts[i, :seq_len] = item['dynamic_counts'][:seq_len]
             if dynamic_values is not None and 'dynamic_values' in item:
                 dynamic_values[i, :seq_len] = item['dynamic_values'][:seq_len]
 
         collated_batch = {
             'dynamic_indices': dynamic_indices,
-            'dynamic_counts': dynamic_counts,
             'labels': torch.stack([self.safe_tensor_conversion(item.get('labels', 0), torch.float32) for item in valid_items]).squeeze(),
             'InitialA1c': torch.tensor([self.safe_float_conversion(item.get('InitialA1c', 0.0)) for item in valid_items], dtype=torch.float32),
             'Female': torch.tensor([self.safe_int_conversion(item.get('Female', 0)) for item in valid_items], dtype=torch.long),

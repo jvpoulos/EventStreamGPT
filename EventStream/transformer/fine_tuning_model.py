@@ -205,7 +205,6 @@ class ESTForStreamClassification(StructuredTransformerPreTrainedModel):
         
         # Process dynamic data
         dynamic_indices = batch['dynamic_indices'].to(device)
-        dynamic_counts = batch['dynamic_counts'].to(device)
         
         # Check if dynamic_values is present in the batch
         if 'dynamic_values' in batch:
@@ -228,7 +227,7 @@ class ESTForStreamClassification(StructuredTransformerPreTrainedModel):
         ], dim=1)
         
         # Encode dynamic data
-        pytorch_batch = PytorchBatch(dynamic_indices=dynamic_indices, dynamic_counts=dynamic_counts)
+        pytorch_batch = PytorchBatch(dynamic_indices=dynamic_indices)
         encoded = self.encoder(pytorch_batch).last_hidden_state
         
         # Extract relevant encoded information

@@ -1485,7 +1485,6 @@ class DatasetBase(
                     "event_id",
                     "timestamp",
                     "dynamic_indices",
-                    "dynamic_counts",
                     "dynamic_values",
                     "InitialA1c", "Female", "Married", "GovIns", 
                     "English", "AgeYears", "SDI_score", "Veteran"
@@ -1598,8 +1597,6 @@ class DatasetBase(
             viz_config.subset_random_seed = self._seed(seed=viz_config.subset_random_seed, key="visualize")
 
         if viz_config.subset_size is not None:
-            subject_ids = list(np.random.choice(list(self.subject_ids), viz_config.subset_size))
-
             subjects_df = self._filter_col_inclusion(self.subjects_df, {"subject_id": subject_ids})
             events_df = self._filter_col_inclusion(self.events_df, {"subject_id": subject_ids})
             dynamic_measurements_df = self._filter_col_inclusion(
@@ -1609,6 +1606,11 @@ class DatasetBase(
             subjects_df = self.subjects_df
             events_df = self.events_df
             dynamic_measurements_df = self.dynamic_measurements_df
+
+        # Cast subject_id to u32 in all DataFrames
+        subjects_df = subjects_df.with_columns(pl.col("subject_id").cast(pl.UInt32))
+        events_df = events_df.with_columns(pl.col("subject_id").cast(pl.UInt32))
+        dynamic_measurements_df = dynamic_measurements_df.with_columns(pl.col("subject_id").cast(pl.UInt32))
 
         if viz_config.age_col is not None:
             events_df = self._denormalize(events_df, viz_config.age_col)

@@ -383,9 +383,6 @@ class Dataset(DatasetBase):
         
         dynamic_measurements_df = df.select(dynamic_cols)
 
-        # Add dynamic_counts column
-        dynamic_measurements_df = dynamic_measurements_df.with_columns(pl.lit(1).cast(pl.UInt32).alias("dynamic_counts"))
-
         # Ensure dynamic_values column exists for all event types
         if "dynamic_values" not in dynamic_measurements_df.columns:
             dynamic_measurements_df = dynamic_measurements_df.with_columns(
@@ -694,17 +691,14 @@ class Dataset(DatasetBase):
             if 'dynamic_indices' not in dynamic_measurements_df.columns:
                 raise ValueError("'dynamic_indices' column not found in dynamic_measurements_df")
 
-            # Ensure 'dynamic_values' and 'dynamic_counts' are present
+            # Ensure 'dynamic_values' are present
             if 'dynamic_values' not in dynamic_measurements_df.columns:
                 dynamic_measurements_df = dynamic_measurements_df.with_columns(pl.lit(None).cast(pl.Utf8).alias('dynamic_values'))
-            if 'dynamic_counts' not in dynamic_measurements_df.columns:
-                dynamic_measurements_df = dynamic_measurements_df.with_columns(pl.lit(1).cast(pl.UInt32).alias('dynamic_counts'))
 
             # Cast columns to appropriate types
             dynamic_measurements_df = dynamic_measurements_df.with_columns([
                 pl.col('dynamic_indices').cast(pl.UInt32),
-                pl.col('dynamic_values').cast(pl.Utf8),
-                pl.col('dynamic_counts').cast(pl.UInt32)
+                pl.col('dynamic_values').cast(pl.Utf8)
             ])
 
         return subjects_df, events_df, dynamic_measurements_df
@@ -1203,16 +1197,6 @@ class Dataset(DatasetBase):
                         ])
                         updated_cols.append('dynamic_values')
                     
-                    # Ensure dynamic_counts is present and properly typed
-                    if 'dynamic_counts' not in source_df.columns:
-                        source_df = source_df.with_columns([
-                            pl.lit(1).cast(pl.UInt32).alias('dynamic_counts')
-                        ])
-                    else:
-                        source_df = source_df.with_columns([
-                            pl.col('dynamic_counts').fill_null(1).cast(pl.UInt32)
-                        ])
-                    updated_cols.append('dynamic_counts')
                 elif config.modality == DataModality.MULTI_LABEL_CLASSIFICATION:
                     print(f"Transforming multi-label classification measurement: {measure}")
                     source_df = self._transform_multi_label_classification(measure, config, source_df)
@@ -1516,7 +1500,6 @@ class Dataset(DatasetBase):
             # For dynamic_indices, we preserve the original values
             source_df = source_df.with_columns([
                 pl.col('dynamic_indices').cast(pl.UInt32),
-                pl.col('dynamic_counts').fill_null(1).cast(pl.UInt32),
                 pl.col('dynamic_values').cast(pl.Utf8)
             ])
             
@@ -1619,12 +1602,6 @@ class Dataset(DatasetBase):
             normalized_vals_col = M.predict_from_polars(vals_col, pl.col("normalizer"))
             source_df = source_df.with_columns(normalized_vals_col.alias(f"{vals_col_name}_normalized"))
 
-        # Ensure dynamic_counts is present and properly typed
-        if 'dynamic_counts' not in source_df.columns:
-            source_df = source_df.with_columns(pl.lit(1).cast(pl.UInt32).alias('dynamic_counts'))
-        else:
-            source_df = source_df.with_columns(pl.col('dynamic_counts').fill_null(1).cast(pl.UInt32))
-
         return source_df.drop(cols_to_drop_at_end)
 
     @TimeableMixin.TimeAs
@@ -1644,7 +1621,6 @@ class Dataset(DatasetBase):
             # For dynamic_indices, we preserve the original values
             transform_expr = [
                 vocab_el_col.cast(pl.UInt32).alias(measure),
-                pl.col('dynamic_counts').fill_null(1).cast(pl.UInt32),
                 pl.col('dynamic_values').cast(pl.Utf8)
             ]
         else:
@@ -1794,15 +1770,11 @@ class Dataset(DatasetBase):
         dynamic_data = dynamic_measurements_df.select(
             "event_id",
             "dynamic_indices",
-            "dynamic_values",
-            "dynamic_counts"
+            "dynamic_values"
         )
 
         # Handle dynamic_indices (keep as UInt32)
         dynamic_data = dynamic_data.with_columns(pl.col("dynamic_indices").cast(pl.UInt32))
-
-        # Handle dynamic_counts
-        dynamic_data = dynamic_data.with_columns(pl.col("dynamic_counts").fill_null(1).cast(pl.UInt32))
 
         # Handle dynamic_values
         dynamic_data = dynamic_data.with_columns(pl.col("dynamic_values").cast(pl.Utf8))
@@ -1821,14 +1793,13 @@ class Dataset(DatasetBase):
         )
 
         # Ensure all necessary columns are present in event_data
-        for col in ["dynamic_indices", "dynamic_counts", "dynamic_values"]:
+        for col in ["dynamic_indices", "dynamic_values"]:
             if col not in event_data.columns:
                 event_data = event_data.with_columns(pl.lit(None).alias(col))
 
         # Cast columns to appropriate types
         event_data = event_data.with_columns([
             pl.col("dynamic_indices").cast(pl.UInt32),
-            pl.col("dynamic_counts").cast(pl.UInt32),
             pl.col("dynamic_values").cast(pl.Utf8)
         ])
 
@@ -2015,13 +1986,12 @@ class Dataset(DatasetBase):
             if m == 'dynamic_indices':
                 out_dfs[m] = (
                     df.lazy()
-                    .select("event_id", "dynamic_indices", "dynamic_values", "dynamic_counts")
+                    .select("event_id", "dynamic_indices", "dynamic_values")
                     .filter(pl.col("dynamic_indices").is_not_null())
                     .group_by("event_id")
                     .agg(
                         pl.col("dynamic_indices").alias(f"dynamic/{m}/indices"),
-                        pl.col("dynamic_values").alias(f"dynamic/{m}/values"),
-                        pl.col("dynamic_counts").sum().alias(f"dynamic/{m}/counts")
+                        pl.col("dynamic_values").alias(f"dynamic/{m}/values")
                     )
                 )
                 continue
