@@ -760,12 +760,13 @@ class Dataset(DatasetBase):
             
     def _update_subject_event_properties(self):
         if self.events_df is not None:
-            self.event_types = (
-                self.events_df.get_column("event_type")
-                .value_counts(sort=True)
-                .get_column("event_type")
-                .to_list()
-            )
+            # Split combined event types and keep only unique single event types
+            all_event_types = set()
+            for event_type in self.events_df.get_column("event_type").unique():
+                all_event_types.update(event_type.split('&'))
+            self.event_types = sorted(list(all_event_types))
+
+            self.event_types_idxmap = {event_type: idx for idx, event_type in enumerate(self.event_types, start=1)}
 
             n_events_pd = self.events_df.get_column("subject_id").value_counts(sort=False).to_pandas()
             n_events_pd.columns = ['subject_id', 'counts']  # Rename the columns

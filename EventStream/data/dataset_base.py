@@ -457,11 +457,62 @@ class DatasetBase(
                 json.dump(inferred_measurement_configs, f)
             print("Inferred measurement metadata saved.")
 
-        # Save vocabulary configuration
+        # Update and save vocabulary configuration
+        print("Updating and saving vocabulary configuration...")
+        
+        # First, update the events_df to ensure we have the correct event types
+        def split_event_type(event_type):
+            types = event_type.split('&')
+            return types[0] if len(types) == 1 else 'MULTIPLE'
+
+        self.events_df = self.events_df.with_columns([
+            pl.col('event_type').map_elements(split_event_type).alias('event_type')
+        ])
+
+        # Now get the unique event types from the updated events_df
+        unique_event_types = self.events_df['event_type'].unique().to_list()
+        
+        # Ensure 'LAB' is included if it's not already present
+        if 'LAB' not in unique_event_types:
+            unique_event_types.append('LAB')
+        
+        # Sort the event types to ensure a consistent order
+        unique_event_types = sorted(unique_event_types)
+        
+        # Create the event_types_idxmap with the correct mapping
+        event_types_idxmap = {
+            'DIAGNOSIS': 1,
+            'LAB': 2,
+            'PROCEDURE': 3
+        }
+
+        updated_vocab_config = {
+            "vocab_sizes_by_measurement": {
+                'event_type': len(event_types_idxmap),
+                'dynamic_indices': len(self.code_mapping),
+            },
+            "vocab_offsets_by_measurement": {
+                'event_type': 1,
+                'dynamic_indices': len(event_types_idxmap) + 1,
+            },
+            "measurements_idxmap": self.vocabulary_config.measurements_idxmap,
+            "measurements_per_generative_mode": self.vocabulary_config.measurements_per_generative_mode,
+            "event_types_idxmap": event_types_idxmap
+        }
+
         vocab_config_fp = self.config.save_dir / "vocabulary_config.json"
-        print("Saving vocabulary configuration...")
-        self.vocabulary_config.to_json_file(vocab_config_fp, do_overwrite=do_overwrite)
+        with open(vocab_config_fp, "w") as f:
+            json.dump(updated_vocab_config, f, indent=2)
         print("Vocabulary configuration saved.")
+
+        # Update events_df with single event types
+        def split_event_type(event_type):
+            types = event_type.split('&')
+            return types[0] if len(types) == 1 else 'MULTIPLE'
+
+        self.events_df = self.events_df.with_columns([
+            pl.col('event_type').map_elements(split_event_type).alias('event_type')
+        ])
 
         # Save dataframes
         print("Saving dataframes...")

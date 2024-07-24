@@ -184,7 +184,7 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
                 self.cached_data[col] = pd.Series([[]] * len(self.cached_data))
 
         self.vocabulary_config = VocabularyConfig.from_json_file(
-            Path("data") / "vocabulary_config.json"
+            Path("data/labs") / "vocabulary_config.json"
         )
         inferred_measurement_config_fp = Path("data") / "inferred_measurement_configs.json"
         with open(inferred_measurement_config_fp) as f:

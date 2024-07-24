@@ -608,7 +608,7 @@ class FinetuneConfig:
 
     optimization_config: Dict[str, Any] = field(
         default_factory=lambda: {
-            'batch_size': 128,
+            'batch_size': 256,
             'validation_batch_size': 256,
             'num_dataloader_workers': 4,
             'max_epochs': 100,
@@ -920,7 +920,7 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, wandb_logger
             ),
             EarlyStopping(
                 monitor='val_auc_epoch',
-                min_delta=0.00,
+                min_delta=0.001,
                 patience=cfg.optimization_config['patience'],
                 verbose=True,
                 mode='max',
