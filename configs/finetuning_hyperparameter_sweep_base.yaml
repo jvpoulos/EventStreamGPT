@@ -2,8 +2,16 @@ defaults:
   - parameters: finetuning
   - _self_
 
-entity: "diabetes_finetune_sweep"
-project: "diabetes_finetune"
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  job:
+    chdir: True
+    
+entity: "jvpoulos"  # your W&B username
+project: "diabetes_sweep"
 program: finetune.py
 method: bayes
 name: EST_FT_sweep
@@ -20,12 +28,16 @@ parameters:
   seed:
     value: 42
   save_dir:
-    value: "./experiments/finetune/${now:%Y-%m-%d_%H-%M-%S}"
+    value: "/home/jvp/diabetes_pred/experiments/finetune/${now:%Y-%m-%d_%H-%M-%S}"
   dataset_path:
     value: null
   config:
     _target_:
       value: EventStream.transformer.config.StructuredTransformerConfig
+    use_labs: 
+      value: false
+    sweep: 
+      value: true
     use_batch_norm:
       value: [true, false]
     use_layer_norm:
@@ -69,17 +81,7 @@ parameters:
     num_attention_heads:
       values: [4, 8, 12]
     max_grad_norm:
-      value: [1, 5, 10]
-    intermediate_dropout:
-      values: [0.1, 0.3, 0.5]
-    attention_dropout:
-      values: [0.1, 0.3, 0.5]
-    input_dropout:
-      values: [0.1, 0.3, 0.5]
-    resid_dropout:
-      values: [0.1, 0.3, 0.5]
-    hidden_size:
-      value: ${config.head_dim} * ${config.num_attention_heads}
+      values: [1, 5, 10]
     intermediate_size:
       values: [256, 512, 1024]
     task_specific_params:
@@ -88,29 +90,21 @@ parameters:
 
   optimization_config:
     init_lr:
-      distribution: log_uniform
+      distribution: log_uniform_values
       min: 1e-5
       max: 1e-2
     end_lr:
-      distribution: log_uniform
+      distribution: log_uniform_values
       min: 1e-7
       max: 1e-4
     end_lr_frac_of_init_lr:
-      value: ${optimization_config.end_lr} / ${optimization_config.init_lr}
+      value: null
     max_epochs:
       value: 100
-    batch_size:
-      values: [256, 512, 1024]
-    validation_batch_size:
-      ${optimization_config.batch_size}
-    lr_frac_warmup_steps:
-      value: 0.05
     lr_decay_power:
       distribution: uniform
       min: 0.01
       max: 1.0
-    weight_decay:
-      values: [0.00, 0.01, 0.03]
     clip_grad_value:
       values: [0.5, 1.0, 5.0]
     use_grad_value_clipping:
@@ -132,17 +126,17 @@ parameters:
 
   data_config:
     save_dir:
-      value: "./data"
+      value: "/home/jvp/diabetes_pred/data"
     dl_reps_dir:
-      value: "data/DL_reps"
+      value: "/home/jvp/diabetes_pred/data/DL_reps"
     dataset_path:
       value: null
     max_seq_len:
-      value: max(${config.seq_window_size} * 2, 512)
+      value: null
     subsequence_sampling_strategy:
       value: to_end
     min_seq_len:
-      value: min(${config.seq_window_size} // 2, 16)
+      value: null
     train_subset_size:
       value: "FULL"
     train_subset_seed:
@@ -173,13 +167,15 @@ parameters:
       value: "ddp_find_unused_parameters_true"
 
   experiment_dir:
-    value: "./experiments"
+    value: "/home/jvp/diabetes_pred/experiments"
 
   wandb_logger_kwargs:
     name:
-      value: "jvpoulos"
+      value: "transformer_dia_prc"
     project:
       value: "diabetes_sweep"
+    entity:
+      value: "jvpoulos"  # your W&B username
     team:
       value: null
     log_model:
@@ -189,7 +185,7 @@ parameters:
 
   wandb_experiment_config_kwargs:
     entity:
-      value: "sweep"
+      value: "jvpoulos"
     project:
       value: "diabetes_sweep"
     team:
@@ -202,6 +198,4 @@ parameters:
   do_final_validation_on_metrics:
     value: false
   do_use_filesystem_sharing:
-    value: false
-  do_debug_mode:
     value: false

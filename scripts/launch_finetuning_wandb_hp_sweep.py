@@ -13,7 +13,8 @@ from typing import Any
 
 import hydra
 import wandb
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
+import json
 
 # This is a (non-exhaustive) set of weights and biases sweep parameter keywords, which is used to indicate
 # when a configuration dictionary contains actual parameter choices, rather than further nested parameter
@@ -70,22 +71,115 @@ def collapse_cfg(k: str, v: dict[str, Any]) -> dict[str, Any]:
             out.update(collapse_cfg(kk, vv))
     return out
 
+def json_serializable_config(cfg):
+    if isinstance(cfg, dict):
+        return {k: json_serializable_config(v) for k, v in cfg.items()}
+    elif isinstance(cfg, list):
+        return [json_serializable_config(v) for v in cfg]
+    elif callable(cfg) or isinstance(cfg, str) and cfg.startswith('lambda'):
+        return str(cfg)
+    else:
+        return cfg
+
+def calculate_end_lr_frac(trial):
+    init_lr = trial.suggest_float("optimization_config.init_lr", 1e-5, 1e-2, log=True)
+    end_lr = trial.suggest_float("optimization_config.end_lr", 1e-7, 1e-4, log=True)
+    return end_lr / init_lr
+
+def calculate_max_seq_len(trial):
+    seq_window_size = trial.suggest_categorical("config.seq_window_size", [168, 336, 504])
+    return max(seq_window_size * 2, 512)
+
+def calculate_min_seq_len(trial):
+    seq_window_size = trial.suggest_categorical("config.seq_window_size", [168, 336, 504])
+    return min(seq_window_size // 2, 16)
+
+def calculate_hidden_size(trial):
+    head_dim = trial.suggest_categorical("config.head_dim", [16, 32, 64])
+    num_attention_heads = trial.suggest_categorical("config.num_attention_heads", [4, 8, 12])
+    return head_dim * num_attention_heads
 
 @hydra.main(version_base=None, config_path="../configs", config_name="finetuning_hyperparameter_sweep_base")
 def main(cfg: DictConfig):
-    cfg = hydra.utils.instantiate(cfg, _convert_="all")
+    cfg = OmegaConf.to_container(cfg, resolve=True)
     cfg["command"] = [
-        "${env}",
-        "${interpreter}",
-        "${program}",
-        "${args_no_hyphens}",
+        "python",
+        "/home/jvp/diabetes_pred/src/finetune.py",
     ]
+
+    # Add each parameter as a separate command-line argument
+    for k, v in new_params.items():
+        if isinstance(v, dict) and 'value' in v:
+            cfg["command"].extend([f"{k}={v['value']}"])
+        elif isinstance(v, dict) and 'values' in v:
+            cfg["command"].extend([f"{k}={v['values']}"])
+        else:
+            cfg["command"].extend([f"{k}={v}"])
+
+    # Update configurations
+    if 'config' in cfg['parameters']:
+        # Remove the hidden_size parameter
+        if 'hidden_size' in cfg['parameters']['config']:
+            del cfg['parameters']['config']['hidden_size']
+    
+    if 'optimization_config' in cfg['parameters']:
+        cfg['parameters']['optimization_config']['batch_size'] = {
+            'values': [256, 512, 1024]
+        }
+        cfg['parameters']['optimization_config']['end_lr'] = {
+            'distribution': 'log_uniform_values',
+            'min': 1e-7,
+            'max': 1e-4
+        }
+        cfg['parameters']['optimization_config']['lr_frac_warmup_steps'] = {
+            'distribution': 'log_uniform_values',
+            'min': 1e-6,
+            'max': 0.5
+        }
+        cfg['parameters']['optimization_config']['init_lr'] = {
+            'distribution': 'log_uniform_values',
+            'min': 1e-5,
+            'max': 1e-2
+        }
+        cfg['parameters']['optimization_config']['weight_decay'] = {
+            'values': [0.0, 0.01, 0.03]
+        }
+
+    # Define dropout parameters
+    dropout_params = ['intermediate_dropout', 'attention_dropout', 'input_dropout', 'resid_dropout']
+    for param in dropout_params:
+        cfg['parameters']['config'][param] = {
+            'values': [0.1, 0.3, 0.5]
+        }
 
     new_params = {}
     for k, v in cfg["parameters"].items():
         new_params.update(collapse_cfg(k, v))
-
     cfg["parameters"] = new_params
+
+    # After creating new_params
+    problematic_params = ['config.hidden_size', 'data_config.max_seq_len', 'data_config.min_seq_len', 'optimization_config.end_lr_frac_of_init_lr', 'optimization_config.validation_batch_size']
+
+    for param in problematic_params:
+        if param in new_params:
+            del new_params[param]
+
+    # Add these parameters back with modified values
+    new_params['config.hidden_size'] = {
+        'value': "config.head_dim * config.num_attention_heads"
+    }
+    new_params['data_config.max_seq_len'] = {
+        'value': "max(config.seq_window_size * 2, 512)"
+    }
+    new_params['data_config.min_seq_len'] = {
+        'value': "min(config.seq_window_size // 2, 16)"
+    }
+    new_params['optimization_config.end_lr_frac_of_init_lr'] = {
+        'value': "optimization_config.end_lr / optimization_config.init_lr"
+    }
+    new_params['optimization_config.validation_batch_size'] = {
+        'value': "optimization_config.batch_size"
+    }
 
     if "cohort_name" in cfg:
         cfg.pop("cohort_name")
@@ -95,14 +189,21 @@ def main(cfg: DictConfig):
         entity = cfg.pop("entity")
         if entity:
             sweep_kwargs["entity"] = entity
+    else:
+        sweep_kwargs["entity"] = "jvpoulos"  # your W&B username
+
     if "project" in cfg:
         project = cfg.pop("project")
         if project:
             sweep_kwargs["project"] = project
 
+    print("Sweep configuration:")
+    print(json.dumps(json_serializable_config(cfg), indent=2))
+    print("Sweep kwargs:")
+    print(json.dumps(sweep_kwargs, indent=2))
+
     sweep_id = wandb.sweep(sweep=cfg, **sweep_kwargs)
     return sweep_id
-
 
 if __name__ == "__main__":
     main()

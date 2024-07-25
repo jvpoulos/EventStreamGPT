@@ -154,13 +154,28 @@ class InnerSelfAttention(nn.Module):
         Returns:
             The re-shaped tensor.
         """
-
-        new_shape = tensor.size()[:-1] + (num_heads, attn_head_size)
-        tensor = tensor.view(new_shape)
-        return tensor.permute(0, 2, 1, 3)  # (batch, head, seq_length, head_features)
+        if tensor.dim() == 2:
+            # Handle 2D tensors (batch_size * seq_length, hidden_size)
+            batch_seq, hidden_size = tensor.size()
+            seq_length = hidden_size // (num_heads * attn_head_size)
+            new_shape = (batch_seq // seq_length, seq_length, num_heads, attn_head_size)
+            tensor = tensor.view(new_shape)
+            return tensor.permute(0, 2, 1, 3)  # (batch, head, seq_length, head_features)
+        elif tensor.dim() == 3:
+            # Handle 3D tensors (batch_size, seq_length, hidden_size)
+            new_shape = tensor.size()[:-1] + (num_heads, attn_head_size)
+            tensor = tensor.view(new_shape)
+            return tensor.permute(0, 2, 1, 3)  # (batch, head, seq_length, head_features)
+        elif tensor.dim() == 4:
+            # Handle 4D tensors (batch_size, seq_length, dep_graph_len, hidden_size)
+            new_shape = tensor.size()[:-1] + (num_heads, attn_head_size)
+            tensor = tensor.view(new_shape)
+            return tensor.permute(0, 3, 1, 2, 4)  # (batch, head, seq_length, dep_graph_len, head_features)
+        else:
+            raise ValueError(f"Unexpected tensor shape: {tensor.shape}")
 
     def _merge_heads(self, tensor, num_heads, attn_head_size):
-        """Merges the last two dimensions of a tensor into a single dimension.
+        """Merges the attention heads back into a single last dimension.
 
         Args:
             tensor: The input tensor.
@@ -170,10 +185,19 @@ class InnerSelfAttention(nn.Module):
         Returns:
             The re-shaped tensor.
         """
-
-        tensor = tensor.permute(0, 2, 1, 3).contiguous()
-        new_shape = tensor.size()[:-2] + (num_heads * attn_head_size,)
-        return tensor.view(new_shape)
+        if tensor.dim() == 4:
+            # Handle 4D tensors (batch, head, seq_length, head_features)
+            tensor = tensor.permute(0, 2, 1, 3).contiguous()
+            batch_size, seq_length, _, _ = tensor.size()
+            new_shape = (batch_size, seq_length, num_heads * attn_head_size)
+            return tensor.view(new_shape)
+        elif tensor.dim() == 5:
+            # Handle 5D tensors (batch, head, seq_length, dep_graph_len, head_features)
+            tensor = tensor.permute(0, 2, 3, 1, 4).contiguous()
+            new_shape = tensor.size()[:-2] + (num_heads * attn_head_size,)
+            return tensor.view(new_shape)
+        else:
+            raise ValueError(f"Unexpected tensor shape: {tensor.shape}")
 
     def _attn(self, query, key, value, attention_mask=None, head_mask=None):
         """Performs the attention operation.
@@ -768,7 +792,13 @@ class ConditionallyIndependentPointProcessInputLayer(torch.nn.Module):
         # Clip values to avoid extreme values
         data_embed = torch.clamp(data_embed, min=-1e6, max=1e6)
         
-        return self.embedding_dropout(data_embed)
+        data_embed = self.embedding_dropout(data_embed)
+
+        # Ensure output is 2D
+        if data_embed.dim() == 3:
+            data_embed = data_embed.squeeze(1)
+
+        return data_embed
         
 class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTrainedModel):
     def __init__(self, config: StructuredTransformerConfig, vocabulary_config: VocabularyConfig, oov_index: int):
@@ -824,6 +854,10 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
             if batch is None:
                 raise ValueError("Either batch or input_embeds must be provided")
             input_embeds = self.input_layer(batch)
+
+        # Add an extra dimension if input is 2D
+        if input_embeds.dim() == 2:
+            input_embeds = input_embeds.unsqueeze(1)
 
         torch._assert(
             ~torch.isnan(input_embeds).any(), f"{torch.isnan(input_embeds).sum()} NaNs in input_embeds"
@@ -901,7 +935,9 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
 
         hidden_states = self.ln_f(hidden_states)
 
-        hidden_states = hidden_states.view(input_embeds.size())
+        # Reshape hidden states to match input_embeds
+        hidden_states = hidden_states.view(*input_embeds.shape)
+
         # Add last hidden state
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
