@@ -10,11 +10,12 @@ except ImportError:
     pass  # no need to fail because of missing dev dependency
 
 from typing import Any
-
+import sys
 import hydra
 import wandb
 from omegaconf import DictConfig, OmegaConf
 import json
+import base64
 
 # This is a (non-exhaustive) set of weights and biases sweep parameter keywords, which is used to indicate
 # when a configuration dictionary contains actual parameter choices, rather than further nested parameter
@@ -102,20 +103,7 @@ def calculate_hidden_size(trial):
 @hydra.main(version_base=None, config_path="../configs", config_name="finetuning_hyperparameter_sweep_base")
 def main(cfg: DictConfig):
     cfg = OmegaConf.to_container(cfg, resolve=True)
-    cfg["command"] = [
-        "python",
-        "/home/jvp/diabetes_pred/src/finetune.py",
-    ]
-
-    # Add each parameter as a separate command-line argument
-    for k, v in new_params.items():
-        if isinstance(v, dict) and 'value' in v:
-            cfg["command"].extend([f"{k}={v['value']}"])
-        elif isinstance(v, dict) and 'values' in v:
-            cfg["command"].extend([f"{k}={v['values']}"])
-        else:
-            cfg["command"].extend([f"{k}={v}"])
-
+    
     # Update configurations
     if 'config' in cfg['parameters']:
         # Remove the hidden_size parameter
@@ -155,7 +143,6 @@ def main(cfg: DictConfig):
     new_params = {}
     for k, v in cfg["parameters"].items():
         new_params.update(collapse_cfg(k, v))
-    cfg["parameters"] = new_params
 
     # After creating new_params
     problematic_params = ['config.hidden_size', 'data_config.max_seq_len', 'data_config.min_seq_len', 'optimization_config.end_lr_frac_of_init_lr', 'optimization_config.validation_batch_size']
@@ -181,29 +168,53 @@ def main(cfg: DictConfig):
         'value': "optimization_config.batch_size"
     }
 
-    if "cohort_name" in cfg:
-        cfg.pop("cohort_name")
+    # Create the final sweep configuration
+    sweep_config = {
+        "method": cfg.get("method", "bayes"),
+        "metric": cfg.get("metric", {"name": "val_auc_epoch", "goal": "maximize"}),
+        "parameters": new_params,
+        "name": cfg.get("name", "EST_FT_sweep"),
+    }
+
+    # After creating the sweep_config
+    encoded_config = base64.b64encode(json.dumps(sweep_config).encode()).decode()
+
+    # Write the encoded config to a file
+    with open('encoded_config.json', 'w') as f:
+        f.write(encoded_config)
+
+    # Construct the command to run finetune.py
+    sweep_config["command"] = [
+        sys.executable,  # This will be the path to the Python interpreter
+        "/home/jvp/diabetes_pred/src/finetune.py",  # Full path to finetune.py
+        "sweep=true",  # Use Hydra's override syntax
+    ]
+    
+    # Start the sweep
+    sweep_id = wandb.sweep(sweep_config, project="your_project_name")
+    wandb.agent(sweep_id, function=lambda: subprocess.call(sweep_config["command"]))
 
     sweep_kwargs = {}
     if "entity" in cfg:
-        entity = cfg.pop("entity")
-        if entity:
-            sweep_kwargs["entity"] = entity
+        sweep_kwargs["entity"] = cfg["entity"]
     else:
         sweep_kwargs["entity"] = "jvpoulos"  # your W&B username
 
     if "project" in cfg:
-        project = cfg.pop("project")
-        if project:
-            sweep_kwargs["project"] = project
+        sweep_kwargs["project"] = cfg["project"]
+    else:
+        sweep_kwargs["project"] = "diabetes_sweep"  # default project name
 
     print("Sweep configuration:")
-    print(json.dumps(json_serializable_config(cfg), indent=2))
+    print(json.dumps(json_serializable_config(sweep_config), indent=2))
     print("Sweep kwargs:")
     print(json.dumps(sweep_kwargs, indent=2))
 
-    sweep_id = wandb.sweep(sweep=cfg, **sweep_kwargs)
+    sweep_id = wandb.sweep(sweep=sweep_config, **sweep_kwargs)
     return sweep_id
+
+if __name__ == "__main__":
+    main()
 
 if __name__ == "__main__":
     main()

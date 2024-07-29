@@ -2,6 +2,8 @@ defaults:
   - parameters: finetuning
   - _self_
 
+sweep: false
+
 hydra:
   run:
     dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
@@ -12,7 +14,7 @@ hydra:
     
 entity: "jvpoulos"  # your W&B username
 project: "diabetes_sweep"
-program: finetune.py
+program: src/finetune.py
 method: bayes
 name: EST_FT_sweep
 metric:
@@ -23,6 +25,8 @@ early_terminate:
   min_iter: 1000
 
 parameters:
+  sweep:
+    value: true
   do_overwrite:
     value: false
   seed:
@@ -36,8 +40,6 @@ parameters:
       value: EventStream.transformer.config.StructuredTransformerConfig
     use_labs: 
       value: false
-    sweep: 
-      value: true
     use_batch_norm:
       value: [true, false]
     use_layer_norm:
@@ -107,10 +109,12 @@ parameters:
       max: 1.0
     clip_grad_value:
       values: [0.5, 1.0, 5.0]
+    batch_size:
+      values: [512, 1024, 2048]
     use_grad_value_clipping:
       values: [true, false]
     patience:
-      value: 2
+      value: 5
     gradient_accumulation:
       values: [1, 2, 4]
     num_dataloader_workers:
