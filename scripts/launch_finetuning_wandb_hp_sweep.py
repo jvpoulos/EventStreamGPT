@@ -12,10 +12,19 @@ except ImportError:
 from typing import Any
 import sys
 import hydra
+from hydra import compose, initialize
 import wandb
 from omegaconf import DictConfig, OmegaConf
 import json
 import base64
+import subprocess
+import os
+import uuid
+import logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+from datetime import datetime
 
 # This is a (non-exhaustive) set of weights and biases sweep parameter keywords, which is used to indicate
 # when a configuration dictionary contains actual parameter choices, rather than further nested parameter
@@ -100,10 +109,16 @@ def calculate_hidden_size(trial):
     num_attention_heads = trial.suggest_categorical("config.num_attention_heads", [4, 8, 12])
     return head_dim * num_attention_heads
 
-@hydra.main(version_base=None, config_path="../configs", config_name="finetuning_hyperparameter_sweep_base")
-def main(cfg: DictConfig):
-    cfg = OmegaConf.to_container(cfg, resolve=True)
+def main():
+    with initialize(version_base=None, config_path="../configs"):
+        cfg = compose(config_name="finetuning_hyperparameter_sweep_base")
+        cfg = OmegaConf.to_container(cfg, resolve=True)
     
+    # Define the sweep_config_path
+    sweep_config_path = os.path.abspath("../EventStreamGPT/configs/finetuning_hyperparameter_sweep_base.yaml")
+    logger.info(f"Sweep config path: {sweep_config_path}")
+    logger.info(f"Sweep config file exists: {os.path.exists(sweep_config_path)}")
+
     # Update configurations
     if 'config' in cfg['parameters']:
         # Remove the hidden_size parameter
@@ -144,6 +159,9 @@ def main(cfg: DictConfig):
     for k, v in cfg["parameters"].items():
         new_params.update(collapse_cfg(k, v))
 
+    # Remove the '++' prefix from parameter names
+    new_params = {k.lstrip('+'): v for k, v in new_params.items()}
+
     # After creating new_params
     problematic_params = ['config.hidden_size', 'data_config.max_seq_len', 'data_config.min_seq_len', 'optimization_config.end_lr_frac_of_init_lr', 'optimization_config.validation_batch_size']
 
@@ -168,7 +186,6 @@ def main(cfg: DictConfig):
         'value': "optimization_config.batch_size"
     }
 
-    # Create the final sweep configuration
     sweep_config = {
         "method": cfg.get("method", "bayes"),
         "metric": cfg.get("metric", {"name": "val_auc_epoch", "goal": "maximize"}),
@@ -176,23 +193,23 @@ def main(cfg: DictConfig):
         "name": cfg.get("name", "EST_FT_sweep"),
     }
 
-    # After creating the sweep_config
-    encoded_config = base64.b64encode(json.dumps(sweep_config).encode()).decode()
+    # Remove the config file from the sweep configuration
+    if 'config_file' in new_params:
+        del new_params['config_file']
 
-    # Write the encoded config to a file
-    with open('encoded_config.json', 'w') as f:
-        f.write(encoded_config)
+    current_pythonpath = os.environ.get('PYTHONPATH', '')
+    new_pythonpath = f"{current_pythonpath}:{os.path.dirname(os.path.dirname(os.path.abspath(__file__)))}"
 
-    # Construct the command to run finetune.py
     sweep_config["command"] = [
-        sys.executable,  # This will be the path to the Python interpreter
-        "/home/jvp/diabetes_pred/src/finetune.py",  # Full path to finetune.py
-        "sweep=true",  # Use Hydra's override syntax
+        "python",
+        "/home/jvp/diabetes_pred/src/finetune.py",
+        "sweep=true",
+        f"config_file={sweep_config_path}",
+        "++data_config.dl_reps_dir=/home/jvp/diabetes_pred/data",
+        "hydra.job.name=finetune",
+        "hydra.verbose=false",
+        "hydra.job_logging.handlers.file.filename=${hydra.job.name}.log",
     ]
-    
-    # Start the sweep
-    sweep_id = wandb.sweep(sweep_config, project="your_project_name")
-    wandb.agent(sweep_id, function=lambda: subprocess.call(sweep_config["command"]))
 
     sweep_kwargs = {}
     if "entity" in cfg:
@@ -211,10 +228,13 @@ def main(cfg: DictConfig):
     print(json.dumps(sweep_kwargs, indent=2))
 
     sweep_id = wandb.sweep(sweep=sweep_config, **sweep_kwargs)
+    
+    print(f"Sweep created with ID: {sweep_id}")
+    print(f"To start the agent, run the following command:")
+    print(f"wandb agent {sweep_kwargs['entity']}/{sweep_kwargs['project']}/{sweep_id}")
+    
     return sweep_id
 
 if __name__ == "__main__":
-    main()
-
-if __name__ == "__main__":
-    main()
+    sweep_id = main()
+    print(f"Sweep ID: {sweep_id}")

@@ -5,16 +5,30 @@ defaults:
 sweep: false
 
 hydra:
+  job_logging:
+    handlers:
+      file:
+        class: logging.FileHandler
+        formatter: null
+        filename: finetune.log  
   run:
     dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
   sweep:
-    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    dir: multirun/${now:%Y-%m-%D}/${now:%H-%M-%S}
   job:
     chdir: True
     
 entity: "jvpoulos"  # your W&B username
 project: "diabetes_sweep"
 program: src/finetune.py
+command:
+  - python
+  - ${program}
+  - sweep=true
+  - +data_config.dl_reps_dir=/home/jvp/diabetes_pred/data
+  - hydra.job.name=finetune
+  - hydra.verbose=false
+  - hydra.job_logging.handlers.file.filename=finetune.log
 method: bayes
 name: EST_FT_sweep
 metric:
@@ -43,7 +57,7 @@ parameters:
     use_batch_norm:
       value: [true, false]
     use_layer_norm:
-      value: true
+      value: [true, false]
     use_flash_attention:
       value: true
     problem_type:
@@ -114,7 +128,7 @@ parameters:
     use_grad_value_clipping:
       values: [true, false]
     patience:
-      value: 5
+      values: [1,5,10]
     gradient_accumulation:
       values: [1, 2, 4]
     num_dataloader_workers:
@@ -190,6 +204,8 @@ parameters:
   wandb_experiment_config_kwargs:
     entity:
       value: "jvpoulos"
+    name:
+      value: "trans_dia_prc"
     project:
       value: "diabetes_sweep"
     team:
