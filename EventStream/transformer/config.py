@@ -486,7 +486,7 @@ class StructuredTransformerConfig(PretrainedConfig):
     def __init__(
         self,
         # Data configuration
-        use_flash_attention: bool = False,
+        use_flash_attention: bool = True,
         do_use_sinusoidal: bool = False,  # Add this line to the configuration class
         num_labels: int | None = None,
         problem_type: str = "single_label_classification",

@@ -62,6 +62,14 @@ DF_SCHEMA = Union[
 
 DF_T = Union[pl.LazyFrame, pl.DataFrame, pl.Expr, pl.Series]
 
+def try_convert_to_float(x, val_type):
+    if val_type == 'Numeric':
+        try:
+            return float(x)
+        except (ValueError, TypeError):
+            return None
+    return x  # Return as-is for non-numeric types
+
 @dataclasses.dataclass(frozen=True)
 class Query:
     """A structure for database query based input dataframes.
@@ -815,52 +823,103 @@ class Dataset(DatasetBase):
     def _prep_numerical_source(
         self, measure: str, config: MeasurementConfig, source_df: DF_T
     ) -> tuple[DF_T, str, str, str, pl.DataFrame]:
-        metadata = config.measurement_metadata
+        try:
+            metadata = config.measurement_metadata
+            print(f"Measure: {measure}")
+            print(f"Metadata: {metadata}")
+            metadata_schema = self.get_metadata_schema(config)
 
-        print(f"Measure: {measure}")
-        print(f"Config: {config}")
-        print(f"Metadata: {metadata}")
-
-        metadata_schema = self.get_metadata_schema(config)
-
-        match config.modality:
-            case DataModality.UNIVARIATE_REGRESSION:
-                key_col = "const_key"
-                val_col = measure
-                print(f"Univariate Regression - Key column: {key_col}, Value column: {val_col}")
-                metadata_as_polars = pl.DataFrame(
-                    {key_col: [measure], **{c: [v] for c, v in metadata.items()}}
-                )
-                source_df = source_df.with_columns(pl.lit(measure).cast(pl.Categorical).alias(key_col))
-            case DataModality.MULTIVARIATE_REGRESSION:
+            if measure == 'dynamic_values':
                 key_col = measure
-                val_col = config.values_column
-                print(f"Multivariate Regression - Key column: {key_col}, Value column: {val_col}")
-                metadata_as_polars = pl.DataFrame(
-                    {key_col: [measure], **{c: [v] for c, v in metadata.items() if c != key_col}}
-                )
-            case _:
-                raise ValueError(f"Called _pre_numerical_source on {config.modality} measure {measure}!")
+                val_col = measure
+                metadata_as_polars = pl.DataFrame({
+                    key_col: [measure],
+                    'value_type': [NumericDataModalitySubtype.FLOAT],
+                    'outlier_model': [None],
+                    'normalizer': [None]
+                })
+            else:
+                # Existing logic for other measures
+                match config.modality:
+                    case DataModality.UNIVARIATE_REGRESSION:
+                        key_col = "const_key"
+                        val_col = measure
+                        metadata_as_polars = pl.DataFrame(
+                            {key_col: [measure], **{c: [v] for c, v in metadata.items()}}
+                        )
+                        source_df = source_df.with_columns(pl.lit(measure).cast(pl.Categorical).alias(key_col))
+                    case DataModality.MULTIVARIATE_REGRESSION:
+                        key_col = measure
+                        val_col = config.values_column
+                        metadata_as_polars = pl.DataFrame(
+                            {key_col: [measure], **{c: [v] for c, v in metadata.items() if c != key_col}}
+                        )
+                    case _:
+                        raise ValueError(f"Called _prep_numerical_source on {config.modality} measure {measure}!")
 
-        print(f"Metadata as Polars DataFrame: {metadata_as_polars}")
-        print(f"Source DataFrame schema: {source_df.schema}")
+            print(f"Metadata as Polars DataFrame: {metadata_as_polars}")
+            print(f"Source DataFrame schema: {source_df.schema}")
 
-        if "outlier_model" in metadata_as_polars and len(metadata_as_polars.drop_nulls("outlier_model")) == 0:
-            metadata_as_polars = metadata_as_polars.with_columns(pl.lit(None).alias("outlier_model"))
-        if "normalizer" in metadata_as_polars and len(metadata_as_polars.drop_nulls("normalizer")) == 0:
-            metadata_as_polars = metadata_as_polars.with_columns(pl.lit(None).alias("normalizer"))
+            # Handle empty outlier_model and normalizer
+            for col in ['outlier_model', 'normalizer']:
+                if col in metadata_as_polars.columns and len(metadata_as_polars.drop_nulls(col)) == 0:
+                    metadata_as_polars = metadata_as_polars.with_columns(pl.lit(None).alias(col))
 
-        if val_col not in metadata_as_polars.columns:
-            metadata_as_polars = metadata_as_polars.with_columns(pl.lit(None).alias(val_col))
+            # Add val_col if not present
+            if val_col not in metadata_as_polars.columns:
+                metadata_as_polars = metadata_as_polars.with_columns(pl.lit(None).alias(val_col))
 
-        metadata_as_polars = metadata_as_polars.with_columns(
-            pl.col(key_col).cast(pl.Categorical),
-            pl.col(val_col).cast(pl.Float64).alias("value"),  # Rename the values column to 'value'
-            **{k: pl.col(k).cast(v) for k, v in metadata_schema.items()},
-        )
+            # Cast columns with proper error handling
+            cast_exprs = []
+            for col_name, dtype in {key_col: pl.Categorical, val_col: pl.Float64, **metadata_schema}.items():
+                if col_name in source_df.columns:
+                    try:
+                        if col_name == 'dynamic_values':
+                            # For dynamic_values, keep it as a string
+                            cast_exprs.append(pl.col(col_name).cast(pl.Utf8).alias(col_name))
+                        else:
+                            cast_exprs.append(pl.col(col_name).cast(dtype).alias(col_name))
+                    except pl.exceptions.ComputeError as e:
+                        print(f"Error casting column {col_name} to {dtype}: {str(e)}")
+                        print(f"Column contents: {source_df[col_name].head()}")
+                        # Use a fallback type if casting fails
+                        cast_exprs.append(pl.col(col_name).cast(pl.Object).alias(col_name))
 
-        source_df = source_df.join(metadata_as_polars, on=key_col, how="left")
-        return source_df, key_col, val_col, f"{measure}_is_inlier", metadata_as_polars
+            if cast_exprs:
+                source_df = source_df.with_columns(cast_exprs)
+
+            # Rename the values column to 'value' in metadata_as_polars
+            if val_col in metadata_as_polars.columns:
+                metadata_as_polars = metadata_as_polars.rename({val_col: "value"})
+
+            # Add the key column to metadata_as_polars if it's not present
+            if key_col not in metadata_as_polars.columns:
+                metadata_as_polars = metadata_as_polars.with_columns(pl.lit(measure).alias(key_col))
+
+            # Ensure the key column in metadata_as_polars has the same dtype as in source_df
+            key_col_dtype = source_df[key_col].dtype
+            metadata_as_polars = metadata_as_polars.with_columns(pl.col(key_col).cast(key_col_dtype))
+
+            print(f"Final source_df columns: {source_df.columns}")
+            print(f"Final metadata_as_polars columns: {metadata_as_polars.columns}")
+            print(f"source_df[{key_col}] dtype: {source_df[key_col].dtype}")
+            print(f"metadata_as_polars[{key_col}] dtype: {metadata_as_polars[key_col].dtype}")
+
+            # Join with proper error handling
+            try:
+                source_df = source_df.join(metadata_as_polars, on=key_col, how="left")
+            except Exception as e:
+                print(f"Error joining source_df with metadata_as_polars: {str(e)}")
+                print(f"source_df columns: {source_df.columns}")
+                print(f"metadata_as_polars columns: {metadata_as_polars.columns}")
+                raise
+
+            return source_df, key_col, val_col, f"{measure}_is_inlier", metadata_as_polars
+
+        except Exception as e:
+            print(f"Error in _prep_numerical_source for measure {measure}: {str(e)}")
+            print(f"Source DataFrame schema: {source_df.schema}")
+            raise
 
     def _total_possible_and_observed(
         self, measure: str, config: MeasurementConfig, source_df: DF_T
@@ -994,6 +1053,15 @@ class Dataset(DatasetBase):
     def _fit_measurement_metadata(
         self, measure: str, config: MeasurementConfig, source_df: DF_T
     ) -> pd.DataFrame:
+        if measure == 'dynamic_values':
+            # For dynamic_values, we'll create a simple metadata structure
+            metadata = pd.DataFrame({
+                "value_type": [NumericDataModalitySubtype.FLOAT],
+                "outlier_model": [None],
+                "normalizer": [None]
+            }, index=[measure])
+            return metadata
+
         orig_source_df = source_df.clone()
 
         source_df, vocab_keys_col, vals_col, _, measurement_metadata = self._prep_numerical_source(
@@ -1012,7 +1080,10 @@ class Dataset(DatasetBase):
                 num_non_null = orig_source_df.select(pl.col(measure).drop_nulls().len()).item()
 
         # Drop the 'Result' column after calculating total possible and observed instances
-        source_df = source_df.drop_nulls([vocab_keys_col, vals_col]).filter(pl.col(vals_col).is_not_nan())
+        if measure == 'dynamic_values':
+            source_df = source_df.drop_nulls([vocab_keys_col, vals_col])
+        else:
+            source_df = source_df.drop_nulls([vocab_keys_col, vals_col]).filter(pl.col(vals_col).is_not_nan())
 
         # Check if measurement metadata is missing for categorical variables
         if config.measurement_metadata is None:
@@ -1061,69 +1132,70 @@ class Dataset(DatasetBase):
                 else:
                     return measurement_metadata
 
-        # 2. Eliminates hard outliers and performs censoring via specified config.
-        bound_cols = {}
-        for col in (
-            "drop_upper_bound",
-            "drop_upper_bound_inclusive",
-            "drop_lower_bound",
-            "drop_lower_bound_inclusive",
-            "censor_lower_bound",
-            "censor_upper_bound",
-        ):
-            if col in source_df:
-                bound_cols[col] = pl.col(col)
+        if measure != 'dynamic_values':
+            # 2. Eliminates hard outliers and performs censoring via specified config.
+            bound_cols = {}
+            for col in (
+                "drop_upper_bound",
+                "drop_upper_bound_inclusive",
+                "drop_lower_bound",
+                "drop_lower_bound_inclusive",
+                "censor_lower_bound",
+                "censor_upper_bound",
+            ):
+                if col in source_df:
+                    bound_cols[col] = pl.col(col)
 
-        if bound_cols:
-            source_df = source_df.with_columns(
-                self.drop_or_censor(pl.col(vals_col), **bound_cols).alias(vals_col)
-            )
-
-        source_df = source_df.filter(pl.col(vals_col).is_not_nan())
-        if len(source_df) == 0:
-            return config.measurement_metadata
-
-        # 3. Infer the value type and convert where necessary.
-        measurement_metadata = self._add_inferred_val_types(
-            measurement_metadata, source_df, vocab_keys_col, vals_col
-        )
-
-        source_df = (
-            source_df.update(measurement_metadata.select(vocab_keys_col, "value_type"), on=vocab_keys_col)
-            .with_columns(
-                pl.when(pl.col("value_type") == NumericDataModalitySubtype.INTEGER)
-                .then(pl.col(vals_col).cast(pl.Float64).round(0))  # Cast to float before rounding
-                .when(pl.col("value_type") == NumericDataModalitySubtype.FLOAT)
-                .then(pl.col(vals_col))
-                .otherwise(None)
-                .alias(vals_col)
-            )
-            .drop_nulls(vals_col)
-            .filter(pl.col(vals_col).is_not_nan())
-        )
-
-        # 4. Infer outlier detector and normalizer parameters.
-        if self.config.outlier_detector_config is not None:
-            with self._time_as("fit_outlier_detector"):
-                M = self._get_preprocessing_model(self.config.outlier_detector_config, for_fit=True)
-                outlier_model_params = source_df.group_by(vocab_keys_col).agg(
-                    M.fit_from_polars(pl.col(vals_col)).alias("outlier_model")
-                )
-
-                measurement_metadata = measurement_metadata.with_columns(
-                    pl.col("outlier_model").cast(outlier_model_params["outlier_model"].dtype)
-                )
+            if bound_cols:
                 source_df = source_df.with_columns(
-                    pl.col("outlier_model").cast(outlier_model_params["outlier_model"].dtype)
+                    self.drop_or_censor(pl.col(vals_col), **bound_cols).alias(vals_col)
                 )
 
-                measurement_metadata = measurement_metadata.update(outlier_model_params, on=vocab_keys_col)
-                source_df = source_df.update(
-                    measurement_metadata.select(vocab_keys_col, "outlier_model"), on=vocab_keys_col
-                )
+            source_df = source_df.filter(pl.col(vals_col).is_not_nan())
+            if len(source_df) == 0:
+                return config.measurement_metadata
 
-                is_inlier = ~M.predict_from_polars(pl.col(vals_col), pl.col("outlier_model"))
-                source_df = source_df.filter(is_inlier)
+            # 3. Infer the value type and convert where necessary.
+            measurement_metadata = self._add_inferred_val_types(
+                measurement_metadata, source_df, vocab_keys_col, vals_col
+            )
+
+            source_df = (
+                source_df.update(measurement_metadata.select(vocab_keys_col, "value_type"), on=vocab_keys_col)
+                .with_columns(
+                    pl.when(pl.col("value_type") == NumericDataModalitySubtype.INTEGER)
+                    .then(pl.col(vals_col).cast(pl.Float64).round(0))  # Cast to float before rounding
+                    .when(pl.col("value_type") == NumericDataModalitySubtype.FLOAT)
+                    .then(pl.col(vals_col))
+                    .otherwise(None)
+                    .alias(vals_col)
+                )
+                .drop_nulls(vals_col)
+                .filter(pl.col(vals_col).is_not_nan())
+            )
+
+            # 4. Infer outlier detector and normalizer parameters.
+            if self.config.outlier_detector_config is not None:
+                with self._time_as("fit_outlier_detector"):
+                    M = self._get_preprocessing_model(self.config.outlier_detector_config, for_fit=True)
+                    outlier_model_params = source_df.group_by(vocab_keys_col).agg(
+                        M.fit_from_polars(pl.col(vals_col)).alias("outlier_model")
+                    )
+
+                    measurement_metadata = measurement_metadata.with_columns(
+                        pl.col("outlier_model").cast(outlier_model_params["outlier_model"].dtype)
+                    )
+                    source_df = source_df.with_columns(
+                        pl.col("outlier_model").cast(outlier_model_params["outlier_model"].dtype)
+                    )
+
+                    measurement_metadata = measurement_metadata.update(outlier_model_params, on=vocab_keys_col)
+                    source_df = source_df.update(
+                        measurement_metadata.select(vocab_keys_col, "outlier_model"), on=vocab_keys_col
+                    )
+
+                    is_inlier = ~M.predict_from_polars(pl.col(vals_col), pl.col("outlier_model"))
+                    source_df = source_df.filter(is_inlier)
 
         # 5. Fit a normalizer model.
         if self.config.normalizer_config is not None:
@@ -1137,7 +1209,7 @@ class Dataset(DatasetBase):
                 )
                 measurement_metadata = measurement_metadata.update(normalizer_params, on=vocab_keys_col)
 
-        # 6. Convert to the appropriate type and return.
+        # Convert to pandas DataFrame at the end
         measurement_metadata = measurement_metadata.to_pandas()
         measurement_metadata = measurement_metadata.set_index(vocab_keys_col)
 
@@ -1177,10 +1249,8 @@ class Dataset(DatasetBase):
     def transform_measurements(self):
         for measure, config in self.measurement_configs.items():
             source_attr, id_col, source_df = self._get_source_df(config, do_only_train=False)
-
             source_df = self._filter_col_inclusion(source_df, {measure: True})
             updated_cols = []
-
             try:
                 if measure == 'dynamic_indices':
                     # Special handling for dynamic_indices
@@ -1190,45 +1260,52 @@ class Dataset(DatasetBase):
                         ])
                         updated_cols.append('dynamic_indices')
                     
-                    # Handle dynamic_values column
+                elif measure == 'dynamic_values':
+                    # Keep dynamic_values as numeric (Float64)
                     if 'dynamic_values' in source_df.columns:
                         source_df = source_df.with_columns([
-                            pl.col('dynamic_values').cast(pl.Utf8)
+                            pl.col('dynamic_values').cast(pl.Float64)
                         ])
                         updated_cols.append('dynamic_values')
+                    print(f"Processed dynamic_values")
                     
                 elif config.modality == DataModality.MULTI_LABEL_CLASSIFICATION:
                     print(f"Transforming multi-label classification measurement: {measure}")
                     source_df = self._transform_multi_label_classification(measure, config, source_df)
                     print(f"Transformed multi-label classification measurement: {measure}")
                     updated_cols.append(measure)
+                    
                 else:
                     if config.is_numeric:
                         print(f"Transforming numerical measurement: {measure}")
+                        if 'normalizer' not in source_df.columns and self.config.normalizer_config is not None:
+                            print(f"Warning: 'normalizer' column not found for measure {measure}. Skipping normalization.")
                         source_df = self._transform_numerical_measurement(measure, config, source_df)
                         print(f"Transformed numerical measurement: {measure}")
                         updated_cols.append(measure)
-
                         if config.modality == DataModality.MULTIVARIATE_REGRESSION:
                             updated_cols.append(config.values_column)
-
                         if self.config.outlier_detector_config is not None:
                             updated_cols.append(f"{measure}_is_inlier")
-
-                    if config.vocabulary is not None:
+                    
+                    if config.vocabulary is not None and measure not in ['dynamic_values', 'dynamic_indices']:
                         print(f"Transforming categorical measurement: {measure}")
                         source_df = self._transform_categorical_measurement(measure, config, source_df)
                         print(f"Transformed categorical measurement: {measure}")
-                        updated_cols.append(measure)
+                        if measure not in updated_cols:
+                            updated_cols.append(measure)
 
                 print(f"Transformation status for {measure}: {'Dropped' if config.is_dropped else 'Retained'}")
-
+                
                 # Only update columns that exist in source_df
-                cols_to_update = [col for col in updated_cols if col in source_df.columns]
+                cols_to_update = list(dict.fromkeys([col for col in updated_cols if col in source_df.columns]))
                 self._update_attr_df(source_attr, id_col, source_df, cols_to_update)
 
             except Exception as e:
                 print(f"Error transforming measurement {measure}: {str(e)}")
+                print(f"Config: {config}")
+                print(f"Source DataFrame schema: {source_df.schema}")
+                print(f"Source DataFrame sample: {source_df.head()}")
                 raise ValueError(f"Transforming measurement failed for measure {measure}!") from e
 
         print("Sample of dynamic_measurements_df after transform_measurements:")
@@ -1236,7 +1313,19 @@ class Dataset(DatasetBase):
         print("Data types:")
         for col in self.dynamic_measurements_df.columns:
             print(f"{col}: {self.dynamic_measurements_df[col].dtype}")
-        
+
+        # Additional check for null values
+        null_counts = self.dynamic_measurements_df.null_count()
+        print("Null value counts:")
+        print(null_counts)
+
+        if null_counts.select(pl.all()).sum().sum() > 0:
+            print("Warning: Null values found in dynamic_measurements_df")
+            for col in self.dynamic_measurements_df.columns:
+                null_count = null_counts[col][0]
+                if null_count > 0:
+                    print(f"  {col}: {null_count} null values")
+            
     def preprocess(self):
         print("Starting preprocessing...")
         self._filter_subjects()
@@ -1335,41 +1424,32 @@ class Dataset(DatasetBase):
         dynamic_indices_dtype = self.dynamic_measurements_df[code_column].dtype
         print(f"Data type of {code_column}: {dynamic_indices_dtype}")
 
-        # Check if dynamic_indices is already numeric
-        numeric_types = (pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64, pl.Int8, pl.Int16, pl.Int32, pl.Int64, pl.Float32, pl.Float64)
-        if isinstance(dynamic_indices_dtype, numeric_types):
-            print("dynamic_indices is already numeric. Converting zero values to unknown index.")
-            unknown_index = self.code_mapping.get('UNKNOWN', len(self.code_mapping) + 1)
-            self.dynamic_measurements_df = self.dynamic_measurements_df.with_columns([
-                pl.when(pl.col(code_column) == 0)
-                .then(pl.lit(unknown_index))
-                .otherwise(pl.col(code_column))
-                .cast(pl.UInt32)
-                .alias('dynamic_indices')
-            ])
-        else:
-            # If not numeric, perform the original conversion
-            unknown_index = self.code_mapping.get('UNKNOWN', len(self.code_mapping) + 1)
-            self.dynamic_measurements_df = self.dynamic_measurements_df.with_columns([
-                pl.when(pl.col(code_column).is_null() | (pl.col(code_column) == "0"))
-                .then(pl.lit(unknown_index))
-                .otherwise(pl.col(code_column).map_dict(self.code_mapping, default=unknown_index))
-                .cast(pl.UInt32)
-                .alias('dynamic_indices')
-            ])
+        # Print some sample values before conversion
+        print("Sample of dynamic_indices before conversion:")
+        print(self.dynamic_measurements_df.select(code_column).head())
+
+        # Keep dynamic_indices as a string
+        self.dynamic_measurements_df = self.dynamic_measurements_df.with_columns([
+            pl.col(code_column).cast(pl.Utf8).alias(code_column)
+        ])
 
         print("Exiting _convert_dynamic_indices_to_indices")
         print("Data types in dynamic_measurements_df:")
         for col in self.dynamic_measurements_df.columns:
             print(f"{col}: {self.dynamic_measurements_df[col].dtype}")
 
-        # Print a sample of the dynamic_indices column
-        print("Sample of dynamic_indices column:")
-        print(self.dynamic_measurements_df.select('dynamic_indices').head())
+        # Print a sample of the dynamic_indices column after conversion
+        print("Sample of dynamic_indices column after conversion:")
+        print(self.dynamic_measurements_df.select(code_column).head())
 
-        # Count of zero values after conversion
-        zero_count = self.dynamic_measurements_df.filter(pl.col('dynamic_indices') == 0).shape[0]
-        print(f"Zero values in dynamic_indices after conversion: {zero_count}")
+        # Count of unique values after conversion
+        unique_count = self.dynamic_measurements_df[code_column].n_unique()
+        print(f"Number of unique values in dynamic_indices after conversion: {unique_count}")
+
+        # Distribution of dynamic_indices
+        value_counts = self.dynamic_measurements_df[code_column].value_counts().sort("count", descending=True)
+        print("Top 10 most common dynamic_indices values:")
+        print(value_counts.head(10))
 
     @TimeableMixin.TimeAs
     def _fit_vocabulary(self, measure: str, config: MeasurementConfig, source_df: DF_T) -> Vocabulary:
@@ -1404,7 +1484,7 @@ class Dataset(DatasetBase):
                 return Vocabulary(vocabulary=["UNK"], obs_frequencies=[1])
             
             return Vocabulary(vocabulary=vocab_elements, obs_frequencies=el_counts)
-    
+            
         elif config.modality == DataModality.MULTI_LABEL_CLASSIFICATION:
             observations = source_df.get_column(measure).cast(pl.Utf8)
             observations = observations.apply(lambda s: s.split("|") if s is not None else [], return_dtype=pl.List(pl.Utf8))
@@ -1527,85 +1607,95 @@ class Dataset(DatasetBase):
     def _transform_numerical_measurement(
         self, measure: str, config: MeasurementConfig, source_df: DF_T
     ) -> DF_T:
-        source_df, keys_col_name, vals_col_name, inliers_col_name, _ = self._prep_numerical_source(
-            measure, config, source_df
-        )
-
-        keys_col = pl.col(keys_col_name)
-        vals_col = pl.col(vals_col_name)
-
-        cols_to_drop_at_end = []
-        for col in config.measurement_metadata:
-            if col != measure and col in source_df:
-                cols_to_drop_at_end.append(col)
-
-        bound_cols = {}
-        for col in (
-            "drop_upper_bound",
-            "drop_upper_bound_inclusive",
-            "drop_lower_bound",
-            "drop_lower_bound_inclusive",
-            "censor_lower_bound",
-            "censor_upper_bound",
-        ):
-            if col in source_df:
-                bound_cols[col] = pl.col(col)
-
-        if bound_cols:
-            vals_col = self.drop_or_censor(vals_col, **bound_cols)
-
-        value_type = pl.col("value_type")
-        keys_col = (
-            pl.when(value_type == NumericDataModalitySubtype.DROPPED)
-            .then(keys_col)
-            .when(value_type == NumericDataModalitySubtype.CATEGORICAL_INTEGER)
-            .then(keys_col + "__EQ_" + vals_col.fill_null(0).cast(pl.Int64).cast(pl.Utf8))
-            .when(value_type == NumericDataModalitySubtype.CATEGORICAL_FLOAT)
-            .then(keys_col + "__EQ_" + vals_col.fill_null(0).cast(pl.Utf8))
-            .otherwise(keys_col)
-            .alias(keys_col_name)
-        )
-
-        vals_col = (
-            pl.when(
-                value_type.is_in(
-                    [
-                        NumericDataModalitySubtype.DROPPED,
-                        NumericDataModalitySubtype.CATEGORICAL_INTEGER,
-                        NumericDataModalitySubtype.CATEGORICAL_FLOAT,
-                    ]
-                )
+        try:
+            source_df, keys_col_name, vals_col_name, inliers_col_name, _ = self._prep_numerical_source(
+                measure, config, source_df
             )
-            .then(pl.lit(None))
-            .otherwise(vals_col)  # Remove fill_nan(0) to preserve original values
-            .alias(vals_col_name)
-        )
 
-        # Remove null filtering to preserve all rows
-        source_df = source_df.with_columns(
-            pl.struct([keys_col, vals_col]).alias("temp")
-        )
+            keys_col = pl.col(keys_col_name)
+            vals_col = pl.col(vals_col_name)
 
-        source_df = source_df.select(
-            pl.all().exclude([keys_col_name, vals_col_name, "temp"]),
-            pl.col("temp").struct.field(keys_col_name).alias(keys_col_name),
-            pl.col("temp").struct.field(vals_col_name).cast(pl.Float32).alias(vals_col_name),
-        )
+            cols_to_drop_at_end = [col for col in config.measurement_metadata if col != measure and col in source_df.columns]
 
-        if self.config.outlier_detector_config is not None:
-            M = self._get_preprocessing_model(self.config.outlier_detector_config, for_fit=False)
-            inliers_col = ~M.predict_from_polars(vals_col, pl.col("outlier_model")).alias(inliers_col_name)
-            source_df = source_df.with_columns(inliers_col)
+            bound_cols = {
+                col: pl.col(col)
+                for col in [
+                    "drop_upper_bound",
+                    "drop_upper_bound_inclusive",
+                    "drop_lower_bound",
+                    "drop_lower_bound_inclusive",
+                    "censor_lower_bound",
+                    "censor_upper_bound",
+                ]
+                if col in source_df.columns
+            }
 
-        if self.config.normalizer_config is not None:
-            M = self._get_preprocessing_model(self.config.normalizer_config, for_fit=False)
-            normalized_vals_col = M.predict_from_polars(vals_col, pl.col("normalizer"))
-            source_df = source_df.with_columns(normalized_vals_col.alias(f"{vals_col_name}_normalized"))
+            if bound_cols:
+                vals_col = self.drop_or_censor(vals_col, **bound_cols)
 
-        return source_df.drop(cols_to_drop_at_end)
+            if 'value_type' in source_df.columns:
+                value_type = pl.col("value_type")
+            else:
+                value_type = pl.lit(NumericDataModalitySubtype.FLOAT)  # Default to FLOAT if value_type is not present
+
+            # For dynamic_values, we don't need to apply the categorical transformations
+            if measure != 'dynamic_values':
+                # Safely cast vals_col to string for concatenation
+                safe_vals_col = pl.when(vals_col.is_null()).then(pl.lit("")).otherwise(vals_col.cast(pl.Utf8))
+
+                keys_col = (
+                    pl.when(value_type == NumericDataModalitySubtype.DROPPED)
+                    .then(keys_col)
+                    .when(value_type == NumericDataModalitySubtype.CATEGORICAL_INTEGER)
+                    .then(keys_col + "__EQ_" + safe_vals_col)
+                    .when(value_type == NumericDataModalitySubtype.CATEGORICAL_FLOAT)
+                    .then(keys_col + "__EQ_" + safe_vals_col)
+                    .otherwise(keys_col)
+                    .alias(f"{keys_col_name}_transformed")
+                )
+
+                vals_col = (
+                    pl.when(value_type.is_in([NumericDataModalitySubtype.DROPPED, NumericDataModalitySubtype.CATEGORICAL_INTEGER, NumericDataModalitySubtype.CATEGORICAL_FLOAT]))
+                    .then(pl.lit(None))
+                    .otherwise(vals_col)
+                    .alias(f"{vals_col_name}_transformed")
+                )
+
+                source_df = source_df.with_columns([keys_col, vals_col])
+
+            # Apply outlier detection
+            if self.config.outlier_detector_config is not None:
+                M = self._get_preprocessing_model(self.config.outlier_detector_config, for_fit=False)
+                inliers_col = ~M.predict_from_polars(vals_col, pl.col("outlier_model")).alias(inliers_col_name)
+                source_df = source_df.with_columns(inliers_col)
+
+            # Apply normalization
+            if self.config.normalizer_config is not None:
+                M = self._get_preprocessing_model(self.config.normalizer_config, for_fit=False)
+                if "normalizer" in source_df.columns:
+                    normalized_vals_col = M.predict_from_polars(vals_col, pl.col("normalizer"))
+                    source_df = source_df.with_columns(normalized_vals_col.alias(f"{vals_col_name}_normalized"))
+                else:
+                    print(f"Warning: 'normalizer' column not found for measure {measure}. Skipping normalization.")
+
+            result_df = source_df.drop(cols_to_drop_at_end)
+            
+            # Rename the transformed columns back to their original names
+            if measure != 'dynamic_values':
+                result_df = result_df.rename({
+                    f"{keys_col_name}_transformed": keys_col_name,
+                    f"{vals_col_name}_transformed": vals_col_name
+                })
+            
+            return result_df
+
+        except Exception as e:
+            print(f"Error in _transform_numerical_measurement for measure {measure}: {str(e)}")
+            print(f"Source DataFrame schema: {source_df.schema}")
+            raise
 
     @TimeableMixin.TimeAs
-    def _transform_categorical_measurement(self, measure: str, config: MeasurementConfig, source_df: DF_T) -> DF_T:
+    def _transform_categorical_measurement(self, measure: str, config: MeasurementConfig, source_df: pl.DataFrame) -> pl.DataFrame:
         print(f"Transforming categorical measurement: {measure}")
         if measure not in source_df.columns:
             print(f"Warning: Measure {measure} not found in the source DataFrame.")
@@ -1615,19 +1705,26 @@ class Dataset(DatasetBase):
             return source_df
 
         vocab_el_col = pl.col(measure)
-        vocab_lit = pl.Series(config.vocabulary.vocabulary).cast(pl.Categorical)
-
-        if measure == 'dynamic_indices':
-            # For dynamic_indices, we preserve the original values
+        
+        if measure == 'dynamic_values':
+            # For dynamic_values, we keep it as Float64 and don't transform
             transform_expr = [
-                vocab_el_col.cast(pl.UInt32).alias(measure),
-                pl.col('dynamic_values').cast(pl.Utf8)
+                vocab_el_col.cast(pl.Float64).alias(measure)
+            ]
+        elif measure == 'dynamic_indices':
+            # For dynamic_indices, we keep it as a string (Utf8)
+            transform_expr = [
+                vocab_el_col.cast(pl.Utf8).alias(measure)
             ]
         else:
+            # Convert vocabulary to strings to ensure compatibility
+            vocab_as_strings = [str(v) for v in config.vocabulary.vocabulary]
+            vocab_lit = pl.Series(vocab_as_strings).cast(pl.Categorical)
+
             transform_expr = [
                 pl.when(vocab_el_col.is_null())
                 .then(vocab_el_col)  # Preserve null values
-                .when(~vocab_el_col.is_in(vocab_lit))
+                .when(~vocab_el_col.cast(pl.Utf8).is_in(vocab_lit))
                 .then(vocab_el_col)  # Preserve values not in vocabulary
                 .otherwise(vocab_el_col)
                 .cast(pl.Categorical)
@@ -1642,6 +1739,9 @@ class Dataset(DatasetBase):
 
         # Only update columns that exist in both old_df and df
         cols_to_update = [col for col in cols_to_update if col in old_df.columns and col in df.columns]
+
+        # Remove duplicates from cols_to_update
+        cols_to_update = list(dict.fromkeys(cols_to_update))
 
         # Create a new dataframe with only the columns to be updated
         new_df = df.select([id_col] + cols_to_update)
@@ -1773,11 +1873,11 @@ class Dataset(DatasetBase):
             "dynamic_values"
         )
 
-        # Handle dynamic_indices (keep as UInt32)
         dynamic_data = dynamic_data.with_columns(pl.col("dynamic_indices").cast(pl.UInt32))
+        dynamic_data = dynamic_data.with_columns(pl.col("dynamic_values").cast(pl.Float64))
 
-        # Handle dynamic_values
-        dynamic_data = dynamic_data.with_columns(pl.col("dynamic_values").cast(pl.Utf8))
+        # Handle dynamic_values (keep as Float64)
+        dynamic_data = dynamic_data.with_columns(pl.col("dynamic_values").cast(pl.Float64))
 
         print("Preparing event data")
         event_data = events_df.select(

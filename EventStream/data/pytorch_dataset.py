@@ -141,6 +141,7 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
         self.split = split
         config.save_dir = Path(config.save_dir)
         self.dl_reps_dir = dl_reps_dir or config.save_dir / "DL_reps"
+        print(f"dl_reps_dir: {self.dl_reps_dir}")
         self.config = config
         self.task_types = {}
         self.task_vocabs = {}
@@ -184,9 +185,9 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
                 self.cached_data[col] = pd.Series([[]] * len(self.cached_data))
 
         self.vocabulary_config = VocabularyConfig.from_json_file(
-            Path("data/labs") / "vocabulary_config.json"
+            config.save_dir  / "vocabulary_config.json"
         )
-        inferred_measurement_config_fp = Path("data") / "inferred_measurement_configs.json"
+        inferred_measurement_config_fp = config.save_dir / "inferred_measurement_configs.json"
         with open(inferred_measurement_config_fp) as f:
             inferred_measurement_configs = {
                 k: MeasurementConfig.from_dict(v) for k, v in json.load(f).items()
@@ -194,10 +195,7 @@ class PytorchDataset(SaveableMixin, SeedableMixin, TimeableMixin, torch.utils.da
         self.measurement_configs = {k: v for k, v in inferred_measurement_configs.items() if not v.is_dropped}
 
         self.split = split
-        config.save_dir = Path(config.save_dir)
-        self.dl_reps_dir = Path("./data/DL_reps")
-        print(f"dl_reps_dir: {self.dl_reps_dir}")
-
+ 
         parquet_files = list(self.dl_reps_dir.glob(f"{split}*.parquet"))
         if parquet_files:
             print(f"Loading parquet files for split '{split}': {parquet_files}")

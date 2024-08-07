@@ -8,6 +8,7 @@ e3cc4487fe66e03ec85970ea2db8e5fb34c455f4/src/transformers/models/gpt_neo/modelin
 """  # noqa E501
 
 import math
+import os
 
 import torch
 import torch.utils.checkpoint
@@ -109,7 +110,7 @@ class InnerSelfAttention(nn.Module):
         self.attention_type = attention_type
         self.window_size = window_size
         self.causal = attention_type in ["local", "global"]  # Set causal based on attention type
-
+        self.use_flash_attention = config.use_flash_attention
 
         max_seq_len = config.max_seq_len
         self.window_size = window_size
@@ -213,7 +214,7 @@ class InnerSelfAttention(nn.Module):
             A tuple containing the output of the attention operation and the attention weights.
         """
 
-        if self.config.use_flash_attention:
+        if self.use_flash_attention:
             # Reshape inputs for Flash Attention
             qkv = torch.stack([query, key, value], dim=2)
             qkv = qkv.transpose(0, 1).contiguous()  # [seqlen, bsz, 3, num_heads, head_dim]
@@ -769,6 +770,9 @@ class ConditionallyIndependentPointProcessInputLayer(torch.nn.Module):
 
         self.embedding_dropout = torch.nn.Dropout(p=config.input_dropout)
 
+        # Add a linear layer for dynamic_values
+        self.dynamic_values_encoder = nn.Linear(1, config.hidden_size)
+
     def forward(self, batch: PytorchBatch | torch.Tensor) -> torch.Tensor:
         if isinstance(batch, torch.Tensor):
             dynamic_indices = batch
@@ -827,6 +831,10 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
             self.bn_f = nn.BatchNorm1d(self.embed_dim)
 
         self.gradient_checkpointing = False
+
+        self.attention_dir = os.path.join(config.save_dir, "attention_weights")
+        os.makedirs(self.attention_dir, exist_ok=True)
+
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -941,6 +949,11 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
         # Add last hidden state
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
+
+        if output_attentions:
+            # Save attention weights
+            attention_path = os.path.join(self.config.save_dir, f"attention_weights_epoch_{self.current_epoch}.pt")
+            torch.save(all_self_attentions, attention_path)
 
         if not return_dict:
             return tuple(
@@ -1090,6 +1103,10 @@ class NestedAttentionPointProcessTransformer(StructuredTransformerPreTrainedMode
         self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
 
         self.gradient_checkpointing = False
+
+        self.attention_dir = os.path.join(config.save_dir, "attention_weights")
+        os.makedirs(self.attention_dir, exist_ok=True)
+
         # Initialize weights and apply final processing
         self.post_init()
 

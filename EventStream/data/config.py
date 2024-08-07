@@ -205,6 +205,9 @@ class PytorchDatasetConfig(DataConfig):
     do_include_subject_id: bool = False
     do_include_start_time_min: bool = False
 
+    def set_dl_reps_dir(self, value):
+        self.dl_reps_dir = value
+
     def __post_init__(self):
         if self.seq_padding_side not in SeqPaddingSide.values():
             raise ValueError(f"seq_padding_side invalid; must be in {', '.join(SeqPaddingSide.values())}")

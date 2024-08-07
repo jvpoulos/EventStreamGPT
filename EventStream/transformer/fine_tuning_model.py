@@ -30,6 +30,11 @@ class CustomConditionallyIndependentPointProcessTransformer(ConditionallyIndepen
     def __init__(self, config: StructuredTransformerConfig, vocabulary_config: VocabularyConfig):
         oov_index = max(vocabulary_config.vocab_sizes_by_measurement.values()) + 1
         print(f"CustomConditionallyIndependentPointProcessTransformer: oov_index = {oov_index}")
+
+        # Add a default save_dir if it's not present in the config
+        if not hasattr(config, 'save_dir'):
+            config.save_dir = './model_outputs'  # You can change this to any default path you prefer
+        
         super().__init__(config, vocabulary_config, oov_index=oov_index)
 
         if config.use_layer_norm:
@@ -105,17 +110,20 @@ class ESTForStreamClassification(StructuredTransformerPreTrainedModel):
         self.vocabulary_config = vocabulary_config
         self.optimization_config = optimization_config
 
+        # Add a default save_dir if it's not present in the config
+        if not hasattr(self.config, 'save_dir'):
+            self.config.save_dir = './model_outputs'  # You can change this to any default path you prefer
+
         if self._uses_dep_graph:
-            self.encoder = NestedAttentionPointProcessTransformer(config)
+            self.encoder = NestedAttentionPointProcessTransformer(self.config)
         else:
-            self.encoder = CustomConditionallyIndependentPointProcessTransformer(config, vocabulary_config)
+            self.encoder = CustomConditionallyIndependentPointProcessTransformer(self.config, vocabulary_config)
         
         self.pooling_method = config.task_specific_params["pooling_method"]
         
         self.logit_layer = torch.nn.Linear(config.hidden_size, 1)
         self.criteria = torch.nn.BCEWithLogitsLoss()
         self.dropout = torch.nn.Dropout(config.intermediate_dropout)
-        self.static_encoder = nn.Linear(8, config.hidden_size)
         
         # Add embeddings for categorical variables
         self.categorical_embeddings = nn.ModuleDict({
@@ -126,7 +134,7 @@ class ESTForStreamClassification(StructuredTransformerPreTrainedModel):
             'Veteran': nn.Embedding(2, config.hidden_size)
         })
         
-        # Linear layer for continuous variables
+        # Linear layer for continuous variables (including SDI_score)
         self.continuous_encoder = nn.Linear(3, config.hidden_size)
 
         # Add a linear layer for dynamic_values
@@ -135,6 +143,7 @@ class ESTForStreamClassification(StructuredTransformerPreTrainedModel):
         # Create normalization layers
         self.layer_norm = nn.LayerNorm(config.hidden_size) if config.use_layer_norm else nn.Identity()
         self.batch_norm = nn.BatchNorm1d(config.hidden_size) if config.use_batch_norm else nn.Identity()
+        self.dynamic_values_norm = nn.BatchNorm1d(1)
 
         self.intermediate = nn.Sequential(
             nn.Linear(config.hidden_size, config.hidden_size),
@@ -155,6 +164,12 @@ class ESTForStreamClassification(StructuredTransformerPreTrainedModel):
         self.max_grad_norm = getattr(config, 'max_grad_norm', 1.0)
         self.use_grad_value_clipping = getattr(optimization_config, 'use_grad_value_clipping', False)
         self.clip_grad_value = getattr(optimization_config, 'clip_grad_value', 1.0)
+
+        # Add a mask for dynamic_values to handle missing values
+        self.dynamic_values_mask = nn.Parameter(torch.ones(1), requires_grad=False)
+
+        # Add a learnable embedding for missing values
+        self.missing_value_embedding = nn.Parameter(torch.randn(config.hidden_size))
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -205,13 +220,7 @@ class ESTForStreamClassification(StructuredTransformerPreTrainedModel):
         
         # Process dynamic data
         dynamic_indices = batch['dynamic_indices'].to(device)
-        
-        # Check if dynamic_values is present in the batch
-        if 'dynamic_values' in batch:
-            dynamic_values = batch['dynamic_values'].to(device)
-        else:
-            # If not present, create a tensor of zeros with the same shape as dynamic_indices
-            dynamic_values = torch.zeros_like(dynamic_indices, dtype=torch.float32).to(device)
+        dynamic_values = batch['dynamic_values'].to(device) if 'dynamic_values' in batch else None
         
         # Validate vocab size
         max_index = dynamic_indices.max().item()
@@ -227,7 +236,7 @@ class ESTForStreamClassification(StructuredTransformerPreTrainedModel):
         ], dim=1)
         
         # Encode dynamic data
-        pytorch_batch = PytorchBatch(dynamic_indices=dynamic_indices)
+        pytorch_batch = PytorchBatch(dynamic_indices=dynamic_indices, dynamic_values=dynamic_values)
         encoded = self.encoder(pytorch_batch).last_hidden_state
         
         # Extract relevant encoded information
@@ -246,9 +255,22 @@ class ESTForStreamClassification(StructuredTransformerPreTrainedModel):
         static_cat_embed = torch.stack(static_cat_embeds, dim=1).mean(dim=1)
         static_num_embed = self.continuous_encoder(static_continuous)
 
-        # Encode dynamic_values
-        dynamic_values_embed = self.dynamic_values_encoder(dynamic_values.unsqueeze(-1))
-        pooled_dynamic_values = dynamic_values_embed.mean(dim=1)  # or use max pooling if preferred
+        # Encode and normalize dynamic_values
+        if dynamic_values is not None:
+            # Create a mask for non-missing values
+            mask = ~torch.isnan(dynamic_values)
+            
+            # Normalize non-missing values
+            dynamic_values_normalized = torch.where(mask, self.dynamic_values_norm(dynamic_values.unsqueeze(1)).squeeze(1), dynamic_values)
+            
+            # Replace missing values with learnable embedding
+            dynamic_values_embed = torch.where(mask.unsqueeze(-1), 
+                                               self.dynamic_values_encoder(dynamic_values_normalized.unsqueeze(-1)), 
+                                               self.missing_value_embedding.unsqueeze(0).unsqueeze(0))
+            
+            pooled_dynamic_values = dynamic_values_embed.mean(dim=1)  # or use max pooling if preferred
+        else:
+            pooled_dynamic_values = self.missing_value_embedding.unsqueeze(0).expand(pooled_dynamic.size(0), -1)
 
         # Combine static embeddings
         static_embed = static_cat_embed + static_num_embed
@@ -260,22 +282,13 @@ class ESTForStreamClassification(StructuredTransformerPreTrainedModel):
         intermediate = self.intermediate(combined_embed)
         
         # Get logits and probabilities
-        logits = self.logit_layer(intermediate).squeeze(-1)  # Ensure logits are squeezed
+        logits = self.logit_layer(intermediate).squeeze(-1)
         probs = torch.sigmoid(logits)
         
         # Compute loss and metrics if labels are provided
         loss, accuracy, auc = None, None, None
         if labels is not None:
             labels = labels.to(logits.device).float()
-            
-            # Ensure labels have the same shape as logits
-            if labels.dim() == 1 and logits.dim() == 1:
-                pass  # Both are 1D, no need to adjust
-            elif labels.dim() == 0 and logits.dim() == 1:
-                labels = labels.unsqueeze(0)  # Make labels 1D to match logits
-            elif labels.dim() == 1 and logits.dim() == 0:
-                logits = logits.unsqueeze(0)  # Make logits 1D to match labels
-            
             loss = self.criteria(logits, labels)
             
             with torch.no_grad():
@@ -283,25 +296,14 @@ class ESTForStreamClassification(StructuredTransformerPreTrainedModel):
                 auc = self.auroc.compute()
                 accuracy = ((probs > 0.5) == labels).float().mean()
         
-        # Collect debugging information
-        debug_info = {
-            "encoded_mean": encoded.mean().item(),
-            "encoded_std": encoded.std().item(),
-            "combined_embed_mean": combined_embed.mean().item(),
-            "combined_embed_std": combined_embed.std().item(),
-            "logits_mean": logits.mean().item(),
-            "logits_std": logits.std().item(),
-        }
-        
         return StreamClassificationModelOutput(
             loss=loss,
             preds=logits,
             labels=labels,
             accuracy=accuracy,
-            auc=auc,
-            debug_info=debug_info
+            auc=auc
         )
-
+        
     @property
     def _uses_dep_graph(self):
         return self.config.structured_event_processing_mode == StructuredEventProcessingMode.NESTED_ATTENTION

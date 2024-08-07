@@ -55,7 +55,7 @@ from torch.utils.data import DataLoader
 import logging
 
 import numpy as np
-from torch.cuda.amp import GradScaler
+from torch.cuda.amp import autocast, GradScaler
 
 from dataclasses import dataclass, field
 
@@ -122,6 +122,8 @@ class ESTForStreamClassificationLM(L.LightningModule):
         self.gradient_norm_changes = []
         self.max_outliers_to_log = 10
         self.batch_indices = []  # Store batch indices instead of subject_ids
+
+        self.current_epoch = 0
 
         # Initialize metrics dictionaries
         self.train_metrics = {}
@@ -322,8 +324,18 @@ class ESTForStreamClassificationLM(L.LightningModule):
         if prefix == 'val':
             self.log(f'{prefix}_loss', metrics[f'{prefix}_loss'], on_step=False, on_epoch=True, prog_bar=True, logger=True)
 
+    @property
+    def current_epoch(self):
+        return self._current_epoch
+
+    @current_epoch.setter
+    def current_epoch(self, value):
+        self._current_epoch = value
+
     def on_train_epoch_start(self):
-        self.batch_indices = []  # Reset for new epoch
+        self._current_epoch += 1
+        if hasattr(self.model, 'encoder'):
+            self.model.encoder.current_epoch = self._current_epoch
 
     def training_step(self, batch, batch_idx):
         outputs = self.model(batch, labels=batch['labels'])
@@ -571,6 +583,8 @@ class FinetuneConfig:
     do_final_validation_metrics_config: Optional[Dict[str, Any]] = None
     do_final_validation_on_metrics: bool = False
     pretrained_weights_fp: Path | str | None = "skip"
+    sweep: bool = False
+    use_labs: bool = False
 
     save_dir: Optional[str] = (
         "${experiment_dir}/${task_df_name}/"
@@ -775,19 +789,19 @@ class CollateFunction:
 
         max_seq_len = max(item['dynamic_indices'].size(0) for item in valid_items)
         dynamic_indices = torch.zeros((len(valid_items), max_seq_len), dtype=torch.long)
-
-        dynamic_values = None
-        if 'dynamic_values' in valid_items[0]:
-            dynamic_values = torch.zeros((len(valid_items), max_seq_len), dtype=torch.float32)
+        dynamic_values = torch.zeros((len(valid_items), max_seq_len), dtype=torch.float32)
 
         for i, item in enumerate(valid_items):
             seq_len = item['dynamic_indices'].size(0)
             dynamic_indices[i, :seq_len] = item['dynamic_indices']
-            if dynamic_values is not None and 'dynamic_values' in item:
+            if 'dynamic_values' in item:
                 dynamic_values[i, :seq_len] = item['dynamic_values'][:seq_len]
+            else:
+                dynamic_values[i, :seq_len] = torch.zeros(seq_len)  # Use zeros for missing dynamic_values
 
         collated_batch = {
             'dynamic_indices': dynamic_indices,
+            'dynamic_values': dynamic_values,
             'labels': torch.stack([self.safe_tensor_conversion(item.get('labels', 0), torch.float32) for item in valid_items]).squeeze(),
             'InitialA1c': torch.tensor([self.safe_float_conversion(item.get('InitialA1c', 0.0)) for item in valid_items], dtype=torch.float32),
             'Female': torch.tensor([self.safe_int_conversion(item.get('Female', 0)) for item in valid_items], dtype=torch.long),
@@ -798,9 +812,6 @@ class CollateFunction:
             'SDI_score': torch.tensor([self.safe_float_conversion(item.get('SDI_score', 0.0)) for item in valid_items], dtype=torch.float32),
             'Veteran': torch.tensor([self.safe_int_conversion(item.get('Veteran', 0)) for item in valid_items], dtype=torch.long),
         }
-
-        if dynamic_values is not None:
-            collated_batch['dynamic_values'] = dynamic_values
 
         return collated_batch
 
@@ -907,11 +918,11 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, wandb_logger
             LearningRateMonitor(logging_interval="step"),
             ModelCheckpoint(
                 dirpath=cfg.save_dir / "checkpoints",
-                filename="{epoch}-{val_loss_epoch:.2f}",
-                monitor="val_loss_epoch", 
-                mode="min",
-                save_top_k=1,
-                save_weights_only=True,
+                filename="{epoch}-{val_auc_epoch:.2f}",
+                monitor="val_auc_epoch", 
+                mode="max",
+                save_top_k=3,
+                save_weights_only=False,
                 save_last=True,
                 auto_insert_metric_name=False,
             ),
@@ -926,12 +937,19 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, wandb_logger
         ]
 
         logger.info("Setting up trainer")
+        
+        # Create a GradScaler for mixed precision training
+        scaler = GradScaler()
+
+        # Update trainer configuration
+        cfg.trainer_config["precision"] = "16-mixed"
+
         trainer = L.Trainer(
             **cfg.trainer_config,
             callbacks=callbacks,
             logger=wandb_logger,
             accumulate_grad_batches=optimization_config.get('gradient_accumulation', 4),
-            max_epochs=optimization_config.get('max_epochs', 100),  # Ensure this is correctly passed
+            max_epochs=optimization_config.get('max_epochs', 100),
             gradient_clip_val=config.max_grad_norm if not optimization_config.get('use_grad_value_clipping', False) else optimization_config.get('clip_grad_value', None),
             gradient_clip_algorithm="norm" if not optimization_config.get('use_grad_value_clipping', False) else "value",
             enable_progress_bar=True,

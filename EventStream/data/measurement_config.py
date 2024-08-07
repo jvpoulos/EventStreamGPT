@@ -258,6 +258,8 @@ class MeasurementConfig(JSONableMixin):
 
     def __post_init__(self):
         self._validate()
+        if self._measurement_metadata is None and self.is_numeric:
+            self._measurement_metadata = pd.DataFrame()
 
     def _validate(self):
         """Checks the internal state of `self` and ensures internal consistency and validity."""
@@ -457,36 +459,9 @@ class MeasurementConfig(JSONableMixin):
             case _:
                 self._measurement_metadata = new_metadata
 
-    def cache_measurement_metadata(self, base_dir: Path, fn: str):
-        fp = base_dir / fn
-        if isinstance(self._measurement_metadata, (str, Path)):
-            if str(fp) != str(self._measurement_metadata):
-                raise ValueError(f"Caching is already enabled at {self._measurement_metadata} != {fp}")
-            return
-        if self.measurement_metadata is None:
-            return
-
-        fp.parent.mkdir(exist_ok=True, parents=True)
-        self.measurement_metadata.to_csv(fp)
-        self._measurement_metadata = [str(base_dir.resolve()), fn]
-
-    def uncache_measurement_metadata(self):
-        if self._measurement_metadata is None:
-            return
-
-        match self._measurement_metadata:
-            case [Path(), str()]:
-                pass
-            case Path() | str():
-                pass
-            case _:
-                raise ValueError("Caching is not enabled, can't uncache!")
-
-        self._measurement_metadata = self.measurement_metadata
-
     def add_empty_metadata(self):
         """Adds an empty `measurement_metadata` dataframe or series."""
-        if self.measurement_metadata is not None:
+        if self.measurement_metadata is not None and not self.measurement_metadata.empty:
             raise ValueError(f"Can't add empty metadata; already set to {self.measurement_metadata}")
 
         match self.modality:
@@ -523,6 +498,33 @@ class MeasurementConfig(JSONableMixin):
                 for col, dtype in self.PREPROCESSING_METADATA_COLUMNS.items():
                     if col not in self.measurement_metadata.index:
                         self.measurement_metadata[col] = None
+
+    def cache_measurement_metadata(self, base_dir: Path, fn: str):
+        fp = base_dir / fn
+        if isinstance(self._measurement_metadata, (str, Path)):
+            if str(fp) != str(self._measurement_metadata):
+                raise ValueError(f"Caching is already enabled at {self._measurement_metadata} != {fp}")
+            return
+        if self.measurement_metadata is None:
+            return
+
+        fp.parent.mkdir(exist_ok=True, parents=True)
+        self.measurement_metadata.to_csv(fp)
+        self._measurement_metadata = [str(base_dir.resolve()), fn]
+
+    def uncache_measurement_metadata(self):
+        if self._measurement_metadata is None:
+            return
+
+        match self._measurement_metadata:
+            case [Path(), str()]:
+                pass
+            case Path() | str():
+                pass
+            case _:
+                raise ValueError("Caching is not enabled, can't uncache!")
+
+        self._measurement_metadata = self.measurement_metadata
 
     def to_dict(self) -> dict:
         """Represents this configuration object as a plain dictionary."""
@@ -598,62 +600,6 @@ class MeasurementConfig(JSONableMixin):
     def describe(
         self, line_width: int = 60, wrap_lines: bool = False, stream: TextIOBase | None = None
     ) -> int | None:
-        """Provides a plain-text description of the measurement.
-
-        Prints the following information about the MeasurementConfig object:
-
-        1. The measurement's name, temporality, modality, and observation frequency.
-        2. What value types (e.g., integral, float, etc.) it's values take on, if the measurement is a
-           numerical modality whose values may take on distinct value types.
-        3. Details about its internal `self.vocabulary` object, via `Vocabulary.describe`.
-
-        Args:
-            line_width: The maximum width of each line in the description.
-            wrap_lines: Whether to wrap lines that exceed the `line_width`.
-            stream: The stream to write the description to. If `None`, the description is printed to stdout.
-
-        Returns:
-            The number of characters written to the stream if a stream was provided, otherwise `None`.
-
-        Raises:
-            ValueError: if the calling object is misconfigured.
-
-        Examples:
-            >>> vocab = Vocabulary(
-            ...     vocabulary=['apple', 'banana', 'pear', 'UNK'],
-            ...     obs_frequencies=[3, 4, 1, 2],
-            ... )
-            >>> cfg = MeasurementConfig(
-            ...     name="MVR",
-            ...     values_column='bar',
-            ...     temporality='dynamic',
-            ...     modality='multivariate_regression',
-            ...     observation_rate_over_cases=0.6816,
-            ...     observation_rate_per_case=1.32,
-            ...     _measurement_metadata=pd.DataFrame(
-            ...         {'value_type': ['float', 'categorical', 'categorical']},
-            ...         index=pd.Index(['apple', 'pear', 'banana'], name='MVR'),
-            ...     ),
-            ...     vocabulary=vocab,
-            ... )
-            >>> cfg.describe(line_width=100)
-            MVR: dynamic, multivariate_regression observed 68.2%, 1.3/case on average
-            Value Types:
-              2 categorical
-              1 float
-            Vocabulary:
-              4 elements, 20.0% UNKs
-              Frequencies: █▆▁
-              Elements:
-                (40.0%) banana
-                (30.0%) apple
-                (10.0%) pear
-            >>> cfg.modality = 'wrong'
-            >>> cfg.describe()
-            Traceback (most recent call last):
-                ...
-            ValueError: Can't describe wrong measure MVR!
-        """
         lines = []
         lines.append(
             f"{self.name}: {self.temporality}, {self.modality} "
@@ -663,11 +609,17 @@ class MeasurementConfig(JSONableMixin):
 
         match self.modality:
             case DataModality.UNIVARIATE_REGRESSION:
-                lines.append(f"Value is a {self.measurement_metadata.value_type}")
+                if isinstance(self.measurement_metadata, pd.DataFrame) and 'value_type' in self.measurement_metadata.columns:
+                    lines.append(f"Value is a {self.measurement_metadata['value_type'].iloc[0]}")
+                else:
+                    lines.append("Value type information not available")
             case DataModality.MULTIVARIATE_REGRESSION:
                 lines.append("Value Types:")
-                for t, cnt in self.measurement_metadata.value_type.value_counts().items():
-                    lines.append(f"  {cnt} {t}")
+                if isinstance(self.measurement_metadata, pd.DataFrame) and 'value_type' in self.measurement_metadata.columns:
+                    for t, cnt in self.measurement_metadata['value_type'].value_counts().items():
+                        lines.append(f"  {cnt} {t}")
+                else:
+                    lines.append("  Value type information not available")
             case DataModality.MULTI_LABEL_CLASSIFICATION:
                 pass
             case DataModality.SINGLE_LABEL_CLASSIFICATION:
