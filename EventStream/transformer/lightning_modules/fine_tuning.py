@@ -104,8 +104,10 @@ class ESTForStreamClassificationLM(L.LightningModule):
         config: StructuredTransformerConfig | dict[str, Any],
         optimization_config: OptimizationConfig | dict[str, Any],
         cfg,
+        vocabulary_config: VocabularyConfig,
+        oov_index: int,
         pretrained_weights_fp: Path | str | None = None,
-        do_debug_mode: bool = True,
+        do_debug_mode: bool = False,
         **model_params
     ):
         super().__init__()
@@ -118,18 +120,19 @@ class ESTForStreamClassificationLM(L.LightningModule):
             self.optimization_config = optimization_config
         self.cfg = cfg
         self.do_debug_mode = do_debug_mode
+        self.oov_index = oov_index
         
         self.gradient_norm_changes = []
         self.max_outliers_to_log = 10
         self.batch_indices = []  # Store batch indices instead of subject_ids
-
         self.current_epoch = 0
-
+        
         # Initialize metrics dictionaries
         self.train_metrics = {}
         self.val_metrics = {}
         self.test_metrics = {}
-
+        
+        # Set optimization parameters
         self.learning_rate = self.optimization_config.init_lr
         self.num_training_steps = self.optimization_config.max_training_steps
         self.weight_decay = self.optimization_config.weight_decay
@@ -140,50 +143,86 @@ class ESTForStreamClassificationLM(L.LightningModule):
         self.use_grad_value_clipping = self.optimization_config.use_grad_value_clipping
         self.clip_grad_value = self.optimization_config.clip_grad_value
         self.max_grad_norm = self.config.max_grad_norm
-
+        
         self.grad_norm_before = None
         self.grad_norm_after = None
+
+        self.automatic_optimization = True
 
         # Load the vocabulary_config from a file
         vocabulary_config_path = "data/vocabulary_config.json"
         with open(vocabulary_config_path, "r") as f:
             vocabulary_config_dict = json.load(f)
         vocabulary_config = VocabularyConfig.from_dict(vocabulary_config_dict)
-
+        
+        # Initialize the model
         if pretrained_weights_fp is None or pretrained_weights_fp == "skip":
-            self.model = ESTForStreamClassification(config, vocabulary_config, self.optimization_config)
+            self.model = ESTForStreamClassification(config, vocabulary_config, self.optimization_config, oov_index=self.oov_index)
         else:
-            self.model = ESTForStreamClassification.from_pretrained(pretrained_weights_fp, config=config, vocabulary_config=vocabulary_config, optimization_config=self.optimization_config)
+            self.model = ESTForStreamClassification.from_pretrained(
+                pretrained_weights_fp,
+                config=config,
+                vocabulary_config=vocabulary_config,
+                optimization_config=self.optimization_config,
+                oov_index=self.oov_index
+            )
+        
+        if self.config.use_gradient_checkpointing:
+            self.model.gradient_checkpointing_enable()
+            self._set_static_graph()
 
+        # Ensure all parameters require gradients
+        for param in self.model.parameters():
+            param.requires_grad = True
+
+        # Save hyperparameters
         self.save_hyperparameters(
             {
                 "config": config.to_dict(),
                 "optimization_config": asdict(self.optimization_config) if is_dataclass(self.optimization_config) else self.optimization_config,
             }
         )
-
+        
+        # Build metrics
         self.build_metrics()
-
-        # Load the vocabulary_config from a file
-        vocabulary_config_path = "data/vocabulary_config.json"
-        with open(vocabulary_config_path, "r") as f:
-            vocabulary_config_dict = json.load(f)
-        vocabulary_config = VocabularyConfig.from_dict(vocabulary_config_dict)
-
-        if pretrained_weights_fp is None or pretrained_weights_fp == "skip":
-            self.model = ESTForStreamClassification(config, vocabulary_config, self.optimization_config)
-        else:
-            self.model = ESTForStreamClassification.from_pretrained(pretrained_weights_fp, config=config, vocabulary_config=vocabulary_config, optimization_config=self.optimization_config)
-
+        
+        # Initialize gradient stats
         self.gradient_stats = {
             'before_norm': [],
             'after_norm': [],
             'after_clip': []
         }
+        
+        # Initialize metric accumulator
         self.metric_accumulator = defaultdict(list)
+
+    def _set_static_graph(self):
+        def apply_static_graph(module):
+            if hasattr(module, '_set_static_graph'):
+                module._set_static_graph()
+            for child in module.children():
+                apply_static_graph(child)
+
+        apply_static_graph(self.model)
+
+    def configure_sharded_model(self):
+        self.model._set_static_graph()
+
+    def on_train_start(self):
+        if self.config.use_gradient_checkpointing:
+            self.model._set_static_graph()
+
+    @property
+    def is_gradient_checkpointing(self):
+        return getattr(self.model, 'gradient_checkpointing', False)
+
+    def gradient_checkpointing_enable(self):
+        self.model.gradient_checkpointing_enable()
 
     def on_train_start(self):
         self.gradient_stats = {k: [] for k in self.gradient_stats}
+        if self.config.use_gradient_checkpointing:
+            self.model._set_static_graph()
     
     def get_gradient_norm(self):
         total_norm = 0.0
@@ -194,8 +233,10 @@ class ESTForStreamClassificationLM(L.LightningModule):
         return total_norm ** 0.5
 
     def on_before_optimizer_step(self, optimizer):
-        self.grad_norm_before = self.get_gradient_norm()
-        self.log('grad_norm_before', self.grad_norm_before, on_step=True, on_epoch=False, prog_bar=False, logger=True)
+        # Custom gradient clipping logic here
+        if self.trainer.gradient_clip_val is not None:
+            params = [p for group in optimizer.param_groups for p in group['params']]
+            torch.nn.utils.clip_grad_norm_(params, self.trainer.gradient_clip_val)
 
     def on_after_optimizer_step(self, optimizer):
         self.grad_norm_after = self.get_gradient_norm()
@@ -318,11 +359,11 @@ class ESTForStreamClassificationLM(L.LightningModule):
             self.metric_accumulator[name].append(value)
         
         # Log all metrics at once
-        self.log_dict(metrics, on_step=(prefix == 'train'), on_epoch=True, prog_bar=True, logger=True)
+        self.log_dict(metrics, on_step=(prefix == 'train'), on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
 
         # For validation, we only want to log the loss on_epoch
         if prefix == 'val':
-            self.log(f'{prefix}_loss', metrics[f'{prefix}_loss'], on_step=False, on_epoch=True, prog_bar=True, logger=True)
+            self.log(f'{prefix}_loss', metrics[f'{prefix}_loss'], on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
 
     @property
     def current_epoch(self):
@@ -332,33 +373,11 @@ class ESTForStreamClassificationLM(L.LightningModule):
     def current_epoch(self, value):
         self._current_epoch = value
 
-    def on_train_epoch_start(self):
-        self._current_epoch += 1
-        if hasattr(self.model, 'encoder'):
-            self.model.encoder.current_epoch = self._current_epoch
-
     def training_step(self, batch, batch_idx):
         outputs = self.model(batch, labels=batch['labels'])
         loss = outputs.loss
 
-        if torch.isnan(loss) or torch.isinf(loss):
-            logger.error(f"NaN or Inf loss detected: {loss}")
-            return None
-
-        # Store batch index
-        self.batch_indices.append(batch_idx)
-
-        # Log gradients before normalization
-        self.log_gradients('before_norm')
-
-        # Manually compute gradient norm and clip if necessary
-        if self.trainer.gradient_clip_val is not None:
-            torch.nn.utils.clip_grad_norm_(self.parameters(), self.trainer.gradient_clip_val)
-        
-        # Log gradients after normalization/clipping
-        self.log_gradients('after_clip')
-
-        # Use the updated log_metrics function
+        # Log metrics
         self.log_metrics('train', outputs)
         
         return loss
@@ -402,6 +421,10 @@ class ESTForStreamClassificationLM(L.LightningModule):
         self.gradient_stats[stage].append(total_norm)
 
     def validation_step(self, batch, batch_idx):
+        # Convert batch to dictionary if it's not already
+        if not isinstance(batch, dict):
+            batch = {k: v for k, v in zip(self.model.config.input_keys, batch)}
+        
         outputs = self.model(batch, labels=batch['labels'])
         self.log_metrics('val', outputs)
         return outputs.loss
@@ -515,7 +538,7 @@ class ESTForStreamClassificationLM(L.LightningModule):
 
         # Initialize optimizer
         optimizer = torch.optim.AdamW(
-            optimizer_grouped_parameters,
+            self.parameters(),  # Use self.parameters() instead of optimizer_grouped_parameters
             lr=self.learning_rate,
             betas=(0.9, 0.999),
             eps=1e-8,
@@ -565,6 +588,12 @@ class ESTForStreamClassificationLM(L.LightningModule):
                 "frequency": 1,
                 "monitor": "val_loss" if self.lr_scheduler_type == "reduce_on_plateau" else None,
             }
+
+            # Enable gradient checkpointing and set static graph
+            if hasattr(self.model, 'encoder'):
+                self.model.encoder.gradient_checkpointing = True
+                self._set_static_graph()
+
             return {"optimizer": optimizer, "lr_scheduler": scheduler_config}
         else:
             return optimizer
@@ -575,7 +604,7 @@ class FinetuneConfig:
     load_from_model_dir: Optional[Union[str, Path]] = omegaconf.MISSING
     task_df_name: Optional[str] = omegaconf.MISSING
     optimization_config_path: str = omegaconf.MISSING
-    vocabulary_config: Any = field(default_factory=VocabularyConfig)  # Changed to Any
+    vocabulary_config: Any = field(default_factory=VocabularyConfig)
     pretrain_config_path: Optional[str] = None
     dataset_path: Optional[str] = None
     pretraining_metrics_config: Optional[Dict[str, Any]] = None
@@ -585,6 +614,8 @@ class FinetuneConfig:
     pretrained_weights_fp: Path | str | None = "skip"
     sweep: bool = False
     use_labs: bool = False
+    do_debug_mode: bool = False
+    data_config: PytorchDatasetConfig = field(default_factory=PytorchDatasetConfig)
 
     save_dir: Optional[str] = (
         "${experiment_dir}/${task_df_name}/"
@@ -592,6 +623,19 @@ class FinetuneConfig:
         "subset_seed_${data_config.train_subset_seed}/"
         "${now:%Y-%m-%d_%H-%M-%S}"
     )
+
+    def get_data_directories(self):
+        if self.use_labs:
+            save_dir = "./data/labs"
+            dl_reps_dir = "data/labs/DL_reps"
+        else:
+            save_dir = "./data"
+            dl_reps_dir = "data/DL_reps"
+        return save_dir, dl_reps_dir
+
+    def update_data_config(self):
+        save_dir, dl_reps_dir = self.get_data_directories()
+        self.data_config = dataclasses.replace(self.data_config, save_dir=save_dir, dl_reps_dir=dl_reps_dir)
 
     wandb_logger_kwargs: Dict[str, Any] = field(
         default_factory=lambda: {
@@ -655,6 +699,14 @@ class FinetuneConfig:
         }
     )
     do_use_filesystem_sharing: bool = True
+
+    def set_data_directory(self):
+        if self.use_labs:
+            self.data_config['save_dir'] = "./data/labs"
+            self.data_config['dl_reps_dir'] = "data/labs/DL_reps"
+        else:
+            self.data_config['save_dir'] = "./data"
+            self.data_config['dl_reps_dir'] = "data/DL_reps"
 
     def __post_init__(self):
         if isinstance(self.save_dir, str):
@@ -775,11 +827,11 @@ class CollateFunction:
             
             if 'dynamic_indices' not in item or item['dynamic_indices'] is None:
                 self.logger.warning(f"Item {i} has missing or None dynamic_indices, using default")
-                item['dynamic_indices'] = torch.tensor([0], dtype=torch.long)  # Use 0 for padding
+                item['dynamic_indices'] = torch.tensor([0], dtype=torch.long)
             
-            if not isinstance(item['dynamic_indices'], torch.Tensor) or item['dynamic_indices'].numel() == 0:
-                self.logger.warning(f"Invalid dynamic_indices in item {i}, using default")
-                item['dynamic_indices'] = torch.tensor([0], dtype=torch.long)  # Use 0 for padding
+            if 'dynamic_values' not in item or item['dynamic_values'] is None:
+                self.logger.warning(f"Item {i} has missing or None dynamic_values, using default")
+                item['dynamic_values'] = torch.tensor([0.0], dtype=torch.float)
             
             valid_items.append(item)
 
@@ -790,18 +842,21 @@ class CollateFunction:
         max_seq_len = max(item['dynamic_indices'].size(0) for item in valid_items)
         dynamic_indices = torch.zeros((len(valid_items), max_seq_len), dtype=torch.long)
         dynamic_values = torch.zeros((len(valid_items), max_seq_len), dtype=torch.float32)
+        dynamic_values_mask = torch.zeros((len(valid_items), max_seq_len), dtype=torch.bool)
 
         for i, item in enumerate(valid_items):
             seq_len = item['dynamic_indices'].size(0)
             dynamic_indices[i, :seq_len] = item['dynamic_indices']
-            if 'dynamic_values' in item:
-                dynamic_values[i, :seq_len] = item['dynamic_values'][:seq_len]
+            if 'dynamic_values' in item and item['dynamic_values'] is not None:
+                dynamic_values[i, :seq_len] = item['dynamic_values']
+                dynamic_values_mask[i, :seq_len] = True
             else:
-                dynamic_values[i, :seq_len] = torch.zeros(seq_len)  # Use zeros for missing dynamic_values
+                dynamic_values_mask[i, :seq_len] = False
 
         collated_batch = {
             'dynamic_indices': dynamic_indices,
             'dynamic_values': dynamic_values,
+            'dynamic_values_mask': dynamic_values_mask,
             'labels': torch.stack([self.safe_tensor_conversion(item.get('labels', 0), torch.float32) for item in valid_items]).squeeze(),
             'InitialA1c': torch.tensor([self.safe_float_conversion(item.get('InitialA1c', 0.0)) for item in valid_items], dtype=torch.float32),
             'Female': torch.tensor([self.safe_int_conversion(item.get('Female', 0)) for item in valid_items], dtype=torch.long),
@@ -858,11 +913,37 @@ def worker_init_fn(worker_id):
     random.seed(worker_id)
 
 @task_wrapper
-def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, wandb_logger: WandbLogger | None = None):
+def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_config: VocabularyConfig, oov_index: int, wandb_logger: WandbLogger | None = None):
+
+    # Close out existing wandb sessions
+    if wandb.run:
+        wandb.finish()
+    wandb.init(mode="disabled")
+    wandb.finish()
+
     logging.basicConfig(level=logging.DEBUG)
     logger = logging.getLogger(__name__)
 
     try:
+        # Update data config
+        cfg.update_data_config()
+        
+        # Load the vocabulary_config from the correct file
+        vocabulary_config_path = "data/labs/vocabulary_config.json" if cfg.use_labs else "data/vocabulary_config.json"
+        with open(vocabulary_config_path, "r") as f:
+            vocabulary_config_dict = json.load(f)
+        vocabulary_config = VocabularyConfig.from_dict(vocabulary_config_dict)
+
+        # Calculate OOV index
+        dynamic_indices_vocab_size = vocabulary_config.vocab_sizes_by_measurement.get("dynamic_indices", 0)
+        oov_index = cfg.config.vocab_size  # Set oov_index to vocab_size
+
+        logger.info(f"Calculated OOV index: {oov_index}")
+        
+        # Log the data directories
+        logger.info(f"Using data directory: {cfg.data_config.save_dir}")
+        logger.info(f"Using DL reps directory: {cfg.data_config.dl_reps_dir}")
+        
         # Always initialize wandb
         if wandb.run is None:
             wandb.init(project=cfg.wandb_logger_kwargs.get('project', 'default_project'),
@@ -889,7 +970,17 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, wandb_logger
         logger.info(f"Using device: {device}")
         
         logger.info("Initializing model")
-        LM = ESTForStreamClassificationLM(config, optimization_config, cfg, **model_params).to(device)
+        LM = ESTForStreamClassificationLM(
+            config,
+            optimization_config,
+            cfg,
+            vocabulary_config=vocabulary_config,
+            oov_index=oov_index,
+            pretrained_weights_fp=cfg.pretrained_weights_fp,
+            do_debug_mode=cfg.do_debug_mode,
+            device=device,
+            **model_params
+        ).to(device)
 
         logger.info(f"Train dataset length: {len(train_pyd)}")
         logger.info(f"First few items from train dataset:")
@@ -948,11 +1039,11 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, wandb_logger
             **cfg.trainer_config,
             callbacks=callbacks,
             logger=wandb_logger,
-            accumulate_grad_batches=optimization_config.get('gradient_accumulation', 4),
             max_epochs=optimization_config.get('max_epochs', 100),
-            gradient_clip_val=config.max_grad_norm if not optimization_config.get('use_grad_value_clipping', False) else optimization_config.get('clip_grad_value', None),
-            gradient_clip_algorithm="norm" if not optimization_config.get('use_grad_value_clipping', False) else "value",
+            gradient_clip_val=config.max_grad_norm,
+            gradient_clip_algorithm="norm",
             enable_progress_bar=True,
+            deterministic=True,
         )
 
         logger.info("Starting training")

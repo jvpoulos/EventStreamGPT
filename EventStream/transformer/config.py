@@ -539,10 +539,11 @@ class StructuredTransformerConfig(PretrainedConfig):
         std_log_inter_event_time_min: float | None = None,
         # For decoding
         use_cache: bool = True,
+        use_gradient_checkpointing: bool = False,
+        device=None,
         **kwargs,
     ):
-        # Set the device attribute based on the availability of a GPU
-        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.problem_type = problem_type
         self.do_use_sinusoidal = do_use_sinusoidal  # Initialize the attribute here
         self.do_use_learnable_sinusoidal_ATE = do_use_learnable_sinusoidal_ATE
@@ -594,6 +595,8 @@ class StructuredTransformerConfig(PretrainedConfig):
         super().__init__(**kwargs)
 
         self.use_flash_attention = use_flash_attention
+
+        self.use_gradient_checkpointing = use_gradient_checkpointing
 
         # Initialize id2label and label2id based on the value of num_labels
         if num_labels is None:

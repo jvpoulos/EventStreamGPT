@@ -2,6 +2,7 @@
 import torch
 import math
 from torch import nn
+import torch.utils.checkpoint
 import torch.nn.functional as F
 from torch.nn import LayerNorm
 from torchmetrics.classification import BinaryAUROC
@@ -26,31 +27,107 @@ import logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
-class CustomConditionallyIndependentPointProcessTransformer(ConditionallyIndependentPointProcessTransformer):
-    def __init__(self, config: StructuredTransformerConfig, vocabulary_config: VocabularyConfig):
-        oov_index = max(vocabulary_config.vocab_sizes_by_measurement.values()) + 1
-        print(f"CustomConditionallyIndependentPointProcessTransformer: oov_index = {oov_index}")
+class ESTForStreamClassification(StructuredTransformerPreTrainedModel):
+    def __init__(self, config: StructuredTransformerConfig, vocabulary_config: VocabularyConfig, optimization_config: OptimizationConfig, oov_index: int):
+        super().__init__(config)
+        self.config = config
+        self.vocabulary_config = vocabulary_config
+        self.optimization_config = optimization_config
+        self.oov_index = oov_index
+
+        self._current_epoch = 0  # Use a private attribute for current_epoch
 
         # Add a default save_dir if it's not present in the config
-        if not hasattr(config, 'save_dir'):
-            config.save_dir = './model_outputs'  # You can change this to any default path you prefer
-        
-        super().__init__(config, vocabulary_config, oov_index=oov_index)
+        if not hasattr(self.config, 'save_dir'):
+            self.config.save_dir = './model_outputs'  # You can change this to any default path you prefer
 
-        if config.use_layer_norm:
-            self.ln_f = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
+        # Set OOV index based on vocabulary_config
+        dynamic_indices_vocab_size = vocabulary_config.vocab_sizes_by_measurement.get("dynamic_indices", 0)
+        self.oov_index = dynamic_indices_vocab_size + 1
+
+        if self._uses_dep_graph:
+            self.encoder = NestedAttentionPointProcessTransformer(self.config)
         else:
-            self.ln_f = nn.Identity()  # Use Identity if layer norm is not required
+            self.encoder = ConditionallyIndependentPointProcessTransformer(self.config, vocabulary_config, oov_index=self.oov_index)
+       
+        # Convert encoder to use SyncBatchNorm
+        self.encoder = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.encoder)
 
-        # Initialize weights
-        self.initialize_weights()
+        self.pooling_method = config.task_specific_params["pooling_method"]
+        
+        self.logit_layer = torch.nn.Linear(config.hidden_size, 1)
+        self.criteria = torch.nn.BCEWithLogitsLoss()
+        self.dropout = torch.nn.Dropout(config.intermediate_dropout)
+        
+        # Add embeddings for categorical variables
+        self.categorical_embeddings = nn.ModuleDict({
+            'Female': nn.Embedding(2, config.hidden_size),
+            'Married': nn.Embedding(2, config.hidden_size),
+            'GovIns': nn.Embedding(2, config.hidden_size),
+            'English': nn.Embedding(2, config.hidden_size),
+            'Veteran': nn.Embedding(2, config.hidden_size)
+        })
+        
+        # Linear layer for continuous variables (including SDI_score)
+        self.continuous_encoder = nn.Linear(3, config.hidden_size)
 
+        # Add a linear layer for dynamic_values
+        self.dynamic_values_encoder = nn.Linear(1, config.hidden_size)
+
+        # Create normalization layers
+        self.layer_norm = nn.LayerNorm(config.hidden_size) if config.use_layer_norm else nn.Identity()
+        self.batch_norm = nn.BatchNorm1d(config.hidden_size) if config.use_batch_norm else nn.Identity()
+        self.dynamic_values_norm = nn.BatchNorm1d(1)
+
+        self.intermediate = nn.Sequential(
+            nn.Linear(config.hidden_size, config.hidden_size),
+            nn.ReLU(),
+            self.layer_norm,
+            self.batch_norm,
+            self.dropout
+        )
+
+        self.static_weight = nn.Parameter(torch.tensor(config.static_embedding_weight))
+        self.dynamic_weight = nn.Parameter(torch.tensor(config.dynamic_embedding_weight))
+
+        self.apply(self._init_weights)
+
+        # Initialize AUROC
+        self.auroc = BinaryAUROC()
+
+        self.max_grad_norm = getattr(config, 'max_grad_norm', 1.0)
+        self.use_grad_value_clipping = getattr(optimization_config, 'use_grad_value_clipping', False)
+        self.clip_grad_value = getattr(optimization_config, 'clip_grad_value', 1.0)
+
+        # Add a mask for dynamic_values to handle missing values
+        self.dynamic_values_mask = nn.Parameter(torch.ones(1), requires_grad=False)
+
+        # Add a learnable embedding for missing values
+        self.missing_value_embedding = nn.Parameter(torch.randn(config.hidden_size))
+        
+        # Enable gradient checkpointing for the encoder
+        self.encoder.gradient_checkpointing = True
+
+    def _set_static_graph(self):
+        for module in self.children():
+            if hasattr(module, '_set_static_graph'):
+                module._set_static_graph()
+
+        # Explicitly set static graph for all InnerBlock modules
+        if hasattr(self.encoder, 'h'):
+            for block in self.encoder.h:
+                if hasattr(block, '_set_static_graph'):
+                    block._set_static_graph()
+                
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             nn.init.xavier_uniform_(module.weight)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.LayerNorm):
+            nn.init.ones_(module.weight)
+            nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.BatchNorm1d):
             nn.init.ones_(module.weight)
             nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
@@ -103,124 +180,35 @@ class CustomConditionallyIndependentPointProcessTransformer(ConditionallyIndepen
             else:
                 self.decoder.apply(self._init_weights)
 
-class ESTForStreamClassification(StructuredTransformerPreTrainedModel):
-    def __init__(self, config: StructuredTransformerConfig, vocabulary_config: VocabularyConfig, optimization_config: OptimizationConfig):
-        super().__init__(config)
-        self.config = config
-        self.vocabulary_config = vocabulary_config
-        self.optimization_config = optimization_config
-
-        # Add a default save_dir if it's not present in the config
-        if not hasattr(self.config, 'save_dir'):
-            self.config.save_dir = './model_outputs'  # You can change this to any default path you prefer
-
-        if self._uses_dep_graph:
-            self.encoder = NestedAttentionPointProcessTransformer(self.config)
-        else:
-            self.encoder = CustomConditionallyIndependentPointProcessTransformer(self.config, vocabulary_config)
-        
-        self.pooling_method = config.task_specific_params["pooling_method"]
-        
-        self.logit_layer = torch.nn.Linear(config.hidden_size, 1)
-        self.criteria = torch.nn.BCEWithLogitsLoss()
-        self.dropout = torch.nn.Dropout(config.intermediate_dropout)
-        
-        # Add embeddings for categorical variables
-        self.categorical_embeddings = nn.ModuleDict({
-            'Female': nn.Embedding(2, config.hidden_size),
-            'Married': nn.Embedding(2, config.hidden_size),
-            'GovIns': nn.Embedding(2, config.hidden_size),
-            'English': nn.Embedding(2, config.hidden_size),
-            'Veteran': nn.Embedding(2, config.hidden_size)
-        })
-        
-        # Linear layer for continuous variables (including SDI_score)
-        self.continuous_encoder = nn.Linear(3, config.hidden_size)
-
-        # Add a linear layer for dynamic_values
-        self.dynamic_values_encoder = nn.Linear(1, config.hidden_size)
-
-        # Create normalization layers
-        self.layer_norm = nn.LayerNorm(config.hidden_size) if config.use_layer_norm else nn.Identity()
-        self.batch_norm = nn.BatchNorm1d(config.hidden_size) if config.use_batch_norm else nn.Identity()
-        self.dynamic_values_norm = nn.BatchNorm1d(1)
-
-        self.intermediate = nn.Sequential(
-            nn.Linear(config.hidden_size, config.hidden_size),
-            nn.ReLU(),
-            self.layer_norm,
-            self.batch_norm,
-            self.dropout
-        )
-
-        self.static_weight = nn.Parameter(torch.tensor(config.static_embedding_weight))
-        self.dynamic_weight = nn.Parameter(torch.tensor(config.dynamic_embedding_weight))
-
-        self.apply(self._init_weights)
-
-        # Initialize AUROC
-        self.auroc = BinaryAUROC()
-
-        self.max_grad_norm = getattr(config, 'max_grad_norm', 1.0)
-        self.use_grad_value_clipping = getattr(optimization_config, 'use_grad_value_clipping', False)
-        self.clip_grad_value = getattr(optimization_config, 'clip_grad_value', 1.0)
-
-        # Add a mask for dynamic_values to handle missing values
-        self.dynamic_values_mask = nn.Parameter(torch.ones(1), requires_grad=False)
-
-        # Add a learnable embedding for missing values
-        self.missing_value_embedding = nn.Parameter(torch.randn(config.hidden_size))
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            nn.init.xavier_uniform_(module.weight)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.LayerNorm):
-            nn.init.ones_(module.weight)
-            nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.BatchNorm1d):
-            nn.init.ones_(module.weight)
-            nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            embedding_dim = module.embedding_dim
-            std = math.sqrt(1.0 / embedding_dim)
-            nn.init.normal_(module.weight, mean=0, std=std)
-
-    def _init_input_embeddings(self):
-        for embedding in self.categorical_embeddings.values():
-            embedding_dim = embedding.embedding_dim
-            std = math.sqrt(1.0 / embedding_dim)
-            nn.init.normal_(embedding.weight, mean=0, std=std)
-
-        # Initialize the continuous encoder (which is essentially an embedding for numerical values)
-        nn.init.normal_(self.continuous_encoder.weight, mean=0, std=math.sqrt(1.0 / self.config.numerical_embedding_dim))
-        if self.continuous_encoder.bias is not None:
-            nn.init.zeros_(self.continuous_encoder.bias)
-
-    def initialize_weights(self):
-        # Apply Xavier initialization to all parameters except embeddings
-        self.apply(self._init_weights)
-        
-        # Apply Gaussian initialization to input embeddings
-        self._init_input_embeddings()
-
-        # Initialize the encoder separately
-        if hasattr(self.encoder, 'initialize_weights'):
-            self.encoder.initialize_weights()
-
     @classmethod
-    def from_pretrained(cls, pretrained_weights_fp, config, vocabulary_config, optimization_config):
-        model = cls(config, vocabulary_config, optimization_config)
+    def from_pretrained(cls, pretrained_weights_fp, config, vocabulary_config, optimization_config, oov_index):
+        model = cls(config, vocabulary_config, optimization_config, oov_index)
         # Load pretrained weights here
         return model
 
+    @property
+    def current_epoch(self):
+        return self._current_epoch
+
+    @current_epoch.setter
+    def current_epoch(self, value):
+        self._current_epoch = value
+        if hasattr(self, 'encoder') and hasattr(self.encoder, 'current_epoch'):
+            self.encoder.current_epoch = value
+            
+    def on_train_epoch_start(self):
+        self.current_epoch += 1  # Increment the epoch counter
+        if hasattr(self, 'encoder') and hasattr(self.encoder, 'current_epoch'):
+            self.encoder.current_epoch = self.current_epoch
+            
     def forward(self, batch: dict, labels=None):
         device = self.logit_layer.weight.device
         
         # Process dynamic data
         dynamic_indices = batch['dynamic_indices'].to(device)
-        dynamic_values = batch['dynamic_values'].to(device) if 'dynamic_values' in batch else None
+        dynamic_values = batch.get('dynamic_values')
+        if dynamic_values is not None:
+            dynamic_values = dynamic_values.to(device)
         
         # Validate vocab size
         max_index = dynamic_indices.max().item()
@@ -236,8 +224,15 @@ class ESTForStreamClassification(StructuredTransformerPreTrainedModel):
         ], dim=1)
         
         # Encode dynamic data
-        pytorch_batch = PytorchBatch(dynamic_indices=dynamic_indices, dynamic_values=dynamic_values)
-        encoded = self.encoder(pytorch_batch).last_hidden_state
+        pytorch_batch = {
+            'dynamic_indices': dynamic_indices,
+            'dynamic_values': dynamic_values
+        }
+        
+        if self.training and self.encoder.gradient_checkpointing:
+            encoded = torch.utils.checkpoint.checkpoint(self.encoder, pytorch_batch).last_hidden_state
+        else:
+            encoded = self.encoder(pytorch_batch).last_hidden_state
         
         # Extract relevant encoded information
         event_encoded = encoded[:, :, -1, :] if self._uses_dep_graph else encoded

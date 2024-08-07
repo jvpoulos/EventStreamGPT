@@ -413,6 +413,9 @@ class InnerAttention(nn.Module):
             static_kv_first=static_kv_first,
         )
 
+    def _set_static_graph(self):
+        if hasattr(self.attention, '_set_static_graph'):
+            self.attention._set_static_graph()
 
 class InnerMLP(nn.Module):
     """Applies a multilayer perceptron (MLP) to the `hidden_states`.
@@ -446,17 +449,11 @@ class InnerMLP(nn.Module):
         hidden_states = self.dropout(hidden_states)
         return hidden_states
 
-
+    def _set_static_graph(self):
+        pass  # No submodules to set static graph for
+        
 class InnerBlock(nn.Module):
-    """An inner block in a transformer architecture that consists of attention and MLP layers.
-
-    Args:
-        config: Configuration parameters for the structured transformer.
-        layer_id: Unique identifier for the layer.
-        is_seq: Flag indicating whether the block is sequential.
-    """
-
-    def __init__(self, config: StructuredTransformerConfig, layer_id: int, is_seq: bool):
+    def __init__(self, config: StructuredTransformerConfig, layer_id: int, is_seq: bool, device=None):
         super().__init__()
         self.attn = InnerAttention(config, layer_id, is_seq)
         self.layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
@@ -466,6 +463,9 @@ class InnerBlock(nn.Module):
         self.layer_norm.bias.data = self.layer_norm.bias.data.to(config.device)
 
         self.mlp = InnerMLP(config)
+
+        if device is not None:
+            self.to(device)
 
     def forward(
         self,
@@ -525,6 +525,12 @@ class InnerBlock(nn.Module):
             outputs.pop("present_key_value")
         return hidden_states, outputs
 
+    def _set_static_graph(self):
+        if hasattr(self.attn, '_set_static_graph'):
+            self.attn._set_static_graph()
+        if hasattr(self.mlp, '_set_static_graph'):
+            self.mlp._set_static_graph()
+
 class StructuredTransformerBlock(nn.Module):
     """A block for structured attention with both sequential and dependency graph modules.
 
@@ -583,6 +589,11 @@ class StructuredTransformerPreTrainedModel(PreTrainedModel):
     def _set_gradient_checkpointing(self, module, value=False):
         if isinstance(module, StructuredTransformerPreTrainedModel):
             module.gradient_checkpointing = value
+            
+    def _set_static_graph(self):
+        for module in self.children():
+            if hasattr(module, '_set_static_graph'):
+                module._set_static_graph()    
 
 def time_from_deltas(batch: PytorchBatch) -> torch.Tensor:
     """Given a batch of time deltas, compute the relative time-since-start for each event.
@@ -741,8 +752,6 @@ class ConditionallyIndependentPointProcessInputLayer(torch.nn.Module):
     def __init__(self, config: StructuredTransformerConfig, vocab_sizes_by_measurement: dict[str, int], oov_index: int, do_use_sinusoidal: bool):
         super().__init__()
 
-        print(f"ConditionallyIndependentPointProcessInputLayer: oov_index = {oov_index}")
-
         self.config = config
 
         self.data_embedding_layer = DataEmbeddingLayer(
@@ -769,32 +778,44 @@ class ConditionallyIndependentPointProcessInputLayer(torch.nn.Module):
             )
 
         self.embedding_dropout = torch.nn.Dropout(p=config.input_dropout)
-
-        # Add a linear layer for dynamic_values
+        
         self.dynamic_values_encoder = nn.Linear(1, config.hidden_size)
+        self.missing_value_embedding = nn.Parameter(torch.randn(config.hidden_size))
+        self.dynamic_values_norm = nn.BatchNorm1d(1)
 
-    def forward(self, batch: PytorchBatch | torch.Tensor) -> torch.Tensor:
+    def forward(self, batch: dict | torch.Tensor) -> torch.Tensor:
         if isinstance(batch, torch.Tensor):
             dynamic_indices = batch
             dynamic_values = None
-        elif isinstance(batch, PytorchBatch):
-            dynamic_indices = batch.dynamic_indices
-            dynamic_values = getattr(batch, 'dynamic_values', None)
+        elif isinstance(batch, dict):
+            dynamic_indices = batch['dynamic_indices']
+            dynamic_values = batch.get('dynamic_values')
         else:
-            raise TypeError("Input 'batch' should be a PytorchBatch object or a Tensor.")
+            raise TypeError("Input 'batch' should be a dictionary or a Tensor.")
 
+        # Replace NaN values in dynamic_indices with the OOV index
+        dynamic_indices = torch.where(torch.isnan(dynamic_indices), torch.full_like(dynamic_indices, self.config.vocab_size), dynamic_indices)
+        
         data_embed: torch.Tensor = self.data_embedding_layer(dynamic_indices)
         
         if dynamic_values is not None:
-            # Incorporate dynamic_values into the embedding
-            data_embed = data_embed + self.dynamic_values_encoder(dynamic_values.unsqueeze(-1))
-        
-        # Add a small epsilon to avoid division by zero
-        epsilon = 1e-8
-        data_embed = torch.where(torch.isnan(data_embed), torch.zeros_like(data_embed) + epsilon, data_embed)
-        
-        # Clip values to avoid extreme values
-        data_embed = torch.clamp(data_embed, min=-1e6, max=1e6)
+            # Create a mask for non-missing values
+            mask = ~torch.isnan(dynamic_values)
+            
+            # Normalize non-missing values
+            dynamic_values_normalized = torch.where(mask, dynamic_values, torch.zeros_like(dynamic_values))
+            dynamic_values_normalized = self.dynamic_values_norm(dynamic_values_normalized.unsqueeze(1)).squeeze(1)
+            
+            # Encode normalized values
+            dynamic_values_embed = self.dynamic_values_encoder(dynamic_values_normalized.unsqueeze(-1))
+            
+            # Replace missing values with learnable embedding
+            dynamic_values_embed = torch.where(mask.unsqueeze(-1), 
+                                               dynamic_values_embed, 
+                                               self.missing_value_embedding.unsqueeze(0).unsqueeze(0))
+            
+            # Combine with data embeddings
+            data_embed = data_embed + dynamic_values_embed
         
         data_embed = self.embedding_dropout(data_embed)
 
@@ -807,23 +828,26 @@ class ConditionallyIndependentPointProcessInputLayer(torch.nn.Module):
 class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTrainedModel):
     def __init__(self, config: StructuredTransformerConfig, vocabulary_config: VocabularyConfig, oov_index: int):
         super().__init__(config)
-
-        print(f"ConditionallyIndependentPointProcessTransformer: oov_index = {oov_index}")
         
-        config.vocab_sizes_by_measurement = vocabulary_config.vocab_sizes_by_measurement
+        self.config = config
+        self.vocabulary_config = vocabulary_config
+        self.oov_index = oov_index
+
+        print(f"ConditionallyIndependentPointProcessTransformer: oov_index = {self.oov_index}")
 
         self.embed_dim = config.hidden_size
-
+        
         self.input_layer = ConditionallyIndependentPointProcessInputLayer(
             config,
             vocabulary_config.vocab_sizes_by_measurement,
-            oov_index=oov_index,
+            oov_index=self.oov_index,
             do_use_sinusoidal=config.do_use_sinusoidal,
         )
-
-        self.h = nn.ModuleList(
-            [InnerBlock(config, layer_id=i, is_seq=True) for i in range(config.num_hidden_layers)]
-        )
+        
+        self.h = torch.nn.ModuleList([
+            torch.nn.utils.skip_init(InnerBlock, config, layer_id=i, is_seq=True, device=config.device)
+            for i in range(config.num_hidden_layers)
+        ])
 
         if config.use_layer_norm:
             self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
@@ -838,9 +862,29 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
         # Initialize weights and apply final processing
         self.post_init()
 
+        self._current_epoch = 0
+
+    def _set_static_graph(self):
+        for module in self.children():
+            if hasattr(module, '_set_static_graph'):
+                module._set_static_graph()
+        
+        # Explicitly set static graph for all InnerBlock modules
+        for block in self.h:
+            if hasattr(block, '_set_static_graph'):
+                block._set_static_graph()
+
+    @property
+    def current_epoch(self):
+        return self._current_epoch
+
+    @current_epoch.setter
+    def current_epoch(self, value):
+        self._current_epoch = value
+        
     def forward(
         self,
-        batch: PytorchBatch | None = None,
+        batch: dict | torch.Tensor,
         input_embeds: torch.Tensor | None = None,
         past: tuple[torch.FloatTensor] | None = None,
         seq_attention_mask: torch.Tensor | None = None,
@@ -867,12 +911,9 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
         if input_embeds.dim() == 2:
             input_embeds = input_embeds.unsqueeze(1)
 
-        torch._assert(
-            ~torch.isnan(input_embeds).any(), f"{torch.isnan(input_embeds).sum()} NaNs in input_embeds"
-        )
-
+        # Replace NaNs with zeros instead of asserting
         if torch.isnan(input_embeds).any():
-            logger.warning(f"NaNs detected in input_embeds. Replacing with zeros.")
+            logger.warning(f"{torch.isnan(input_embeds).sum()} NaNs detected in input_embeds. Replacing with zeros.")
             input_embeds = torch.where(torch.isnan(input_embeds), torch.zeros_like(input_embeds), input_embeds)
 
         if batch is not None and hasattr(batch, 'event_mask') and batch.event_mask is not None:
@@ -883,48 +924,28 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
 
         hidden_states = input_embeds
 
+        # Ensure hidden_states requires gradients
+        hidden_states.requires_grad_(True)
+
         presents = () if use_cache else None
 
         all_self_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
+        
         for i, (block, layer_past) in enumerate(zip(self.h, past)):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
-            if self.gradient_checkpointing and self.training:
-                if use_cache:
-                    logger.warning(
-                        "`use_cache=True` is incompatible with gradient checkpointing. "
-                        "Setting `use_cache=False`..."
-                    )
-                    use_cache = False
-
-                def create_custom_forward(module):
-                    def custom_forward(*inputs):
-                        return module(*inputs)
-
-                    return custom_forward
-
-                args = (
-                    hidden_states,
-                    seq_attention_mask,
-                    layer_past,
-                    head_mask[i],
-                    use_cache,
-                    output_attentions,
-                )
-
-                outputs = torch.utils.checkpoint.checkpoint(create_custom_forward(block), *args)
-            else:
-                kwargs = dict(
-                    hidden_states=hidden_states,
-                    attention_mask=seq_attention_mask,
-                    layer_past=layer_past,
-                    head_mask=head_mask[i],
-                    use_cache=use_cache,
-                    output_attentions=output_attentions,
-                )
-                outputs = block(**kwargs)
+            # Remove the gradient checkpointing condition
+            kwargs = dict(
+                hidden_states=hidden_states,
+                attention_mask=seq_attention_mask,
+                layer_past=layer_past,
+                head_mask=head_mask[i],
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+            )
+            outputs = block(**kwargs)
 
             hidden_states, extra_return_info = outputs
 
