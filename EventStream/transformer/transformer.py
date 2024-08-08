@@ -585,10 +585,6 @@ class StructuredTransformerPreTrainedModel(PreTrainedModel):
 
     def __init__(self, *inputs, **kwargs):
         super().__init__(*inputs, **kwargs)
-
-    def _set_gradient_checkpointing(self, module, value=False):
-        if isinstance(module, StructuredTransformerPreTrainedModel):
-            module.gradient_checkpointing = value
             
     def _set_static_graph(self):
         for module in self.children():
@@ -802,29 +798,27 @@ class ConditionallyIndependentPointProcessInputLayer(torch.nn.Module):
             # Create a mask for non-missing values
             mask = ~torch.isnan(dynamic_values)
             
-            # Normalize non-missing values
-            dynamic_values_normalized = torch.where(mask, dynamic_values, torch.zeros_like(dynamic_values))
-            dynamic_values_normalized = self.dynamic_values_norm(dynamic_values_normalized.unsqueeze(1)).squeeze(1)
-            
-            # Encode normalized values
-            dynamic_values_embed = self.dynamic_values_encoder(dynamic_values_normalized.unsqueeze(-1))
-            
-            # Replace missing values with learnable embedding
-            dynamic_values_embed = torch.where(mask.unsqueeze(-1), 
-                                               dynamic_values_embed, 
-                                               self.missing_value_embedding.unsqueeze(0).unsqueeze(0))
+            # Process only non-missing values
+            valid_values = dynamic_values[mask]
+            if valid_values.numel() > 0:
+                valid_values_normalized = self.dynamic_values_norm(valid_values.unsqueeze(1)).squeeze(1)
+                valid_values_embed = self.dynamic_values_encoder(valid_values_normalized.unsqueeze(-1))
+                
+                # Use scatter to place the encoded values back
+                dynamic_values_embed = self.missing_value_embedding.expand(*dynamic_values.shape, self.config.hidden_size)
+                dynamic_values_embed = dynamic_values_embed.to(data_embed.dtype)  # Ensure same dtype as data_embed
+                dynamic_values_embed[mask] = valid_values_embed.squeeze(1).to(data_embed.dtype)  # Ensure same dtype
+            else:
+                dynamic_values_embed = self.missing_value_embedding.expand(*dynamic_values.shape, self.config.hidden_size)
+                dynamic_values_embed = dynamic_values_embed.to(data_embed.dtype)  # Ensure same dtype as data_embed
             
             # Combine with data embeddings
             data_embed = data_embed + dynamic_values_embed
         
         data_embed = self.embedding_dropout(data_embed)
 
-        # Ensure output is 2D
-        if data_embed.dim() == 3:
-            data_embed = data_embed.squeeze(1)
-
         return data_embed
-        
+            
 class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTrainedModel):
     def __init__(self, config: StructuredTransformerConfig, vocabulary_config: VocabularyConfig, oov_index: int):
         super().__init__(config)
@@ -854,7 +848,7 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
         if config.use_batch_norm:
             self.bn_f = nn.BatchNorm1d(self.embed_dim)
 
-        self.gradient_checkpointing = False
+        self.gradient_checkpointing = config.use_gradient_checkpointing
 
         self.attention_dir = os.path.join(config.save_dir, "attention_weights")
         os.makedirs(self.attention_dir, exist_ok=True)
@@ -911,10 +905,12 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
         if input_embeds.dim() == 2:
             input_embeds = input_embeds.unsqueeze(1)
 
-        # Replace NaNs with zeros instead of asserting
-        if torch.isnan(input_embeds).any():
-            logger.warning(f"{torch.isnan(input_embeds).sum()} NaNs detected in input_embeds. Replacing with zeros.")
-            input_embeds = torch.where(torch.isnan(input_embeds), torch.zeros_like(input_embeds), input_embeds)
+        # Handle NaNs more efficiently
+        nan_mask = torch.isnan(input_embeds)
+        if nan_mask.any():
+            logger.warning(f"{nan_mask.sum()} NaNs detected in input_embeds. Replacing with zeros.")
+            input_embeds = input_embeds.clone()
+            input_embeds[nan_mask] = 0.0
 
         if batch is not None and hasattr(batch, 'event_mask') and batch.event_mask is not None:
             seq_attention_mask = expand_mask(batch.event_mask, input_embeds.dtype)
@@ -924,28 +920,40 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
 
         hidden_states = input_embeds
 
-        # Ensure hidden_states requires gradients
-        hidden_states.requires_grad_(True)
-
         presents = () if use_cache else None
-
         all_self_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
-        
+
         for i, (block, layer_past) in enumerate(zip(self.h, past)):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
-            # Remove the gradient checkpointing condition
-            kwargs = dict(
-                hidden_states=hidden_states,
-                attention_mask=seq_attention_mask,
-                layer_past=layer_past,
-                head_mask=head_mask[i],
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-            )
-            outputs = block(**kwargs)
+            if self.gradient_checkpointing and self.training:
+                def create_custom_forward(module):
+                    def custom_forward(*inputs):
+                        return module(*inputs)
+                    return custom_forward
+
+                outputs = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(block),
+                    hidden_states,
+                    seq_attention_mask,
+                    layer_past,
+                    head_mask[i],
+                    use_cache,
+                    output_attentions,
+                    use_reentrant=False
+                )
+            else:
+                kwargs = dict(
+                    hidden_states=hidden_states,
+                    attention_mask=seq_attention_mask,
+                    layer_past=layer_past,
+                    head_mask=head_mask[i],
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                )
+                outputs = block(**kwargs)
 
             hidden_states, extra_return_info = outputs
 
@@ -1256,7 +1264,7 @@ class NestedAttentionPointProcessTransformer(StructuredTransformerPreTrainedMode
                     ),
                 )
 
-                outputs = torch.utils.checkpoint.checkpoint(create_custom_forward(block), *args)
+                outputs = torch.utils.checkpoint.checkpoint(create_custom_forward(block), *args, use_reentrant=False)
             else:
                 kwargs = dict(
                     hidden_states=hidden_states,

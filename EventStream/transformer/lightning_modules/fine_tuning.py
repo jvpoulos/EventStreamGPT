@@ -63,41 +63,6 @@ from dataclasses import dataclass, field
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
-
-def get_config_value(config, key, default=None):
-    if isinstance(config, dict):
-        return config.get(key, default)
-    return getattr(config, key, default)
-
-class TimeoutDataLoader(DataLoader):
-    def __init__(self, *args, **kwargs):
-        self.timeout = kwargs.pop('timeout', 600)  # Default timeout of 600 seconds (10 minutes)
-        super().__init__(*args, **kwargs)
-
-    def __iter__(self):
-        return TimeoutDataLoaderIter(super().__iter__(), self.timeout)
-
-class TimeoutDataLoaderIter:
-    def __init__(self, iterator, timeout):
-        self.iterator = iterator
-        self.timeout = timeout
-        self.start_time = time.time()
-
-    def __next__(self):
-        if self.timeout <= 0:  # If timeout is 0 or negative, don't apply timeout
-            return next(self.iterator)
-        
-        elapsed_time = time.time() - self.start_time
-        if elapsed_time > self.timeout:
-            raise TimeoutError(f"DataLoader timed out after {elapsed_time:.2f} seconds")
-        
-        try:
-            return next(self.iterator)
-        except StopIteration:
-            raise
-        except Exception as e:
-            raise TimeoutError(f"DataLoader encountered an error after {elapsed_time:.2f} seconds: {str(e)}")
-
 class ESTForStreamClassificationLM(L.LightningModule):
     def __init__(
         self,
@@ -148,6 +113,8 @@ class ESTForStreamClassificationLM(L.LightningModule):
         self.grad_norm_after = None
 
         self.automatic_optimization = True
+
+        self.scaler = GradScaler()
 
         # Load the vocabulary_config from a file
         vocabulary_config_path = "data/vocabulary_config.json"
@@ -374,8 +341,10 @@ class ESTForStreamClassificationLM(L.LightningModule):
         self._current_epoch = value
 
     def training_step(self, batch, batch_idx):
-        outputs = self.model(batch, labels=batch['labels'])
-        loss = outputs.loss
+        # Forward pass with autocast for mixed precision
+        with torch.cuda.amp.autocast():
+            outputs = self.model(batch, labels=batch['labels'])
+            loss = outputs.loss
 
         # Log metrics
         self.log_metrics('train', outputs)
@@ -407,7 +376,7 @@ class ESTForStreamClassificationLM(L.LightningModule):
         # Log additional debugging information
         if hasattr(outputs, 'debug_info') and outputs.debug_info:
             for key, value in outputs.debug_info.items():
-                self.log(f'test_debug_{key}', value, on_step=False, on_epoch=True)
+                self.log(f'test_debug_{key}', value, on_step=False, on_epoch=True, sync_dist=True)
 
         return loss
 
@@ -442,7 +411,7 @@ class ESTForStreamClassificationLM(L.LightningModule):
         for key, values in metrics.items():
             if values:  # Check if the list is not empty
                 avg_value = sum(values) / len(values)
-                self.log(f'{prefix}_{key}_epoch', avg_value, on_step=False, on_epoch=True, logger=True)
+                self.log(f'{prefix}_{key}_epoch', avg_value, on_step=False, on_epoch=True, logger=True, sync_dist=True)
         
         # Clear accumulated metrics
         self.__dict__[f'{prefix}_metrics'].clear()
@@ -459,7 +428,7 @@ class ESTForStreamClassificationLM(L.LightningModule):
     def log_accumulated_metrics(self, prefix):
         for name, values in self.metric_accumulator.items():
             if name.startswith(prefix):
-                self.log(f'{name}_epoch', sum(values) / len(values), on_epoch=True, prog_bar=True, logger=True)
+                self.log(f'{name}_epoch', sum(values) / len(values), on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
         self.metric_accumulator = defaultdict(list)
 
     def log_gradient_statistics(self):
@@ -468,9 +437,9 @@ class ESTForStreamClassificationLM(L.LightningModule):
                 mean_norm = sum(norms) / len(norms)
                 max_norm = max(norms)
                 min_norm = min(norms)
-                self.log(f'grad_norm_{stage}_mean', mean_norm, on_epoch=True, logger=True)
-                self.log(f'grad_norm_{stage}_max', max_norm, on_epoch=True, logger=True)
-                self.log(f'grad_norm_{stage}_min', min_norm, on_epoch=True, logger=True)
+                self.log(f'grad_norm_{stage}_mean', mean_norm, on_epoch=True, logger=True, sync_dist=True)
+                self.log(f'grad_norm_{stage}_max', max_norm, on_epoch=True, logger=True, sync_dist=True)
+                self.log(f'grad_norm_{stage}_min', min_norm, on_epoch=True, logger=True, sync_dist=True)
 
     def log_gradient_instability(self):
         # Sort gradient changes and get top outliers
@@ -499,6 +468,13 @@ class ESTForStreamClassificationLM(L.LightningModule):
             raise FileNotFoundError("Code mapping file not found. Please run preprocessing first.")
 
     def forward(self, batch, **kwargs):
+        if isinstance(batch, dict):
+            for key, value in batch.items():
+                if torch.isnan(value).any():
+                    print(f"NaNs detected in batch['{key}']")
+        elif torch.isnan(batch).any():
+            print("NaNs detected in batch tensor")
+
         if not isinstance(batch, dict):
             raise TypeError("Input 'batch' should be a dictionary.")
         
@@ -523,32 +499,22 @@ class ESTForStreamClassificationLM(L.LightningModule):
         self._log_epoch_metrics('test')
 
     def configure_optimizers(self):
-        # Group parameters by weight decay
-        no_decay = ["bias", "LayerNorm.weight"]
-        optimizer_grouped_parameters = [
-            {
-                "params": [p for n, p in self.named_parameters() if not any(nd in n for nd in no_decay)],
-                "weight_decay": self.weight_decay,
-            },
-            {
-                "params": [p for n, p in self.named_parameters() if any(nd in n for nd in no_decay)],
-                "weight_decay": 0.0,
-            },
-        ]
-
         # Initialize optimizer
         optimizer = torch.optim.AdamW(
-            self.parameters(),  # Use self.parameters() instead of optimizer_grouped_parameters
+            self.parameters(),
             lr=self.learning_rate,
             betas=(0.9, 0.999),
             eps=1e-8,
         )
 
-        if self.use_grad_value_clipping:
-            for param_group in optimizer.param_groups:
-                param_group['clip_value'] = self.clip_grad_value
+        # Initialize GradScaler for mixed precision training
+        self.scaler = torch.cuda.amp.GradScaler()
 
-        # Initialize scheduler
+        # Gradient checkpointing
+        if self.config.use_gradient_checkpointing:
+            self.gradient_checkpointing_enable()
+
+        # Learning rate scheduler
         if self.use_lr_scheduler:
             if self.lr_scheduler_type == "cosine":
                 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -588,12 +554,6 @@ class ESTForStreamClassificationLM(L.LightningModule):
                 "frequency": 1,
                 "monitor": "val_loss" if self.lr_scheduler_type == "reduce_on_plateau" else None,
             }
-
-            # Enable gradient checkpointing and set static graph
-            if hasattr(self.model, 'encoder'):
-                self.model.encoder.gradient_checkpointing = True
-                self._set_static_graph()
-
             return {"optimizer": optimizer, "lr_scheduler": scheduler_config}
         else:
             return optimizer
@@ -670,7 +630,6 @@ class FinetuneConfig:
             'validation_batch_size': 256,
             'num_dataloader_workers': 4,
             'max_epochs': 100,
-            'gradient_accumulation': 2,
             'patience': 10,
         }
     )
@@ -814,49 +773,32 @@ class FinetuneConfig:
             self.wandb_logger_kwargs["project"] = reloaded_pretrain_config.wandb_logger_kwargs.project
 
 class CollateFunction:
-    def __init__(self, vocab_size):
+    def __init__(self, vocab_size, oov_index):
         self.vocab_size = vocab_size
+        self.oov_index = oov_index
         self.logger = logging.getLogger(__name__)
 
     def __call__(self, batch):
-        valid_items = []
-        for i, item in enumerate(batch):
-            if item is None:
-                self.logger.warning(f"Item {i} in batch is None, skipping")
-                continue
-            
-            if 'dynamic_indices' not in item or item['dynamic_indices'] is None:
-                self.logger.warning(f"Item {i} has missing or None dynamic_indices, using default")
-                item['dynamic_indices'] = torch.tensor([0], dtype=torch.long)
-            
-            if 'dynamic_values' not in item or item['dynamic_values'] is None:
-                self.logger.warning(f"Item {i} has missing or None dynamic_values, using default")
-                item['dynamic_values'] = torch.tensor([0.0], dtype=torch.float)
-            
-            valid_items.append(item)
-
+        valid_items = [item for item in batch if item is not None]
+        
         if not valid_items:
             self.logger.error("No valid items found in batch")
             raise ValueError("No valid items in batch")
 
         max_seq_len = max(item['dynamic_indices'].size(0) for item in valid_items)
-        dynamic_indices = torch.zeros((len(valid_items), max_seq_len), dtype=torch.long)
-        dynamic_values = torch.zeros((len(valid_items), max_seq_len), dtype=torch.float32)
-        dynamic_values_mask = torch.zeros((len(valid_items), max_seq_len), dtype=torch.bool)
-
+        
+        dynamic_indices = torch.full((len(valid_items), max_seq_len), self.oov_index, dtype=torch.long)
+        dynamic_values = torch.full((len(valid_items), max_seq_len), float('nan'), dtype=torch.float32)
+        
         for i, item in enumerate(valid_items):
             seq_len = item['dynamic_indices'].size(0)
             dynamic_indices[i, :seq_len] = item['dynamic_indices']
             if 'dynamic_values' in item and item['dynamic_values'] is not None:
                 dynamic_values[i, :seq_len] = item['dynamic_values']
-                dynamic_values_mask[i, :seq_len] = True
-            else:
-                dynamic_values_mask[i, :seq_len] = False
 
         collated_batch = {
             'dynamic_indices': dynamic_indices,
             'dynamic_values': dynamic_values,
-            'dynamic_values_mask': dynamic_values_mask,
             'labels': torch.stack([self.safe_tensor_conversion(item.get('labels', 0), torch.float32) for item in valid_items]).squeeze(),
             'InitialA1c': torch.tensor([self.safe_float_conversion(item.get('InitialA1c', 0.0)) for item in valid_items], dtype=torch.float32),
             'Female': torch.tensor([self.safe_int_conversion(item.get('Female', 0)) for item in valid_items], dtype=torch.long),
@@ -989,7 +931,7 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_c
             logger.info(f"Item {i}: {item}")
 
         logger.info("Creating data loaders")
-        collate_fn = CollateFunction(config.vocab_size)
+        collate_fn = CollateFunction(config.vocab_size, oov_index)
         
         def create_dataloader(dataset, batch_size, shuffle):
             return DataLoader(
@@ -1043,7 +985,7 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_c
             gradient_clip_val=config.max_grad_norm,
             gradient_clip_algorithm="norm",
             enable_progress_bar=True,
-            deterministic=True,
+            deterministic=False,
         )
 
         logger.info("Starting training")
