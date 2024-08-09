@@ -914,6 +914,9 @@ class Dataset(DatasetBase):
                 print(f"metadata_as_polars columns: {metadata_as_polars.columns}")
                 raise
 
+            # Fill null values with 0
+            source_df = source_df.with_columns(pl.col(val_col).fill_null(0))
+
             return source_df, key_col, val_col, f"{measure}_is_inlier", metadata_as_polars
 
         except Exception as e:
@@ -1617,22 +1620,6 @@ class Dataset(DatasetBase):
 
             cols_to_drop_at_end = [col for col in config.measurement_metadata if col != measure and col in source_df.columns]
 
-            bound_cols = {
-                col: pl.col(col)
-                for col in [
-                    "drop_upper_bound",
-                    "drop_upper_bound_inclusive",
-                    "drop_lower_bound",
-                    "drop_lower_bound_inclusive",
-                    "censor_lower_bound",
-                    "censor_upper_bound",
-                ]
-                if col in source_df.columns
-            }
-
-            if bound_cols:
-                vals_col = self.drop_or_censor(vals_col, **bound_cols)
-
             if 'value_type' in source_df.columns:
                 value_type = pl.col("value_type")
             else:
@@ -1687,6 +1674,11 @@ class Dataset(DatasetBase):
                     f"{vals_col_name}_transformed": vals_col_name
                 })
             
+            # Replace any remaining null values with 0
+            result_df = result_df.with_columns([
+                pl.col(col).fill_null(0) for col in result_df.columns if pl.col(col).dtype in [pl.Float32, pl.Float64]
+            ])
+
             return result_df
 
         except Exception as e:

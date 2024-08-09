@@ -13,6 +13,8 @@ import os
 import torch
 import torch.utils.checkpoint
 from torch import nn
+import torch.nn.functional as F
+
 from transformers.activations import ACT2FN
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
@@ -804,18 +806,39 @@ class ConditionallyIndependentPointProcessInputLayer(torch.nn.Module):
                 valid_values_normalized = self.dynamic_values_norm(valid_values.unsqueeze(1)).squeeze(1)
                 valid_values_embed = self.dynamic_values_encoder(valid_values_normalized.unsqueeze(-1))
                 
+                # Ensure consistent dtype
+                valid_values_embed = valid_values_embed.to(dtype=data_embed.dtype)
+                
                 # Use scatter to place the encoded values back
                 dynamic_values_embed = self.missing_value_embedding.expand(*dynamic_values.shape, self.config.hidden_size)
-                dynamic_values_embed = dynamic_values_embed.to(data_embed.dtype)  # Ensure same dtype as data_embed
-                dynamic_values_embed[mask] = valid_values_embed.squeeze(1).to(data_embed.dtype)  # Ensure same dtype
+                dynamic_values_embed = dynamic_values_embed.to(dtype=data_embed.dtype)
+                
+                # Use scatter_add_ instead of direct assignment
+                dynamic_values_embed = dynamic_values_embed.clone()
+                dynamic_values_embed.masked_scatter_(mask.unsqueeze(-1), valid_values_embed.squeeze(1))
             else:
                 dynamic_values_embed = self.missing_value_embedding.expand(*dynamic_values.shape, self.config.hidden_size)
-                dynamic_values_embed = dynamic_values_embed.to(data_embed.dtype)  # Ensure same dtype as data_embed
+                dynamic_values_embed = dynamic_values_embed.to(dtype=data_embed.dtype)
             
             # Combine with data embeddings
             data_embed = data_embed + dynamic_values_embed
         
         data_embed = self.embedding_dropout(data_embed)
+
+        # Check for NaNs after each major operation
+        def check_nan(tensor, name):
+            if torch.isnan(tensor).any():
+                print(f"NaNs detected in {name}: {torch.isnan(tensor).sum().item()}")
+
+        check_nan(data_embed, "data_embed")
+        
+        if dynamic_values is not None:
+            check_nan(dynamic_values, "dynamic_values")
+            check_nan(valid_values_normalized, "valid_values_normalized")
+            check_nan(valid_values_embed, "valid_values_embed")
+            check_nan(dynamic_values_embed, "dynamic_values_embed")
+        
+        check_nan(data_embed, "final data_embed")
 
         return data_embed
             
@@ -843,9 +866,13 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
             for i in range(config.num_hidden_layers)
         ])
 
-        if config.use_layer_norm:
+        # Use both LayerNorm and BatchNorm if both are set to True
+        if config.use_layer_norm and config.use_batch_norm:
             self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
-        if config.use_batch_norm:
+            self.bn_f = nn.BatchNorm1d(self.embed_dim)
+        elif config.use_layer_norm:
+            self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
+        elif config.use_batch_norm:
             self.bn_f = nn.BatchNorm1d(self.embed_dim)
 
         self.gradient_checkpointing = config.use_gradient_checkpointing
@@ -857,6 +884,13 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
         self.post_init()
 
         self._current_epoch = 0
+
+    def gradient_checkpointing_enable(self):
+        self.gradient_checkpointing = True
+        # Enable gradient checkpointing for all sub-modules if necessary
+        for module in self.children():
+            if hasattr(module, 'gradient_checkpointing_enable'):
+                module.gradient_checkpointing_enable()
 
     def _set_static_graph(self):
         for module in self.children():
@@ -970,7 +1004,14 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
             if output_attentions:
                 all_self_attentions = all_self_attentions + (extra_return_info["attn_weights"],)
 
-        hidden_states = self.ln_f(hidden_states)
+        # Apply LayerNorm and/or BatchNorm based on configuration
+        if hasattr(self, 'ln_f') and hasattr(self, 'bn_f'):
+            hidden_states = self.ln_f(hidden_states)
+            hidden_states = self.bn_f(hidden_states.transpose(1, 2)).transpose(1, 2)
+        elif hasattr(self, 'ln_f'):
+            hidden_states = self.ln_f(hidden_states)
+        elif hasattr(self, 'bn_f'):
+            hidden_states = self.bn_f(hidden_states.transpose(1, 2)).transpose(1, 2)
 
         # Reshape hidden states to match input_embeds
         hidden_states = hidden_states.view(*input_embeds.shape)
@@ -981,7 +1022,7 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
 
         if output_attentions:
             # Save attention weights
-            attention_path = os.path.join(self.config.save_dir, f"attention_weights_epoch_{self.current_epoch}.pt")
+            attention_path = os.path.join(self.attention_dir, f"attention_weights_epoch_{self._current_epoch}.pt")
             torch.save(all_self_attentions, attention_path)
 
         if not return_dict:

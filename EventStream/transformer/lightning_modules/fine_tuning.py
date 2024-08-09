@@ -117,7 +117,7 @@ class ESTForStreamClassificationLM(L.LightningModule):
         self.scaler = GradScaler()
 
         # Load the vocabulary_config from a file
-        vocabulary_config_path = "data/vocabulary_config.json"
+        vocabulary_config_path = "/home/jvp/diabetes_pred/data/labs/vocabulary_config.json"
         with open(vocabulary_config_path, "r") as f:
             vocabulary_config_dict = json.load(f)
         vocabulary_config = VocabularyConfig.from_dict(vocabulary_config_dict)
@@ -138,6 +138,10 @@ class ESTForStreamClassificationLM(L.LightningModule):
             self.model.gradient_checkpointing_enable()
             self._set_static_graph()
 
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                print(f"Parameter {name} does not require gradients")
+        
         # Ensure all parameters require gradients
         for param in self.model.parameters():
             param.requires_grad = True
@@ -341,20 +345,23 @@ class ESTForStreamClassificationLM(L.LightningModule):
         self._current_epoch = value
 
     def training_step(self, batch, batch_idx):
-        # Forward pass with autocast for mixed precision
         with torch.cuda.amp.autocast():
             outputs = self.model(batch, labels=batch['labels'])
             loss = outputs.loss
 
-        # Log metrics
         self.log_metrics('train', outputs)
         
         return loss
 
-    def test_step(self, batch, batch_idx):
-        if self.do_debug_mode:
-            logger.debug(f"Test step - Batch keys: {batch.keys() if batch is not None else 'None'}")
+    def validation_step(self, batch, batch_idx):
+        if not isinstance(batch, dict):
+            batch = {k: v for k, v in zip(self.model.config.input_keys, batch)}
         
+        outputs = self.model(batch, labels=batch['labels'])
+        self.log_metrics('val', outputs)
+        return outputs.loss
+
+    def test_step(self, batch, batch_idx):
         if batch is None:
             logger.warning("Received None batch in test_step")
             return None
@@ -362,21 +369,7 @@ class ESTForStreamClassificationLM(L.LightningModule):
         outputs = self.model(batch, labels=batch['labels'])
         loss = outputs.loss
 
-        if self.do_debug_mode:
-            # Add learning rate to debug info
-            if hasattr(outputs, 'debug_info') and outputs.debug_info is not None:
-                outputs.debug_info["learning_rate"] = self.trainer.optimizers[0].param_groups[0]['lr']
-            
-            logger.debug(f"Model outputs: {outputs}")
-            logger.debug(f"Loss: {loss}")
-
-        # Use the updated log_metrics function
         self.log_metrics('test', outputs)
-
-        # Log additional debugging information
-        if hasattr(outputs, 'debug_info') and outputs.debug_info:
-            for key, value in outputs.debug_info.items():
-                self.log(f'test_debug_{key}', value, on_step=False, on_epoch=True, sync_dist=True)
 
         return loss
 
@@ -388,15 +381,6 @@ class ESTForStreamClassificationLM(L.LightningModule):
                 total_norm += param_norm.item() ** 2
         total_norm = total_norm ** 0.5
         self.gradient_stats[stage].append(total_norm)
-
-    def validation_step(self, batch, batch_idx):
-        # Convert batch to dictionary if it's not already
-        if not isinstance(batch, dict):
-            batch = {k: v for k, v in zip(self.model.config.input_keys, batch)}
-        
-        outputs = self.model(batch, labels=batch['labels'])
-        self.log_metrics('val', outputs)
-        return outputs.loss
 
     def _accumulate_metrics(self, prefix, metrics):
         for key, value in metrics.items():
@@ -788,26 +772,31 @@ class CollateFunction:
         max_seq_len = max(item['dynamic_indices'].size(0) for item in valid_items)
         
         dynamic_indices = torch.full((len(valid_items), max_seq_len), self.oov_index, dtype=torch.long)
-        dynamic_values = torch.full((len(valid_items), max_seq_len), float('nan'), dtype=torch.float32)
+        dynamic_values = torch.zeros((len(valid_items), max_seq_len), dtype=torch.float32)
+        dynamic_values_mask = torch.zeros((len(valid_items), max_seq_len), dtype=torch.bool)
         
         for i, item in enumerate(valid_items):
             seq_len = item['dynamic_indices'].size(0)
             dynamic_indices[i, :seq_len] = item['dynamic_indices']
             if 'dynamic_values' in item and item['dynamic_values'] is not None:
-                dynamic_values[i, :seq_len] = item['dynamic_values']
+                values = item['dynamic_values'].float()
+                valid_mask = ~torch.isnan(values)
+                dynamic_values[i, :seq_len][valid_mask] = values[valid_mask]
+                dynamic_values_mask[i, :seq_len] = valid_mask
 
         collated_batch = {
-            'dynamic_indices': dynamic_indices,
-            'dynamic_values': dynamic_values,
-            'labels': torch.stack([self.safe_tensor_conversion(item.get('labels', 0), torch.float32) for item in valid_items]).squeeze(),
-            'InitialA1c': torch.tensor([self.safe_float_conversion(item.get('InitialA1c', 0.0)) for item in valid_items], dtype=torch.float32),
-            'Female': torch.tensor([self.safe_int_conversion(item.get('Female', 0)) for item in valid_items], dtype=torch.long),
-            'Married': torch.tensor([self.safe_int_conversion(item.get('Married', 0)) for item in valid_items], dtype=torch.long),
-            'GovIns': torch.tensor([self.safe_int_conversion(item.get('GovIns', 0)) for item in valid_items], dtype=torch.long),
-            'English': torch.tensor([self.safe_int_conversion(item.get('English', 0)) for item in valid_items], dtype=torch.long),
-            'AgeYears': torch.tensor([self.safe_float_conversion(item.get('AgeYears', 0.0)) for item in valid_items], dtype=torch.float32),
-            'SDI_score': torch.tensor([self.safe_float_conversion(item.get('SDI_score', 0.0)) for item in valid_items], dtype=torch.float32),
-            'Veteran': torch.tensor([self.safe_int_conversion(item.get('Veteran', 0)) for item in valid_items], dtype=torch.long),
+            'dynamic_indices': dynamic_indices.clone(),
+            'dynamic_values': dynamic_values.clone(),
+            'dynamic_values_mask': dynamic_values_mask.clone(),
+            'labels': torch.stack([self.safe_tensor_conversion(item.get('labels', 0), torch.float32) for item in valid_items]).squeeze().clone(),
+            'InitialA1c': torch.tensor([self.safe_float_conversion(item.get('InitialA1c', 0.0)) for item in valid_items], dtype=torch.float32).clone(),
+            'Female': torch.tensor([self.safe_int_conversion(item.get('Female', 0)) for item in valid_items], dtype=torch.long).clone(),
+            'Married': torch.tensor([self.safe_int_conversion(item.get('Married', 0)) for item in valid_items], dtype=torch.long).clone(),
+            'GovIns': torch.tensor([self.safe_int_conversion(item.get('GovIns', 0)) for item in valid_items], dtype=torch.long).clone(),
+            'English': torch.tensor([self.safe_int_conversion(item.get('English', 0)) for item in valid_items], dtype=torch.long).clone(),
+            'AgeYears': torch.tensor([self.safe_float_conversion(item.get('AgeYears', 0.0)) for item in valid_items], dtype=torch.float32).clone(),
+            'SDI_score': torch.tensor([self.safe_float_conversion(item.get('SDI_score', 0.0)) for item in valid_items], dtype=torch.float32).clone(),
+            'Veteran': torch.tensor([self.safe_int_conversion(item.get('Veteran', 0)) for item in valid_items], dtype=torch.long).clone(),
         }
 
         return collated_batch
@@ -871,7 +860,7 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_c
         cfg.update_data_config()
         
         # Load the vocabulary_config from the correct file
-        vocabulary_config_path = "data/labs/vocabulary_config.json" if cfg.use_labs else "data/vocabulary_config.json"
+        vocabulary_config_path = "/home/jvp/diabetes_pred/data/labs/vocabulary_config.json" if cfg.use_labs else "/home/jvp/diabetes_pred/data/vocabulary_config.json"
         with open(vocabulary_config_path, "r") as f:
             vocabulary_config_dict = json.load(f)
         vocabulary_config = VocabularyConfig.from_dict(vocabulary_config_dict)
@@ -968,6 +957,17 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_c
                 check_finite=True
             )
         ]
+
+        class NCCLErrorHandler(Callback):
+            def on_exception(self, trainer, pl_module, exception):
+                if isinstance(exception, RuntimeError) and "NCCL" in str(exception):
+                    print("NCCL error detected. Attempting to recover...")
+                    trainer.strategy.barrier()
+                    return True
+                return False
+
+        # Add this callback to your list of callbacks
+        callbacks.append(NCCLErrorHandler())
 
         logger.info("Setting up trainer")
         
