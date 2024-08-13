@@ -1808,9 +1808,7 @@ class Dataset(DatasetBase):
         return melted_df
 
     @TimeableMixin.TimeAs
-    def build_DL_cached_representation(
-        self, subject_ids: list[int] | None = None, do_sort_outputs: bool = False
-    ) -> DF_T:
+    def build_DL_cached_representation(self, subject_ids: list[int] | None = None, do_sort_outputs: bool = False) -> DF_T:
         print("Starting build_DL_cached_representation")
         subject_measures, event_measures, dynamic_measures = [], [], ["dynamic_indices"]
         for m in self.unified_measurements_vocab[1:]:
@@ -1834,44 +1832,29 @@ class Dataset(DatasetBase):
             events_df = self.events_df
             dynamic_measurements_df = self.dynamic_measurements_df
 
-        print(f"Subjects DataFrame shape: {subjects_df.shape}")
-        print(f"Events DataFrame shape: {events_df.shape}")
-        print(f"Dynamic Measurements DataFrame shape: {dynamic_measurements_df.shape}")
-
-        # Define static_data
         static_data = subjects_df.select(
             "subject_id",
             *[pl.col(m) for m in subject_measures],
-            "InitialA1c", "Female", "Married", "GovIns", 
+            "InitialA1c", "A1cGreaterThan7", "Female", "Married", "GovIns", 
             "English", "AgeYears", "SDI_score", "Veteran"
         )
 
-        # Ensure consistent data types for subject_id
         subject_id_dtype = pl.UInt32
         static_data = static_data.with_columns(pl.col("subject_id").cast(subject_id_dtype))
         events_df = events_df.with_columns(pl.col("subject_id").cast(subject_id_dtype))
         dynamic_measurements_df = dynamic_measurements_df.with_columns(pl.col("subject_id").cast(subject_id_dtype))
 
-        print("Checking dynamic_measurements_df for null or invalid values")
-        null_count = dynamic_measurements_df.filter(pl.col('dynamic_indices').is_null()).shape[0]
-        zero_count = dynamic_measurements_df.filter(pl.col('dynamic_indices') == 0).shape[0]
-        print(f"Null values in dynamic_indices: {null_count}")
-        print(f"Zero values in dynamic_indices: {zero_count}")
-        
-        print("Preparing dynamic data")
         dynamic_data = dynamic_measurements_df.select(
             "event_id",
             "dynamic_indices",
             "dynamic_values"
         )
 
-        dynamic_data = dynamic_data.with_columns(pl.col("dynamic_indices").cast(pl.UInt32))
-        dynamic_data = dynamic_data.with_columns(pl.col("dynamic_values").cast(pl.Float64))
+        dynamic_data = dynamic_data.with_columns([
+            pl.col("dynamic_indices").cast(pl.UInt32),
+            pl.col("dynamic_values").cast(pl.Float64)
+        ])
 
-        # Handle dynamic_values (keep as Float64)
-        dynamic_data = dynamic_data.with_columns(pl.col("dynamic_values").cast(pl.Float64))
-
-        print("Preparing event data")
         event_data = events_df.select(
             "subject_id",
             "timestamp",
@@ -1884,33 +1867,47 @@ class Dataset(DatasetBase):
             how="left"
         )
 
-        # Ensure all necessary columns are present in event_data
         for col in ["dynamic_indices", "dynamic_values"]:
             if col not in event_data.columns:
                 event_data = event_data.with_columns(pl.lit(None).alias(col))
 
-        # Cast columns to appropriate types
         event_data = event_data.with_columns([
             pl.col("dynamic_indices").cast(pl.UInt32),
-            pl.col("dynamic_values").cast(pl.Utf8)
+            pl.col("dynamic_values").cast(pl.Float64)
         ])
 
         if do_sort_outputs:
             event_data = event_data.sort("event_id")
 
-        print("Joining static and event data")
         out = static_data.join(event_data, on="subject_id", how="inner")
+
+        # Add start_time column
+        out = out.with_columns(pl.col("timestamp").min().over("subject_id").alias("start_time"))
+
+        # Add time column (minutes since start_time)
+        out = out.with_columns((pl.col("timestamp") - pl.col("start_time")).dt.total_minutes().alias("time"))
+
+        # Add static_indices
+        static_columns = ['InitialA1c', 'A1cGreaterThan7', 'Female', 'Married', 'GovIns', 'English', 'AgeYears', 'SDI_score', 'Veteran']
+        out = out.with_columns([
+            pl.struct(static_columns).apply(lambda x: [self.static_indices_vocab.get(f"{col}_{str(x[col])}", 0) for col in static_columns]).alias("static_indices")
+        ])
+
+        # Add static_measurement_indices and dynamic_measurement_indices
+        static_measurement_indices = pl.Series([self.unified_measurements_idxmap[m] for m in static_columns])
+        out = out.with_columns(pl.lit(static_measurement_indices).alias("static_measurement_indices"))
+
+        dynamic_measurement_indices = pl.Series([self.unified_measurements_idxmap[m] for m in dynamic_measures])
+        out = out.with_columns(pl.lit(dynamic_measurement_indices).alias("dynamic_measurement_indices"))
+
+        # Rename columns to match required format
+        out = out.rename({
+            "dynamic_indices": "dynamic_indices",
+            "dynamic_values": "dynamic_values"
+        })
 
         if do_sort_outputs:
             out = out.sort("subject_id")
-
-        print("Final check for null values")
-        for col in out.columns:
-            null_count = out.filter(pl.col(col).is_null()).shape[0]
-            print(f"Null values in {col}: {null_count}")
-
-        print(f"Final output shape: {out.shape}")
-        print(f"Sample of final output:\n{out.head()}")
 
         return out
 

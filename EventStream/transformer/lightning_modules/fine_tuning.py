@@ -180,6 +180,8 @@ class ESTForStreamClassificationLM(L.LightningModule):
         self.model._set_static_graph()
 
     def on_train_start(self):
+        train_labels = torch.cat([batch['labels'] for batch in self.train_dataloader()])
+        print(f"Label distribution in training set: {torch.bincount(train_labels.long())}")
         if self.config.use_gradient_checkpointing:
             self.model._set_static_graph()
 
@@ -189,11 +191,6 @@ class ESTForStreamClassificationLM(L.LightningModule):
 
     def gradient_checkpointing_enable(self):
         self.model.gradient_checkpointing_enable()
-
-    def on_train_start(self):
-        self.gradient_stats = {k: [] for k in self.gradient_stats}
-        if self.config.use_gradient_checkpointing:
-            self.model._set_static_graph()
     
     def get_gradient_norm(self):
         total_norm = 0.0
@@ -966,8 +963,21 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_c
                     return True
                 return False
 
-        # Add this callback to your list of callbacks
+        class NoPositiveSamplesCallback(Callback):
+            def __init__(self):
+                self.no_positive_count = 0
+
+            def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+                if batch['labels'].sum() == 0:
+                    self.no_positive_count += 1
+
+            def on_train_epoch_end(self, trainer, pl_module):
+                print(f"Batches with no positive samples: {self.no_positive_count}")
+                self.no_positive_count = 0        
+
+        # Add these callbacks
         callbacks.append(NCCLErrorHandler())
+        callbacks.append(NoPositiveSamplesCallback())
 
         logger.info("Setting up trainer")
         

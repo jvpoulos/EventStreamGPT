@@ -831,8 +831,6 @@ class DatasetBase(
         
         print("Preprocessing completed successfully.")
 
-    # ... (rest of the existing code) ...
-
     @TimeableMixin.TimeAs
     @abc.abstractmethod
     def _add_time_dependent_measurements(self):
@@ -981,6 +979,7 @@ class DatasetBase(
             ValueError: If transforming fails for a given measurement.
         """
         for measure, config in self.measurement_configs.items():
+            print(f"Processing measure: {measure}")
             source_attr, id_col, source_df = self._get_source_df(config, do_only_train=False)
 
             source_df = self._filter_col_inclusion(source_df, {measure: True})
@@ -1486,6 +1485,8 @@ class DatasetBase(
                     "timestamp",
                     "dynamic_indices",
                     "dynamic_values",
+                    "static_indices",
+                    "static_measurement_indices",
                     "InitialA1c", "Female", "Married", "GovIns", 
                     "English", "AgeYears", "SDI_score", "Veteran"
                 ]
@@ -1524,9 +1525,11 @@ class DatasetBase(
         return ["event_type"] + list(sorted(self.measurement_configs.keys()))
 
     @property
-    def unified_measurements_idxmap(self) -> dict[str, int]:
-        """Returns a unified idxmap of observed measurements."""
-        return {m: i + 1 for i, m in enumerate(self.unified_measurements_vocab)}
+    def unified_measurements_idxmap(self):
+        if hasattr(self, '_unified_measurements_idxmap'):
+            return self._unified_measurements_idxmap
+        else:
+            return self._initial_unified_measurements_idxmap
 
     @property
     def unified_vocabulary_offsets(self) -> dict[str, int]:

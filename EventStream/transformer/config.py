@@ -416,7 +416,7 @@ class StructuredTransformerConfig(PretrainedConfig):
         do_normalize_by_measurement_index:
             If True, the input embeddings are normalized such that each unique measurement index contributes
             equally to the embedding.
-        do_use_learnable_sinusoidal_ATE:
+        do_use_sinusoidal:
             If True, then the model will produce temporal position embeddings via a sinnusoidal position
             embedding such that the frequencies are learnable, rather than fixed and regular.
 
@@ -507,7 +507,6 @@ class StructuredTransformerConfig(PretrainedConfig):
         categorical_embedding_weight: float = 0.5,
         numerical_embedding_weight: float = 0.5,
         do_normalize_by_measurement_index: bool = False,
-        do_use_learnable_sinusoidal_ATE: bool = False,
         # Model configuration
         structured_event_processing_mode: StructuredEventProcessingMode = (
             StructuredEventProcessingMode.CONDITIONALLY_INDEPENDENT
@@ -546,7 +545,6 @@ class StructuredTransformerConfig(PretrainedConfig):
         self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.problem_type = problem_type
         self.do_use_sinusoidal = do_use_sinusoidal  # Initialize the attribute here
-        self.do_use_learnable_sinusoidal_ATE = do_use_learnable_sinusoidal_ATE
         # Resetting default values to appropriate types
         if vocab_sizes_by_measurement is None:
             vocab_sizes_by_measurement = {}
@@ -640,7 +638,6 @@ class StructuredTransformerConfig(PretrainedConfig):
         self.categorical_embedding_weight = categorical_embedding_weight
         self.numerical_embedding_weight = numerical_embedding_weight
         self.do_normalize_by_measurement_index = do_normalize_by_measurement_index
-        self.do_use_learnable_sinusoidal_ATE = do_use_learnable_sinusoidal_ATE
 
         self.use_batch_norm = use_batch_norm
         self.use_layer_norm = use_layer_norm
