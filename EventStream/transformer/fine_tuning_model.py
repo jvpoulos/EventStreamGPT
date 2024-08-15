@@ -54,6 +54,10 @@ class ESTForStreamClassification(nn.Module):
         self.criteria = torch.nn.BCEWithLogitsLoss(reduction='none')
         self.dropout = torch.nn.Dropout(config.intermediate_dropout)
         
+        self.static_indices_embedding = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.static_measurement_indices_embedding = nn.Embedding(len(vocabulary_config.measurements_idxmap), config.hidden_size)
+
+        # Keep the individual static feature embeddings for backward compatibility
         self.categorical_embeddings = nn.ModuleDict({
             'Female': nn.Embedding(2, config.hidden_size),
             'Married': nn.Embedding(2, config.hidden_size),
@@ -63,6 +67,7 @@ class ESTForStreamClassification(nn.Module):
         })
         
         self.continuous_encoder = nn.Linear(3, config.hidden_size)
+
         self.dynamic_values_encoder = nn.Linear(1, config.hidden_size)
         
         self.layer_norm = nn.LayerNorm(config.hidden_size) if config.use_layer_norm else nn.Identity()
@@ -189,59 +194,82 @@ class ESTForStreamClassification(nn.Module):
         self.current_epoch += 1
         if hasattr(self.encoder, 'current_epoch'):
             self.encoder.current_epoch = self.current_epoch
-            
+
+    def train_dataloader(self):
+        return DataLoader(
+            self.train_dataset,
+            batch_size=self.optimization_config['batch_size'],
+            shuffle=True,
+            num_workers=self.optimization_config['num_dataloader_workers'],
+            pin_memory=True
+        )
+
+    def val_dataloader(self):
+        return DataLoader(
+            self.val_dataset,
+            batch_size=self.optimization_config['validation_batch_size'],
+            shuffle=False,
+            num_workers=self.optimization_config['num_dataloader_workers'],
+            pin_memory=True
+        )
+
     def forward(self, batch: dict, labels=None):
         device = self.logit_layer.weight.device
         
-        dynamic_indices = batch['dynamic_indices'].to(device)
-        dynamic_values = batch['dynamic_values'].to(device)
-        dynamic_values_mask = batch['dynamic_values_mask'].to(device)
+        # Print out all keys in the batch
+        print("Batch keys:", batch.keys())
         
-        max_index = dynamic_indices.max().item()
-        if max_index >= self.config.vocab_size:
-            raise ValueError(f"Max index in dynamic_indices ({max_index}) is >= vocab_size ({self.config.vocab_size})")
+        # Use .get() method with default values for potentially missing keys
+        dynamic_indices = batch.get('dynamic_indices', torch.tensor([])).to(device)
+        dynamic_measurement_indices = batch.get('dynamic_measurement_indices', torch.tensor([])).to(device)
+        dynamic_values = batch.get('dynamic_values', torch.tensor([])).to(device)
+        static_indices = batch.get('static_indices', torch.tensor([])).to(device)
+        static_measurement_indices = batch.get('static_measurement_indices', torch.tensor([])).to(device)
+        time = batch.get('time', torch.tensor([])).to(device)
 
-        static_categorical = {k: batch[k].to(device) for k in ['Female', 'Married', 'GovIns', 'English', 'Veteran']}
-        static_continuous = torch.stack([
-            batch['InitialA1c'].to(device),
-            batch['AgeYears'].to(device), 
-            batch['SDI_score'].to(device)
-        ], dim=1)
-        
+        # Check if we have the necessary data to proceed
+        if dynamic_indices.numel() == 0 or static_indices.numel() == 0:
+            print("Warning: Missing crucial data in batch")
+            return StreamClassificationModelOutput(
+                loss=torch.tensor(0.0, device=device),
+                preds=torch.tensor([], device=device),
+                labels=labels,
+                accuracy=torch.tensor(0.0, device=device),
+                auc=torch.tensor(0.0, device=device)
+            )
+
+        # Create masks for padded sequences
+        dynamic_mask = (dynamic_indices != 0).float()
+        static_mask = (static_indices != 0).float()
+
+        # Process static embeddings
+        static_embeds = self.static_indices_embedding(static_indices)
+        static_measurement_embeds = self.static_measurement_indices_embedding(static_measurement_indices)
+        static_embed = (static_embeds * static_measurement_embeds * static_mask.unsqueeze(-1)).sum(dim=1) / (static_mask.sum(dim=1, keepdim=True) + 1e-8)
+
+        # Process dynamic embeddings
         pytorch_batch = {
             'dynamic_indices': dynamic_indices,
+            'dynamic_measurement_indices': dynamic_measurement_indices,
             'dynamic_values': dynamic_values,
-            'dynamic_values_mask': dynamic_values_mask
+            'dynamic_mask': dynamic_mask,
+            'time': time
         }
         
         encoded = self.encoder(pytorch_batch)
-
         event_encoded = encoded.last_hidden_state
 
         if self.pooling_method == "mean":
-            pooled_dynamic = event_encoded.mean(dim=1)
+            pooled_dynamic = (event_encoded * dynamic_mask.unsqueeze(-1)).sum(dim=1) / (dynamic_mask.sum(dim=1, keepdim=True) + 1e-8)
         elif self.pooling_method == "max":
-            pooled_dynamic = event_encoded.max(dim=1)[0]
+            pooled_dynamic = torch.max(event_encoded * dynamic_mask.unsqueeze(-1) + (1 - dynamic_mask.unsqueeze(-1)) * -1e9, dim=1)[0]
         else:
             raise ValueError(f"Unknown pooling method: {self.pooling_method}")
-        
-        static_cat_embeds = [self.categorical_embeddings[k](static_categorical[k]) for k in static_categorical]
-        static_cat_embed = torch.stack(static_cat_embeds, dim=1).mean(dim=1)
-        static_num_embed = self.continuous_encoder(static_continuous)
 
-        dynamic_values_normalized = self.dynamic_values_norm(dynamic_values.unsqueeze(1)).squeeze(1)
-        dynamic_values_embed = torch.where(
-            dynamic_values_mask.unsqueeze(-1),
-            self.dynamic_values_encoder(dynamic_values_normalized.unsqueeze(-1)),
-            self.missing_value_embedding.unsqueeze(0).unsqueeze(0)
-        )
-        pooled_dynamic_values = dynamic_values_embed.mean(dim=1)
-
-        static_embed = static_cat_embed + static_num_embed
-        combined_embed = self.static_weight * static_embed + self.dynamic_weight * (pooled_dynamic + pooled_dynamic_values)
+        # Combine static and dynamic embeddings
+        combined_embed = self.static_weight * static_embed + self.dynamic_weight * pooled_dynamic
         
         intermediate = self.intermediate(combined_embed)
-        
         logits = self.logit_layer(intermediate).squeeze(-1)
         probs = torch.sigmoid(logits)
 
@@ -249,9 +277,7 @@ class ESTForStreamClassification(nn.Module):
         if labels is not None:
             labels = labels.to(logits.device).float()
             loss = self.criteria(logits, labels)
-            
-            loss_mask = ~torch.isnan(loss)
-            loss = loss[loss_mask].mean() if loss_mask.any() else torch.tensor(0.0, device=loss.device)
+            loss = loss.mean()
 
             with torch.no_grad():
                 self.auroc.update(probs, labels.int())
@@ -265,7 +291,7 @@ class ESTForStreamClassification(nn.Module):
             accuracy=accuracy,
             auc=auc
         )
-        
+    
     @property
     def _uses_dep_graph(self):
         return self.config.structured_event_processing_mode == StructuredEventProcessingMode.NESTED_ATTENTION

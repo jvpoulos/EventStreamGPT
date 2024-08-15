@@ -116,6 +116,9 @@ class ESTForStreamClassificationLM(L.LightningModule):
 
         self.scaler = GradScaler()
 
+        self.train_dataset = None
+        self.val_dataset = None
+
         # Load the vocabulary_config from a file
         vocabulary_config_path = "/home/jvp/diabetes_pred/data/labs/vocabulary_config.json"
         with open(vocabulary_config_path, "r") as f:
@@ -166,6 +169,54 @@ class ESTForStreamClassificationLM(L.LightningModule):
         
         # Initialize metric accumulator
         self.metric_accumulator = defaultdict(list)
+
+    def train_dataloader(self):
+        return DataLoader(
+            self.train_dataset,
+            batch_size=self.optimization_config.batch_size,
+            shuffle=True,
+            num_workers=self.optimization_config.num_dataloader_workers,
+            pin_memory=True,
+            collate_fn=self.custom_collate_fn
+        )
+
+    def custom_collate_fn(self, batch):
+        # Separate the items in the batch
+        dynamic_indices = [item['dynamic_indices'] for item in batch]
+        dynamic_values = [item['dynamic_values'] for item in batch]
+        static_indices = [item['static_indices'] for item in batch]
+        static_measurement_indices = [item['static_measurement_indices'] for item in batch]
+        labels = [item['labels'] for item in batch]
+
+        # Pad dynamic_indices and dynamic_values
+        max_dynamic_length = max(tensor.size(0) for tensor in dynamic_indices)
+        dynamic_indices_padded = torch.stack([self.pad_sequence(tensor, max_dynamic_length) for tensor in dynamic_indices])
+        dynamic_values_padded = torch.stack([self.pad_sequence(tensor, max_dynamic_length) for tensor in dynamic_values])
+
+        # Pad static_indices and static_measurement_indices
+        max_static_length = max(tensor.size(0) for tensor in static_indices + static_measurement_indices)
+        static_indices_padded = torch.stack([self.pad_sequence(tensor, max_static_length) for tensor in static_indices])
+        static_measurement_indices_padded = torch.stack([self.pad_sequence(tensor, max_static_length) for tensor in static_measurement_indices])
+
+        return {
+            'dynamic_indices': dynamic_indices_padded,
+            'dynamic_values': dynamic_values_padded,
+            'static_indices': static_indices_padded,
+            'static_measurement_indices': static_measurement_indices_padded,
+            'labels': torch.stack(labels)
+        }
+
+    def pad_sequence(self, sequence, length):
+        return torch.nn.functional.pad(sequence, (0, length - sequence.size(0)))
+
+    def val_dataloader(self):
+        return DataLoader(
+            self.val_dataset,
+            batch_size=self.optimization_config.validation_batch_size,
+            shuffle=False,
+            num_workers=self.optimization_config.num_dataloader_workers,
+            pin_memory=True
+        )
 
     def _set_static_graph(self):
         def apply_static_graph(module):
@@ -461,6 +512,8 @@ class ESTForStreamClassificationLM(L.LightningModule):
         
         dynamic_indices = batch.get("dynamic_indices")
         dynamic_values = batch.get("dynamic_values")
+        static_indices = batch.get("static_indices")
+        static_measurement_indices = batch.get("static_measurement_indices")
         
         if dynamic_indices is None:
             raise ValueError("'dynamic_indices' must be provided in the batch.")
@@ -471,6 +524,8 @@ class ESTForStreamClassificationLM(L.LightningModule):
         outputs = self.model(
             dynamic_indices=dynamic_indices,
             dynamic_values=dynamic_values,
+            static_indices=static_indices,
+            static_measurement_indices=static_measurement_indices,
             **kwargs
         )
         
@@ -766,11 +821,26 @@ class CollateFunction:
             self.logger.error("No valid items found in batch")
             raise ValueError("No valid items in batch")
 
+        # Check for required keys
+        required_keys = ['dynamic_indices', 'dynamic_values', 'static_indices', 'static_measurement_indices', 'labels']
+        optional_keys = ['subject_id', 'start_time', 'time']
+        
+        for key in required_keys:
+            if key not in valid_items[0]:
+                self.logger.error(f"Required key '{key}' not found in batch items")
+                raise KeyError(f"Required key '{key}' not found in batch items")
+
         max_seq_len = max(item['dynamic_indices'].size(0) for item in valid_items)
+        max_static_len = max(max(len(item['static_indices']), len(item['static_measurement_indices'])) for item in valid_items)
         
         dynamic_indices = torch.full((len(valid_items), max_seq_len), self.oov_index, dtype=torch.long)
         dynamic_values = torch.zeros((len(valid_items), max_seq_len), dtype=torch.float32)
         dynamic_values_mask = torch.zeros((len(valid_items), max_seq_len), dtype=torch.bool)
+        
+        static_indices = torch.zeros((len(valid_items), max_static_len), dtype=torch.long)
+        static_measurement_indices = torch.zeros((len(valid_items), max_static_len), dtype=torch.long)
+        
+        labels = []
         
         for i, item in enumerate(valid_items):
             seq_len = item['dynamic_indices'].size(0)
@@ -780,35 +850,55 @@ class CollateFunction:
                 valid_mask = ~torch.isnan(values)
                 dynamic_values[i, :seq_len][valid_mask] = values[valid_mask]
                 dynamic_values_mask[i, :seq_len] = valid_mask
+            
+            static_len = len(item['static_indices'])
+            static_indices[i, :static_len] = item['static_indices']
+            
+            static_measurement_len = len(item['static_measurement_indices'])
+            static_measurement_indices[i, :static_measurement_len] = item['static_measurement_indices']
+            
+            labels.append(item['labels'])
 
         collated_batch = {
-            'dynamic_indices': dynamic_indices.clone(),
-            'dynamic_values': dynamic_values.clone(),
-            'dynamic_values_mask': dynamic_values_mask.clone(),
-            'labels': torch.stack([self.safe_tensor_conversion(item.get('labels', 0), torch.float32) for item in valid_items]).squeeze().clone(),
-            'InitialA1c': torch.tensor([self.safe_float_conversion(item.get('InitialA1c', 0.0)) for item in valid_items], dtype=torch.float32).clone(),
-            'Female': torch.tensor([self.safe_int_conversion(item.get('Female', 0)) for item in valid_items], dtype=torch.long).clone(),
-            'Married': torch.tensor([self.safe_int_conversion(item.get('Married', 0)) for item in valid_items], dtype=torch.long).clone(),
-            'GovIns': torch.tensor([self.safe_int_conversion(item.get('GovIns', 0)) for item in valid_items], dtype=torch.long).clone(),
-            'English': torch.tensor([self.safe_int_conversion(item.get('English', 0)) for item in valid_items], dtype=torch.long).clone(),
-            'AgeYears': torch.tensor([self.safe_float_conversion(item.get('AgeYears', 0.0)) for item in valid_items], dtype=torch.float32).clone(),
-            'SDI_score': torch.tensor([self.safe_float_conversion(item.get('SDI_score', 0.0)) for item in valid_items], dtype=torch.float32).clone(),
-            'Veteran': torch.tensor([self.safe_int_conversion(item.get('Veteran', 0)) for item in valid_items], dtype=torch.long).clone(),
+            'dynamic_indices': dynamic_indices,
+            'dynamic_values': dynamic_values,
+            'dynamic_values_mask': dynamic_values_mask,
+            'static_indices': static_indices,
+            'static_measurement_indices': static_measurement_indices,
+            'labels': torch.stack(labels)
         }
+
+        # Add optional keys if they exist
+        for key in optional_keys:
+            if key in valid_items[0]:
+                if key in ['subject_id', 'start_time']:
+                    collated_batch[key] = torch.stack([item[key] for item in valid_items if key in item])
+                elif key == 'time':
+                    collated_batch[key] = self.safe_pad_sequence([item[key] for item in valid_items if key in item], float('inf'), torch.float)
+
+        # Add dynamic_measurement_indices if not present
+        if 'dynamic_measurement_indices' not in collated_batch:
+            self.logger.warning("'dynamic_measurement_indices' not found in batch. Creating a default tensor.")
+            collated_batch['dynamic_measurement_indices'] = torch.zeros_like(dynamic_indices)
 
         return collated_batch
 
+    def safe_pad_sequence(self, sequences, max_val, dtype):
+        try:
+            sequences = [torch.tensor(s, dtype=dtype) if not isinstance(s, torch.Tensor) else s for s in sequences]
+            sequences = [torch.clamp(s, max=max_val) for s in sequences]
+            if all(s.numel() == 0 for s in sequences):
+                raise ValueError("All sequences are empty")
+            padded = torch.nn.utils.rnn.pad_sequence(sequences, batch_first=True)
+            return padded
+        except Exception as e:
+            self.logger.error(f"Error in safe_pad_sequence: {str(e)}")
+            raise
+
     def safe_tensor_conversion(self, value, dtype):
         if value is None:
-            self.logger.warning(f"Received None value for tensor conversion, using 0")
-            return torch.tensor([0], dtype=dtype)
-        if isinstance(value, (int, float)):
-            value = [value]
-        try:
-            return torch.tensor(value, dtype=dtype)
-        except ValueError:
-            self.logger.warning(f"Could not convert value to tensor: {value}, using 0")
-            return torch.tensor([0], dtype=dtype)
+            return torch.tensor(0, dtype=dtype)
+        return torch.tensor(value, dtype=dtype)
 
     def safe_float_conversion(self, value):
         try:
@@ -823,18 +913,6 @@ class CollateFunction:
         except ValueError:
             self.logger.warning(f"Could not convert to int: {value}, using 0")
             return 0
-
-    def safe_pad_sequence(self, sequences, max_val, dtype):
-        try:
-            sequences = [torch.tensor(s, dtype=dtype) if not isinstance(s, torch.Tensor) else s for s in sequences]
-            sequences = [torch.clamp(s, max=max_val) for s in sequences]
-            if all(s.numel() == 0 for s in sequences):
-                raise ValueError("All sequences are empty")
-            padded = torch.nn.utils.rnn.pad_sequence(sequences, batch_first=True)
-            return padded
-        except Exception as e:
-            self.logger.error(f"Error in safe_pad_sequence: {str(e)}")
-            raise
 
 def worker_init_fn(worker_id):
     np.random.seed(worker_id)
@@ -910,11 +988,21 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_c
             **model_params
         ).to(device)
 
+        # Set the datasets
+        LM.train_dataset = train_pyd
+        LM.val_dataset = tuning_pyd
+
         logger.info(f"Train dataset length: {len(train_pyd)}")
         logger.info(f"First few items from train dataset:")
         for i in range(min(5, len(train_pyd))):
             item = train_pyd[i]
             logger.info(f"Item {i}: {item}")
+            logger.info(f"Item {i} keys: {item.keys()}")
+            logger.info(f"Item {i} dynamic_indices shape: {item['dynamic_indices'].shape}")
+            logger.info(f"Item {i} dynamic_values shape: {item['dynamic_values'].shape}")
+            logger.info(f"Item {i} static_indices shape: {item['static_indices'].shape}")
+            logger.info(f"Item {i} static_measurement_indices shape: {item['static_measurement_indices'].shape}")
+            logger.info(f"Item {i} labels: {item['labels']}")
 
         logger.info("Creating data loaders")
         collate_fn = CollateFunction(config.vocab_size, oov_index)
