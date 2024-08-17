@@ -28,27 +28,14 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
 class ESTForStreamClassification(nn.Module):
-    def __init__(self, config: StructuredTransformerConfig, vocabulary_config: VocabularyConfig, optimization_config: OptimizationConfig, oov_index: int):
+    def __init__(self, config: StructuredTransformerConfig, vocabulary_config: VocabularyConfig, optimization_config: OptimizationConfig, oov_index: int, save_dir: str = "./model_outputs"):
         super().__init__()
         self.config = config
-        self.vocabulary_config = vocabulary_config
         self.optimization_config = optimization_config
         self.oov_index = oov_index
-        self._current_epoch = 0
+        self.save_dir = save_dir
 
-        if not hasattr(self.config, 'save_dir'):
-            self.config.save_dir = './ESTForStreamClassificationmodel_outputs'
-
-        dynamic_indices_vocab_size = vocabulary_config.vocab_sizes_by_measurement.get("dynamic_indices", 0)
-        self.oov_index = dynamic_indices_vocab_size + 1
-
-        if self._uses_dep_graph:
-            self.encoder = NestedAttentionPointProcessTransformer(self.config)
-        else:
-            self.encoder = ConditionallyIndependentPointProcessTransformer(self.config, vocabulary_config, oov_index=self.oov_index)
-
-        self.encoder = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.encoder)
-        self.pooling_method = config.task_specific_params["pooling_method"]
+        self.encoder = ConditionallyIndependentPointProcessTransformer(config, vocabulary_config, oov_index=oov_index, save_dir=self.save_dir)
         
         self.logit_layer = torch.nn.Linear(config.hidden_size, 1)
         self.criteria = torch.nn.BCEWithLogitsLoss(reduction='none')
@@ -57,7 +44,6 @@ class ESTForStreamClassification(nn.Module):
         self.static_indices_embedding = nn.Embedding(config.vocab_size, config.hidden_size)
         self.static_measurement_indices_embedding = nn.Embedding(len(vocabulary_config.measurements_idxmap), config.hidden_size)
 
-        # Keep the individual static feature embeddings for backward compatibility
         self.categorical_embeddings = nn.ModuleDict({
             'Female': nn.Embedding(2, config.hidden_size),
             'Married': nn.Embedding(2, config.hidden_size),
@@ -88,13 +74,64 @@ class ESTForStreamClassification(nn.Module):
         self.apply(self._init_weights)
         
         self.auroc = BinaryAUROC()
-        self.max_grad_norm = getattr(config, 'max_grad_norm', 1.0)
-        self.use_grad_value_clipping = getattr(optimization_config, 'use_grad_value_clipping', False)
-        self.clip_grad_value = getattr(optimization_config, 'clip_grad_value', 1.0)
+
+    def forward(self, batch, labels=None):
+        print(f"Batch keys: {batch.keys()}")
+ 
+        pytorch_batch = {
+            key: value.to(self.logit_layer.weight.device) if isinstance(value, torch.Tensor) else value
+            for key, value in batch.items()
+        }
         
-        self.missing_value_embedding = nn.Parameter(torch.randn(config.hidden_size))
+        try:
+            encoded = self.encoder(pytorch_batch)
+            event_encoded = encoded.last_hidden_state
+        except RuntimeError as e:
+            print(f"Error in encoder: {e}")
+            for k, v in pytorch_batch.items():
+                if isinstance(v, torch.Tensor):
+                    print(f"{k} shape: {v.shape}, dtype: {v.dtype}, device: {v.device}")
+            raise
+
+        if self.config.task_specific_params["pooling_method"] == "mean":
+            pooled_dynamic = event_encoded.mean(dim=1)
+        elif self.config.task_specific_params["pooling_method"] == "max":
+            pooled_dynamic = event_encoded.max(dim=1)[0]
+        else:
+            raise ValueError(f"Unknown pooling method: {self.config.task_specific_params['pooling_method']}")
+
+        static_indices = pytorch_batch['static_indices']
+        static_embed = self.static_indices_embedding(static_indices).mean(dim=1)
+
+        # Ensure static_embed and pooled_dynamic have the same shape
+        if static_embed.shape != pooled_dynamic.shape:
+            raise ValueError(f"Shape mismatch: static_embed {static_embed.shape}, pooled_dynamic {pooled_dynamic.shape}")
+
+        combined_embed = self.static_weight * static_embed + self.dynamic_weight * pooled_dynamic
         
-        self.encoder.gradient_checkpointing = getattr(self.config, 'use_gradient_checkpointing', False)
+        intermediate = self.intermediate(combined_embed)
+        logits = self.logit_layer(intermediate).squeeze(-1)
+        probs = torch.sigmoid(logits)
+
+        loss, accuracy, auc = None, None, None
+        if labels is not None:
+            labels = labels.to(logits.device).float()
+            loss = self.criteria(logits, labels)
+            loss = loss.mean()
+            with torch.no_grad():
+                self.auroc.update(probs, labels.int())
+                auc = self.auroc.compute()
+                accuracy = ((probs > 0.5) == labels).float().mean()
+            
+            print(f"Loss: {loss.item()}, Accuracy: {accuracy.item()}, AUC: {auc.item()}")
+        
+        return StreamClassificationModelOutput(
+            loss=loss,
+            preds=logits,
+            labels=labels if labels is not None else None,
+            accuracy=accuracy,
+            auc=auc
+        )
 
     def gradient_checkpointing_enable(self):
         self.encoder.gradient_checkpointing = True
@@ -211,85 +248,6 @@ class ESTForStreamClassification(nn.Module):
             shuffle=False,
             num_workers=self.optimization_config['num_dataloader_workers'],
             pin_memory=True
-        )
-
-    def forward(self, batch: dict, labels=None):
-        device = self.logit_layer.weight.device
-        
-        # Print out all keys in the batch
-        print("Batch keys:", batch.keys())
-        
-        # Use .get() method with default values for potentially missing keys
-        dynamic_indices = batch.get('dynamic_indices', torch.tensor([])).to(device)
-        dynamic_measurement_indices = batch.get('dynamic_measurement_indices', torch.tensor([])).to(device)
-        dynamic_values = batch.get('dynamic_values', torch.tensor([])).to(device)
-        static_indices = batch.get('static_indices', torch.tensor([])).to(device)
-        static_measurement_indices = batch.get('static_measurement_indices', torch.tensor([])).to(device)
-        time = batch.get('time', torch.tensor([])).to(device)
-
-        # Check if we have the necessary data to proceed
-        if dynamic_indices.numel() == 0 or static_indices.numel() == 0:
-            print("Warning: Missing crucial data in batch")
-            return StreamClassificationModelOutput(
-                loss=torch.tensor(0.0, device=device),
-                preds=torch.tensor([], device=device),
-                labels=labels,
-                accuracy=torch.tensor(0.0, device=device),
-                auc=torch.tensor(0.0, device=device)
-            )
-
-        # Create masks for padded sequences
-        dynamic_mask = (dynamic_indices != 0).float()
-        static_mask = (static_indices != 0).float()
-
-        # Process static embeddings
-        static_embeds = self.static_indices_embedding(static_indices)
-        static_measurement_embeds = self.static_measurement_indices_embedding(static_measurement_indices)
-        static_embed = (static_embeds * static_measurement_embeds * static_mask.unsqueeze(-1)).sum(dim=1) / (static_mask.sum(dim=1, keepdim=True) + 1e-8)
-
-        # Process dynamic embeddings
-        pytorch_batch = {
-            'dynamic_indices': dynamic_indices,
-            'dynamic_measurement_indices': dynamic_measurement_indices,
-            'dynamic_values': dynamic_values,
-            'dynamic_mask': dynamic_mask,
-            'time': time
-        }
-        
-        encoded = self.encoder(pytorch_batch)
-        event_encoded = encoded.last_hidden_state
-
-        if self.pooling_method == "mean":
-            pooled_dynamic = (event_encoded * dynamic_mask.unsqueeze(-1)).sum(dim=1) / (dynamic_mask.sum(dim=1, keepdim=True) + 1e-8)
-        elif self.pooling_method == "max":
-            pooled_dynamic = torch.max(event_encoded * dynamic_mask.unsqueeze(-1) + (1 - dynamic_mask.unsqueeze(-1)) * -1e9, dim=1)[0]
-        else:
-            raise ValueError(f"Unknown pooling method: {self.pooling_method}")
-
-        # Combine static and dynamic embeddings
-        combined_embed = self.static_weight * static_embed + self.dynamic_weight * pooled_dynamic
-        
-        intermediate = self.intermediate(combined_embed)
-        logits = self.logit_layer(intermediate).squeeze(-1)
-        probs = torch.sigmoid(logits)
-
-        loss, accuracy, auc = None, None, None
-        if labels is not None:
-            labels = labels.to(logits.device).float()
-            loss = self.criteria(logits, labels)
-            loss = loss.mean()
-
-            with torch.no_grad():
-                self.auroc.update(probs, labels.int())
-                auc = self.auroc.compute()
-                accuracy = ((probs > 0.5) == labels).float().mean()
-        
-        return StreamClassificationModelOutput(
-            loss=loss,
-            preds=logits,
-            labels=labels,
-            accuracy=accuracy,
-            auc=auc
         )
     
     @property

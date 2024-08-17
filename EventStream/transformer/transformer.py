@@ -745,12 +745,11 @@ class TemporalPositionEncoding(torch.nn.Module):
 
         return temporal_embeddings
 
-
-class ConditionallyIndependentPointProcessInputLayer(torch.nn.Module):
-    def __init__(self, config: StructuredTransformerConfig, vocab_sizes_by_measurement: dict[str, int], oov_index: int, do_use_sinusoidal: bool):
+class ConditionallyIndependentPointProcessInputLayer(nn.Module):
+    def __init__(self, config: StructuredTransformerConfig, vocab_sizes_by_measurement: dict[str, int], oov_index: int):
         super().__init__()
-
         self.config = config
+        self.oov_index = oov_index
 
         self.data_embedding_layer = DataEmbeddingLayer(
             n_total_embeddings=max(vocab_sizes_by_measurement.values()) + 125,
@@ -766,18 +765,8 @@ class ConditionallyIndependentPointProcessInputLayer(torch.nn.Module):
             numerical_weight=config.numerical_embedding_weight,
             oov_index=oov_index,
         )
-        self.data_embedding_layer.to(config.device)
 
-        if do_use_sinusoidal:
-            self.time_embedding_layer = LearnableFrequencySinusoidalTemporalPositionEncoding(
-                embedding_dim=config.hidden_size
-            )
-            
-        else:
-            self.time_embedding_layer = TemporalPositionEncoding(embedding_dim=config.hidden_size)
-
-        self.embedding_dropout = torch.nn.Dropout(p=config.input_dropout)
-        
+        self.embedding_dropout = nn.Dropout(p=config.input_dropout)
         self.dynamic_values_encoder = nn.Linear(1, config.hidden_size)
         self.missing_value_embedding = nn.Parameter(torch.randn(config.hidden_size))
         self.dynamic_values_norm = nn.BatchNorm1d(1)
@@ -791,65 +780,56 @@ class ConditionallyIndependentPointProcessInputLayer(torch.nn.Module):
             dynamic_values = batch.get('dynamic_values')
         else:
             raise TypeError("Input 'batch' should be a dictionary or a Tensor.")
-
+        
+        if dynamic_values is not None:
+            print(f"Input dynamic_values shape: {dynamic_values.shape}")
+            print(f"Input dynamic_values dtype: {dynamic_values.dtype}")
+            print(f"Input dynamic_values device: {dynamic_values.device}")
+        
         # Replace NaN values in dynamic_indices with the OOV index
-        dynamic_indices = torch.where(torch.isnan(dynamic_indices), torch.full_like(dynamic_indices, self.config.vocab_size), dynamic_indices)
+        dynamic_indices = torch.where(torch.isnan(dynamic_indices), torch.full_like(dynamic_indices, self.oov_index), dynamic_indices)
         
         data_embed: torch.Tensor = self.data_embedding_layer(dynamic_indices)
         
+        # Reshape data_embed if necessary
+        if len(data_embed.shape) == 2:
+            batch_size, total_elements = data_embed.shape
+            hidden_size = self.config.hidden_size
+            seq_len = total_elements // hidden_size
+            data_embed = data_embed.view(batch_size, seq_len, hidden_size)
+        
         if dynamic_values is not None:
-            # Create a mask for non-missing values
             mask = ~torch.isnan(dynamic_values)
             
-            # Process only non-missing values
             valid_values = dynamic_values[mask]
+            
             if valid_values.numel() > 0:
                 valid_values_normalized = self.dynamic_values_norm(valid_values.unsqueeze(1)).squeeze(1)
                 valid_values_embed = self.dynamic_values_encoder(valid_values_normalized.unsqueeze(-1))
                 
-                # Ensure consistent dtype
                 valid_values_embed = valid_values_embed.to(dtype=data_embed.dtype)
                 
-                # Use scatter to place the encoded values back
-                dynamic_values_embed = self.missing_value_embedding.expand(*dynamic_values.shape, self.config.hidden_size)
-                dynamic_values_embed = dynamic_values_embed.to(dtype=data_embed.dtype)
+                # Reshape valid_values_embed to match data_embed's shape
+                batch_size, seq_len = dynamic_values.shape
+                hidden_size = self.config.hidden_size
                 
-                # Use scatter_add_ instead of direct assignment
-                dynamic_values_embed = dynamic_values_embed.clone()
-                dynamic_values_embed.masked_scatter_(mask.unsqueeze(-1), valid_values_embed.squeeze(1))
-            else:
-                dynamic_values_embed = self.missing_value_embedding.expand(*dynamic_values.shape, self.config.hidden_size)
-                dynamic_values_embed = dynamic_values_embed.to(dtype=data_embed.dtype)
-            
-            # Combine with data embeddings
-            data_embed = data_embed + dynamic_values_embed
+                reshaped_valid_values_embed = torch.zeros(batch_size, seq_len, hidden_size, device=valid_values_embed.device, dtype=valid_values_embed.dtype)
+                reshaped_valid_values_embed[mask] = valid_values_embed.squeeze(1)
+                
+                # Use the mask to update data_embed
+                data_embed = torch.where(mask.unsqueeze(-1), reshaped_valid_values_embed, data_embed)
         
         data_embed = self.embedding_dropout(data_embed)
-
-        # Check for NaNs after each major operation
-        def check_nan(tensor, name):
-            if torch.isnan(tensor).any():
-                print(f"NaNs detected in {name}: {torch.isnan(tensor).sum().item()}")
-
-        check_nan(data_embed, "data_embed")
-        
-        if dynamic_values is not None:
-            check_nan(dynamic_values, "dynamic_values")
-            check_nan(valid_values_normalized, "valid_values_normalized")
-            check_nan(valid_values_embed, "valid_values_embed")
-            check_nan(dynamic_values_embed, "dynamic_values_embed")
-        
-        check_nan(data_embed, "final data_embed")
-
         return data_embed
-            
+        
 class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTrainedModel):
-    def __init__(self, config: StructuredTransformerConfig, vocabulary_config: VocabularyConfig, oov_index: int):
+    def __init__(self, config: StructuredTransformerConfig, vocabulary_config: VocabularyConfig, oov_index: int, save_dir: str = "./model_outputs"):
         super().__init__(config)
         
         self.config = config
         self.vocabulary_config = vocabulary_config
         self.oov_index = oov_index
+        self.save_dir = save_dir
 
         print(f"ConditionallyIndependentPointProcessTransformer: oov_index = {self.oov_index}")
 
@@ -859,7 +839,6 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
             config,
             vocabulary_config.vocab_sizes_by_measurement,
             oov_index=self.oov_index,
-            do_use_sinusoidal=config.do_use_sinusoidal,
         )
         
         self.h = torch.nn.ModuleList([
@@ -867,18 +846,13 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
             for i in range(config.num_hidden_layers)
         ])
 
-        # Use both LayerNorm and BatchNorm if both are set to True
-        if config.use_layer_norm and config.use_batch_norm:
-            self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
-            self.bn_f = nn.BatchNorm1d(self.embed_dim)
-        elif config.use_layer_norm:
-            self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
-        elif config.use_batch_norm:
+        self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
+        if config.use_batch_norm:
             self.bn_f = nn.BatchNorm1d(self.embed_dim)
 
         self.gradient_checkpointing = config.use_gradient_checkpointing
 
-        self.attention_dir = os.path.join(config.save_dir, "attention_weights")
+        self.attention_dir = os.path.join(self.save_dir, "attention_weights")
         os.makedirs(self.attention_dir, exist_ok=True)
 
         # Initialize weights and apply final processing
@@ -910,7 +884,7 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
     @current_epoch.setter
     def current_epoch(self, value):
         self._current_epoch = value
-        
+            
     def forward(
         self,
         batch: dict | torch.Tensor,
@@ -936,10 +910,6 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
                 raise ValueError("Either batch or input_embeds must be provided")
             input_embeds = self.input_layer(batch)
 
-        # Add an extra dimension if input is 2D
-        if input_embeds.dim() == 2:
-            input_embeds = input_embeds.unsqueeze(1)
-
         # Handle NaNs more efficiently
         nan_mask = torch.isnan(input_embeds)
         if nan_mask.any():
@@ -947,8 +917,8 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
             input_embeds = input_embeds.clone()
             input_embeds[nan_mask] = 0.0
 
-        if batch is not None and hasattr(batch, 'event_mask') and batch.event_mask is not None:
-            seq_attention_mask = expand_mask(batch.event_mask, input_embeds.dtype)
+        if batch is not None and 'event_mask' in batch and batch['event_mask'] is not None:
+            seq_attention_mask = expand_mask(batch['event_mask'], input_embeds.dtype)
 
         # Prepare head mask if needed
         head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
@@ -980,21 +950,20 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
                     use_reentrant=False
                 )
             else:
-                kwargs = dict(
-                    hidden_states=hidden_states,
+                outputs = block(
+                    hidden_states,
                     attention_mask=seq_attention_mask,
                     layer_past=layer_past,
                     head_mask=head_mask[i],
                     use_cache=use_cache,
                     output_attentions=output_attentions,
                 )
-                outputs = block(**kwargs)
 
             hidden_states, extra_return_info = outputs
 
-            if batch is not None and hasattr(batch, 'event_mask') and batch.event_mask is not None:
+            if batch is not None and 'event_mask' in batch and batch['event_mask'] is not None:
                 hidden_states = torch.where(
-                    batch.event_mask.unsqueeze(-1).expand_as(hidden_states),
+                    batch['event_mask'].unsqueeze(-1).expand_as(hidden_states),
                     hidden_states,
                     torch.zeros_like(hidden_states),
                 )
@@ -1006,16 +975,9 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
                 all_self_attentions = all_self_attentions + (extra_return_info["attn_weights"],)
 
         # Apply LayerNorm and/or BatchNorm based on configuration
-        if hasattr(self, 'ln_f') and hasattr(self, 'bn_f'):
-            hidden_states = self.ln_f(hidden_states)
+        hidden_states = self.ln_f(hidden_states)
+        if hasattr(self, 'bn_f'):
             hidden_states = self.bn_f(hidden_states.transpose(1, 2)).transpose(1, 2)
-        elif hasattr(self, 'ln_f'):
-            hidden_states = self.ln_f(hidden_states)
-        elif hasattr(self, 'bn_f'):
-            hidden_states = self.bn_f(hidden_states.transpose(1, 2)).transpose(1, 2)
-
-        # Reshape hidden states to match input_embeds
-        hidden_states = hidden_states.view(*input_embeds.shape)
 
         # Add last hidden state
         if output_hidden_states:

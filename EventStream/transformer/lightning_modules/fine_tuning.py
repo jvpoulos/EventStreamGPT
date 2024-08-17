@@ -1,7 +1,9 @@
 import dataclasses
 from dataclasses import is_dataclass, asdict
 import json
+import datetime
 import os
+import torch.distributed as dist
 import random
 from collections.abc import Sequence
 from collections import defaultdict
@@ -13,6 +15,7 @@ from torch.optim.lr_scheduler import LambdaLR
 import math
 import lightning as L
 import omegaconf
+import torch.nn.functional as F
 from omegaconf import DictConfig
 import torch
 from pytorch_lightning import LightningModule
@@ -73,6 +76,7 @@ class ESTForStreamClassificationLM(L.LightningModule):
         oov_index: int,
         pretrained_weights_fp: Path | str | None = None,
         do_debug_mode: bool = False,
+        save_dir: str = "./model_outputs",
         **model_params
     ):
         super().__init__()
@@ -86,6 +90,7 @@ class ESTForStreamClassificationLM(L.LightningModule):
         self.cfg = cfg
         self.do_debug_mode = do_debug_mode
         self.oov_index = oov_index
+        self.save_dir = save_dir
         
         self.gradient_norm_changes = []
         self.max_outliers_to_log = 10
@@ -127,16 +132,16 @@ class ESTForStreamClassificationLM(L.LightningModule):
         
         # Initialize the model
         if pretrained_weights_fp is None or pretrained_weights_fp == "skip":
-            self.model = ESTForStreamClassification(config, vocabulary_config, self.optimization_config, oov_index=self.oov_index)
+            self.model = ESTForStreamClassification(config, vocabulary_config, self.optimization_config, oov_index=self.oov_index, save_dir=self.save_dir)
         else:
             self.model = ESTForStreamClassification.from_pretrained(
                 pretrained_weights_fp,
                 config=config,
                 vocabulary_config=vocabulary_config,
                 optimization_config=self.optimization_config,
-                oov_index=self.oov_index
+                oov_index=self.oov_index,
+                save_dir=self.save_dir
             )
-        
         if self.config.use_gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
             self._set_static_graph()
@@ -177,23 +182,43 @@ class ESTForStreamClassificationLM(L.LightningModule):
             shuffle=True,
             num_workers=self.optimization_config.num_dataloader_workers,
             pin_memory=True,
-            collate_fn=self.custom_collate_fn
+            collate_fn=self.custom_collate_fn,
+            drop_last=True
         )
 
-    def custom_collate_fn(self, batch):
-        # Separate the items in the batch
-        dynamic_indices = [item['dynamic_indices'] for item in batch]
-        dynamic_values = [item['dynamic_values'] for item in batch]
-        static_indices = [item['static_indices'] for item in batch]
-        static_measurement_indices = [item['static_measurement_indices'] for item in batch]
-        labels = [item['labels'] for item in batch]
+    def val_dataloader(self):
+            return DataLoader(
+                self.val_dataset,
+                batch_size=self.optimization_config.validation_batch_size,
+                shuffle=False,
+                num_workers=self.optimization_config.num_dataloader_workers,
+                pin_memory=True,
+                collate_fn=self.custom_collate_fn,
+                drop_last=True  # Add this line
+            )
 
-        # Pad dynamic_indices and dynamic_values
+    def custom_collate_fn(self, batch):
+        # Filter out None items
+        batch = [item for item in batch if item is not None]
+        if len(batch) == 0:
+            return None
+
+        # Separate the items in the batch
+        dynamic_indices = [item['dynamic_indices'] for item in batch if 'dynamic_indices' in item]
+        dynamic_values = [item['dynamic_values'] for item in batch if 'dynamic_values' in item]
+        dynamic_measurement_indices = [item['dynamic_measurement_indices'] for item in batch if 'dynamic_measurement_indices' in item]
+        static_indices = [item['static_indices'] for item in batch if 'static_indices' in item]
+        static_measurement_indices = [item['static_measurement_indices'] for item in batch if 'static_measurement_indices' in item]
+        times = [item['time'] for item in batch if 'time' in item]
+        labels = [item['labels'] for item in batch if 'labels' in item]
+
+        # Pad sequences
         max_dynamic_length = max(tensor.size(0) for tensor in dynamic_indices)
         dynamic_indices_padded = torch.stack([self.pad_sequence(tensor, max_dynamic_length) for tensor in dynamic_indices])
-        dynamic_values_padded = torch.stack([self.pad_sequence(tensor, max_dynamic_length) for tensor in dynamic_values])
+        dynamic_values_padded = torch.stack([self.pad_sequence(tensor, max_dynamic_length, pad_value=0.0) for tensor in dynamic_values])
+        dynamic_measurement_indices_padded = torch.stack([self.pad_sequence(tensor, max_dynamic_length) for tensor in dynamic_measurement_indices])
+        times_padded = torch.stack([self.pad_sequence(tensor, max_dynamic_length, pad_value=0.0) for tensor in times])
 
-        # Pad static_indices and static_measurement_indices
         max_static_length = max(tensor.size(0) for tensor in static_indices + static_measurement_indices)
         static_indices_padded = torch.stack([self.pad_sequence(tensor, max_static_length) for tensor in static_indices])
         static_measurement_indices_padded = torch.stack([self.pad_sequence(tensor, max_static_length) for tensor in static_measurement_indices])
@@ -201,22 +226,20 @@ class ESTForStreamClassificationLM(L.LightningModule):
         return {
             'dynamic_indices': dynamic_indices_padded,
             'dynamic_values': dynamic_values_padded,
+            'dynamic_measurement_indices': dynamic_measurement_indices_padded,
             'static_indices': static_indices_padded,
             'static_measurement_indices': static_measurement_indices_padded,
-            'labels': torch.stack(labels)
+            'time': times_padded,
+            'labels': torch.stack(labels) if labels else None
         }
 
-    def pad_sequence(self, sequence, length):
-        return torch.nn.functional.pad(sequence, (0, length - sequence.size(0)))
-
-    def val_dataloader(self):
-        return DataLoader(
-            self.val_dataset,
-            batch_size=self.optimization_config.validation_batch_size,
-            shuffle=False,
-            num_workers=self.optimization_config.num_dataloader_workers,
-            pin_memory=True
-        )
+    def pad_sequence(self, sequence, max_length, pad_value=0):
+        if isinstance(sequence, list):
+            return self.pad_sequence(torch.tensor(sequence), max_length, pad_value)
+        if len(sequence) >= max_length:
+            return sequence[:max_length]
+        padding = torch.full((max_length - len(sequence),), pad_value, dtype=sequence.dtype, device=sequence.device)
+        return torch.cat([sequence, padding])
 
     def _set_static_graph(self):
         def apply_static_graph(module):
@@ -393,8 +416,12 @@ class ESTForStreamClassificationLM(L.LightningModule):
         self._current_epoch = value
 
     def training_step(self, batch, batch_idx):
+        if batch is None:
+            return None
+
+        labels = batch.pop('labels')  # Remove labels from input
         with torch.cuda.amp.autocast():
-            outputs = self.model(batch, labels=batch['labels'])
+            outputs = self.model(batch, labels=labels)
             loss = outputs.loss
 
         self.log_metrics('train', outputs)
@@ -402,10 +429,12 @@ class ESTForStreamClassificationLM(L.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        if not isinstance(batch, dict):
-            batch = {k: v for k, v in zip(self.model.config.input_keys, batch)}
+        if batch is None:
+            logger.warning("Received None batch in validation_step")
+            return None
         
-        outputs = self.model(batch, labels=batch['labels'])
+        labels = batch.pop('labels')  # Remove labels from input
+        outputs = self.model(batch, labels=labels)
         self.log_metrics('val', outputs)
         return outputs.loss
 
@@ -414,7 +443,8 @@ class ESTForStreamClassificationLM(L.LightningModule):
             logger.warning("Received None batch in test_step")
             return None
         
-        outputs = self.model(batch, labels=batch['labels'])
+        labels = batch.pop('labels')  # Remove labels from input
+        outputs = self.model(batch, labels=labels)
         loss = outputs.loss
 
         self.log_metrics('test', outputs)
@@ -809,79 +839,61 @@ class FinetuneConfig:
             self.wandb_logger_kwargs["project"] = reloaded_pretrain_config.wandb_logger_kwargs.project
 
 class CollateFunction:
-    def __init__(self, vocab_size, oov_index):
+    def __init__(self, vocab_size, oov_index, include_labels=True, static_size=8, max_seq_len=512):
         self.vocab_size = vocab_size
         self.oov_index = oov_index
+        self.include_labels = include_labels
+        self.static_size = static_size
+        self.max_seq_len = max_seq_len
         self.logger = logging.getLogger(__name__)
 
     def __call__(self, batch):
-        valid_items = [item for item in batch if item is not None]
-        
-        if not valid_items:
-            self.logger.error("No valid items found in batch")
-            raise ValueError("No valid items in batch")
+        try:
+            # Filter out None items
+            batch = [item for item in batch if item is not None]
+            if len(batch) == 0:
+                return None
 
-        # Check for required keys
-        required_keys = ['dynamic_indices', 'dynamic_values', 'static_indices', 'static_measurement_indices', 'labels']
-        optional_keys = ['subject_id', 'start_time', 'time']
-        
-        for key in required_keys:
-            if key not in valid_items[0]:
-                self.logger.error(f"Required key '{key}' not found in batch items")
-                raise KeyError(f"Required key '{key}' not found in batch items")
+            # Pad sequences
+            collated_batch = {
+                'dynamic_indices': torch.stack([self.pad_sequence(item['dynamic_indices'], self.max_seq_len) for item in batch]),
+                'dynamic_values': torch.stack([self.pad_sequence(item['dynamic_values'], self.max_seq_len, pad_value=0.0) for item in batch]),
+                'dynamic_measurement_indices': torch.stack([self.pad_sequence(item['dynamic_measurement_indices'], self.max_seq_len) for item in batch]),
+                'static_indices': torch.stack([self.pad_sequence(item['static_indices'], self.static_size) for item in batch]),
+                'static_measurement_indices': torch.stack([self.pad_sequence(item['static_measurement_indices'], self.static_size) for item in batch]),
+                'time': torch.stack([self.pad_sequence(item['time'], self.max_seq_len, pad_value=0.0) for item in batch]),
+            }
+            
+            if self.include_labels:
+                collated_batch['labels'] = torch.stack([item['labels'] for item in batch])
 
-        max_seq_len = max(item['dynamic_indices'].size(0) for item in valid_items)
-        max_static_len = max(max(len(item['static_indices']), len(item['static_measurement_indices'])) for item in valid_items)
-        
-        dynamic_indices = torch.full((len(valid_items), max_seq_len), self.oov_index, dtype=torch.long)
-        dynamic_values = torch.zeros((len(valid_items), max_seq_len), dtype=torch.float32)
-        dynamic_values_mask = torch.zeros((len(valid_items), max_seq_len), dtype=torch.bool)
-        
-        static_indices = torch.zeros((len(valid_items), max_static_len), dtype=torch.long)
-        static_measurement_indices = torch.zeros((len(valid_items), max_static_len), dtype=torch.long)
-        
-        labels = []
-        
-        for i, item in enumerate(valid_items):
-            seq_len = item['dynamic_indices'].size(0)
-            dynamic_indices[i, :seq_len] = item['dynamic_indices']
-            if 'dynamic_values' in item and item['dynamic_values'] is not None:
-                values = item['dynamic_values'].float()
-                valid_mask = ~torch.isnan(values)
-                dynamic_values[i, :seq_len][valid_mask] = values[valid_mask]
-                dynamic_values_mask[i, :seq_len] = valid_mask
-            
-            static_len = len(item['static_indices'])
-            static_indices[i, :static_len] = item['static_indices']
-            
-            static_measurement_len = len(item['static_measurement_indices'])
-            static_measurement_indices[i, :static_measurement_len] = item['static_measurement_indices']
-            
-            labels.append(item['labels'])
+            return collated_batch
+        except Exception as e:
+            self.logger.error(f"Error in collate function: {str(e)}")
+            self.logger.error(f"Batch size: {len(batch)}")
+            for i, item in enumerate(batch):
+                self.logger.error(f"Item {i} keys: {item.keys()}")
+            raise
 
-        collated_batch = {
-            'dynamic_indices': dynamic_indices,
-            'dynamic_values': dynamic_values,
-            'dynamic_values_mask': dynamic_values_mask,
-            'static_indices': static_indices,
-            'static_measurement_indices': static_measurement_indices,
-            'labels': torch.stack(labels)
+    def pad_sequence(self, sequence, length, pad_value=0):
+        if len(sequence) >= length:
+            return sequence[:length]
+        return F.pad(sequence, (0, length - len(sequence)), value=pad_value)
+
+    def is_valid_item(self, item):
+        required_keys = ['dynamic_indices', 'dynamic_values', 'static_indices', 'static_measurement_indices', 'dynamic_measurement_indices', 'labels']
+        return all(k in item for k in required_keys) and all(torch.is_tensor(item[k]) for k in required_keys)
+
+    def get_empty_batch(self):
+        return {
+            'dynamic_indices': torch.tensor([], dtype=torch.long),
+            'dynamic_values': torch.tensor([], dtype=torch.float32),
+            'dynamic_values_mask': torch.tensor([], dtype=torch.bool),
+            'static_indices': torch.tensor([], dtype=torch.long),
+            'static_measurement_indices': torch.tensor([], dtype=torch.long),
+            'dynamic_measurement_indices': torch.tensor([], dtype=torch.long),
+            'labels': torch.tensor([], dtype=torch.float32),
         }
-
-        # Add optional keys if they exist
-        for key in optional_keys:
-            if key in valid_items[0]:
-                if key in ['subject_id', 'start_time']:
-                    collated_batch[key] = torch.stack([item[key] for item in valid_items if key in item])
-                elif key == 'time':
-                    collated_batch[key] = self.safe_pad_sequence([item[key] for item in valid_items if key in item], float('inf'), torch.float)
-
-        # Add dynamic_measurement_indices if not present
-        if 'dynamic_measurement_indices' not in collated_batch:
-            self.logger.warning("'dynamic_measurement_indices' not found in batch. Creating a default tensor.")
-            collated_batch['dynamic_measurement_indices'] = torch.zeros_like(dynamic_indices)
-
-        return collated_batch
 
     def safe_pad_sequence(self, sequences, max_val, dtype):
         try:
@@ -929,6 +941,10 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_c
 
     logging.basicConfig(level=logging.DEBUG)
     logger = logging.getLogger(__name__)
+
+    logger.info(f"Train dataset length: {len(train_pyd)}")
+    logger.info(f"Tuning dataset length: {len(tuning_pyd)}")
+    logger.info(f"Held-out dataset length: {len(held_out_pyd)}")
 
     try:
         # Update data config
@@ -993,10 +1009,9 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_c
         LM.val_dataset = tuning_pyd
 
         logger.info(f"Train dataset length: {len(train_pyd)}")
-        logger.info(f"First few items from train dataset:")
         for i in range(min(5, len(train_pyd))):
             item = train_pyd[i]
-            logger.info(f"Item {i}: {item}")
+            # logger.info(f"Item {i}: {item}")
             logger.info(f"Item {i} keys: {item.keys()}")
             logger.info(f"Item {i} dynamic_indices shape: {item['dynamic_indices'].shape}")
             logger.info(f"Item {i} dynamic_values shape: {item['dynamic_values'].shape}")
@@ -1004,22 +1019,49 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_c
             logger.info(f"Item {i} static_measurement_indices shape: {item['static_measurement_indices'].shape}")
             logger.info(f"Item {i} labels: {item['labels']}")
 
-        logger.info("Creating data loaders")
-        collate_fn = CollateFunction(config.vocab_size, oov_index)
-        
-        def create_dataloader(dataset, batch_size, shuffle):
-            return DataLoader(
-                dataset,
-                batch_size=batch_size,
-                collate_fn=collate_fn,
-                shuffle=shuffle,
-                num_workers=0,  
-                pin_memory=True
-            )
+       # Check label distribution
+        train_labels = torch.tensor([train_pyd[i]['labels'] for i in range(len(train_pyd))])
+        print(f"Label distribution in training set: {torch.bincount(train_labels.long())}")
+        print(f"Unique labels: {torch.unique(train_labels)}")
 
-        train_dataloader = create_dataloader(train_pyd, optimization_config['batch_size'], True)
-        tuning_dataloader = create_dataloader(tuning_pyd, optimization_config['validation_batch_size'], False)
-        held_out_dataloader = create_dataloader(held_out_pyd, optimization_config['validation_batch_size'], False)
+        # Check for maximum sequence length
+        max_seq_len = max(max(len(item['dynamic_indices']) for item in train_pyd),
+                          max(len(item['dynamic_indices']) for item in tuning_pyd),
+                          max(len(item['dynamic_indices']) for item in held_out_pyd))
+        logger.info(f"Maximum sequence length in datasets: {max_seq_len}")
+        if max_seq_len > config.max_seq_len:
+            logger.warning(f"Maximum sequence length ({max_seq_len}) exceeds config.max_seq_len ({config.max_seq_len}). Updating config.")
+            config.max_seq_len = max_seq_len   
+            
+        logger.info("Creating data loaders")
+        collate_fn = CollateFunction(config.vocab_size, oov_index, include_labels=True, static_size=8, max_seq_len=config.max_seq_len)
+        
+        train_dataloader = DataLoader(
+            train_pyd,
+            batch_size=optimization_config['batch_size'],
+            collate_fn=collate_fn,
+            shuffle=True,
+            num_workers=optimization_config['num_dataloader_workers'],
+            pin_memory=True
+        )
+
+        tuning_dataloader = DataLoader(
+            tuning_pyd,
+            batch_size=optimization_config['validation_batch_size'],
+            collate_fn=collate_fn,
+            shuffle=False,
+            num_workers=optimization_config['num_dataloader_workers'],
+            pin_memory=True
+        )
+
+        held_out_dataloader = DataLoader(
+            held_out_pyd,
+            batch_size=optimization_config['validation_batch_size'],
+            collate_fn=collate_fn,
+            shuffle=False,
+            num_workers=optimization_config['num_dataloader_workers'],
+            pin_memory=True
+        )
 
         callbacks = [
             LearningRateMonitor(logging_interval="step"),
@@ -1075,6 +1117,7 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_c
         # Update trainer configuration
         cfg.trainer_config["precision"] = "16-mixed"
 
+        logger.info("Creating trainer")
         trainer = L.Trainer(
             **cfg.trainer_config,
             callbacks=callbacks,
@@ -1085,6 +1128,7 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_c
             enable_progress_bar=True,
             deterministic=False,
         )
+        logger.info("Trainer created")
 
         logger.info("Starting training")
         trainer.fit(model=LM, train_dataloaders=train_dataloader, val_dataloaders=tuning_dataloader)
