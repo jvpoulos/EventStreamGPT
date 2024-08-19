@@ -76,8 +76,6 @@ class ESTForStreamClassification(nn.Module):
         self.auroc = BinaryAUROC()
 
     def forward(self, batch, labels=None):
-        print(f"Batch keys: {batch.keys()}")
- 
         pytorch_batch = {
             key: value.to(self.logit_layer.weight.device) if isinstance(value, torch.Tensor) else value
             for key, value in batch.items()
@@ -132,6 +130,10 @@ class ESTForStreamClassification(nn.Module):
             accuracy=accuracy,
             auc=auc
         )
+
+    def on_epoch_start(self):
+        # ensure that the metric is calculated independently for each epoch
+        self.auroc.reset()
 
     def gradient_checkpointing_enable(self):
         self.encoder.gradient_checkpointing = True

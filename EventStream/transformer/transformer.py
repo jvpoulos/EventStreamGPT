@@ -781,11 +781,6 @@ class ConditionallyIndependentPointProcessInputLayer(nn.Module):
         else:
             raise TypeError("Input 'batch' should be a dictionary or a Tensor.")
         
-        if dynamic_values is not None:
-            print(f"Input dynamic_values shape: {dynamic_values.shape}")
-            print(f"Input dynamic_values dtype: {dynamic_values.dtype}")
-            print(f"Input dynamic_values device: {dynamic_values.device}")
-        
         # Replace NaN values in dynamic_indices with the OOV index
         dynamic_indices = torch.where(torch.isnan(dynamic_indices), torch.full_like(dynamic_indices, self.oov_index), dynamic_indices)
         
@@ -884,7 +879,18 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
     @current_epoch.setter
     def current_epoch(self, value):
         self._current_epoch = value
-            
+ 
+    def extract_embeddings(self, batch):
+        with torch.no_grad():
+            outputs = self.forward(batch, output_hidden_states=True)
+            embeddings = outputs.last_hidden_state
+        return embeddings
+
+    def save_embeddings(self, embeddings, epoch):
+        embeddings_path = os.path.join(self.save_dir, "embeddings", f"embeddings_epoch_{epoch}.pt")
+        os.makedirs(os.path.dirname(embeddings_path), exist_ok=True)
+        torch.save(embeddings, embeddings_path)
+
     def forward(
         self,
         batch: dict | torch.Tensor,
@@ -983,11 +989,21 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
 
-        if output_attentions:
-            # Save attention weights
+        if output_attentions and self._current_epoch % 10 == 0:
             attention_path = os.path.join(self.attention_dir, f"attention_weights_epoch_{self._current_epoch}.pt")
             torch.save(all_self_attentions, attention_path)
 
+        if output_hidden_states and self._current_epoch % 10 == 0:
+            hidden_states_path = os.path.join(self.save_dir, "hidden_states", f"hidden_states_epoch_{self._current_epoch}.pt")
+            os.makedirs(os.path.dirname(hidden_states_path), exist_ok=True)
+            torch.save(all_hidden_states, hidden_states_path)
+
+        # Save embeddings
+        if self._current_epoch % 10 == 0:
+            embeddings_path = os.path.join(self.save_dir, "embeddings", f"embeddings_epoch_{self._current_epoch}.pt")
+            os.makedirs(os.path.dirname(embeddings_path), exist_ok=True)
+            torch.save(hidden_states, embeddings_path)
+    
         if not return_dict:
             return tuple(
                 v for v in [hidden_states, presents, all_hidden_states, all_self_attentions] if v is not None

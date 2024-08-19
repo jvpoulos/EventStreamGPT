@@ -124,6 +124,8 @@ class ESTForStreamClassificationLM(L.LightningModule):
         self.train_dataset = None
         self.val_dataset = None
 
+        self.embedding_save_interval = 10
+
         # Load the vocabulary_config from a file
         vocabulary_config_path = "/home/jvp/diabetes_pred/data/labs/vocabulary_config.json"
         with open(vocabulary_config_path, "r") as f:
@@ -254,8 +256,6 @@ class ESTForStreamClassificationLM(L.LightningModule):
         self.model._set_static_graph()
 
     def on_train_start(self):
-        train_labels = torch.cat([batch['labels'] for batch in self.train_dataloader()])
-        print(f"Label distribution in training set: {torch.bincount(train_labels.long())}")
         if self.config.use_gradient_checkpointing:
             self.model._set_static_graph()
 
@@ -419,6 +419,11 @@ class ESTForStreamClassificationLM(L.LightningModule):
         if batch is None:
             return None
 
+        # Extract and save embeddings
+        if self.current_epoch % self.embedding_save_interval == 0:  # Save every N epochs
+            embeddings = self.model.encoder.extract_embeddings(batch)
+            self.model.encoder.save_embeddings(embeddings, self.current_epoch)
+
         labels = batch.pop('labels')  # Remove labels from input
         with torch.cuda.amp.autocast():
             outputs = self.model(batch, labels=labels)
@@ -435,6 +440,20 @@ class ESTForStreamClassificationLM(L.LightningModule):
         
         labels = batch.pop('labels')  # Remove labels from input
         outputs = self.model(batch, labels=labels)
+        
+        # Log information about the outputs
+        logger.info(f"Validation step {batch_idx}: loss = {outputs.loss}")
+        if torch.isnan(outputs.loss):
+            logger.warning(f"NaN loss detected in validation step {batch_idx}")
+            logger.info(f"Batch contents: {batch}")
+            logger.info(f"Labels: {labels}")
+            logger.info(f"Model outputs: {outputs}")
+     
+        if self.current_epoch % 10 == 0:
+            predictions_path = os.path.join(self.save_dir, "predictions", f"val_predictions_epoch_{self.current_epoch}.pt")
+            os.makedirs(os.path.dirname(predictions_path), exist_ok=True)
+            torch.save(outputs.preds, predictions_path)
+
         self.log_metrics('val', outputs)
         return outputs.loss
 
@@ -446,6 +465,11 @@ class ESTForStreamClassificationLM(L.LightningModule):
         labels = batch.pop('labels')  # Remove labels from input
         outputs = self.model(batch, labels=labels)
         loss = outputs.loss
+
+        if self.current_epoch % 10 == 0:
+            predictions_path = os.path.join(self.save_dir, "predictions", f"test_predictions_epoch_{self.current_epoch}_batch_{batch_idx}.pt")
+            os.makedirs(os.path.dirname(predictions_path), exist_ok=True)
+            torch.save(outputs.preds, predictions_path)
 
         self.log_metrics('test', outputs)
 
@@ -558,7 +582,12 @@ class ESTForStreamClassificationLM(L.LightningModule):
             static_measurement_indices=static_measurement_indices,
             **kwargs
         )
-        
+    
+        if torch.isnan(outputs.loss).any() or torch.isinf(outputs.loss).any():
+            logger.warning("NaN or Inf detected in model outputs")
+            logger.info(f"Inputs: {batch}")
+            logger.info(f"Outputs: {outputs}")
+
         return outputs.last_hidden_state if hasattr(outputs, 'last_hidden_state') else outputs
 
     def on_test_epoch_end(self):
@@ -569,8 +598,7 @@ class ESTForStreamClassificationLM(L.LightningModule):
         optimizer = torch.optim.AdamW(
             self.parameters(),
             lr=self.learning_rate,
-            betas=(0.9, 0.999),
-            eps=1e-8,
+            weight_decay=self.weight_decay
         )
 
         # Initialize GradScaler for mixed precision training
@@ -607,8 +635,8 @@ class ESTForStreamClassificationLM(L.LightningModule):
                 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                     optimizer,
                     mode='min',
-                    factor=0.1,
-                    patience=10,
+                    factor=0.5,
+                    patience=5,
                     verbose=True
                 )
             else:
@@ -718,6 +746,7 @@ class FinetuneConfig:
         default_factory=lambda: {
             "accelerator": "auto",
             "devices": "auto",
+            "strategy": "ddp_find_unused_parameters_true",
             "detect_anomaly": False,
             "default_root_dir": "${save_dir}/model_checkpoints",
             "log_every_n_steps": 10,
@@ -1018,11 +1047,6 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_c
             logger.info(f"Item {i} static_indices shape: {item['static_indices'].shape}")
             logger.info(f"Item {i} static_measurement_indices shape: {item['static_measurement_indices'].shape}")
             logger.info(f"Item {i} labels: {item['labels']}")
-
-       # Check label distribution
-        train_labels = torch.tensor([train_pyd[i]['labels'] for i in range(len(train_pyd))])
-        print(f"Label distribution in training set: {torch.bincount(train_labels.long())}")
-        print(f"Unique labels: {torch.unique(train_labels)}")
 
         # Check for maximum sequence length
         max_seq_len = max(max(len(item['dynamic_indices']) for item in train_pyd),
