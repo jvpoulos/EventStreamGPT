@@ -177,6 +177,11 @@ class ESTForStreamClassificationLM(L.LightningModule):
         # Initialize metric accumulator
         self.metric_accumulator = defaultdict(list)
 
+    def on_train_epoch_start(self):
+        self.current_epoch += 1
+        if hasattr(self.model.encoder, 'current_epoch'):
+            self.model.encoder.current_epoch = self.current_epoch
+        
     def train_dataloader(self):
         return DataLoader(
             self.train_dataset,
@@ -420,11 +425,11 @@ class ESTForStreamClassificationLM(L.LightningModule):
             return None
 
         # Extract and save embeddings
-        if self.current_epoch % self.embedding_save_interval == 0:  # Save every N epochs
-            embeddings = self.model.encoder.extract_embeddings(batch)
-            self.model.encoder.save_embeddings(embeddings, self.current_epoch)
+        embeddings = self.model.encoder.extract_embeddings(batch)
+        self.model.encoder.save_embeddings(embeddings, self.current_epoch)
 
         labels = batch.pop('labels')  # Remove labels from input
+
         with torch.cuda.amp.autocast():
             outputs = self.model(batch, labels=labels)
             loss = outputs.loss
@@ -449,10 +454,10 @@ class ESTForStreamClassificationLM(L.LightningModule):
             logger.info(f"Labels: {labels}")
             logger.info(f"Model outputs: {outputs}")
      
-        if self.current_epoch % 10 == 0:
-            predictions_path = os.path.join(self.save_dir, "predictions", f"val_predictions_epoch_{self.current_epoch}.pt")
-            os.makedirs(os.path.dirname(predictions_path), exist_ok=True)
-            torch.save(outputs.preds, predictions_path)
+        # Save validation predictions at each epoch
+        predictions_path = os.path.join(self.save_dir, "predictions", f"val_predictions_epoch_{self.current_epoch}.pt")
+        os.makedirs(os.path.dirname(predictions_path), exist_ok=True)
+        torch.save(outputs.preds, predictions_path)
 
         self.log_metrics('val', outputs)
         return outputs.loss
@@ -466,10 +471,10 @@ class ESTForStreamClassificationLM(L.LightningModule):
         outputs = self.model(batch, labels=labels)
         loss = outputs.loss
 
-        if self.current_epoch % 10 == 0:
-            predictions_path = os.path.join(self.save_dir, "predictions", f"test_predictions_epoch_{self.current_epoch}_batch_{batch_idx}.pt")
-            os.makedirs(os.path.dirname(predictions_path), exist_ok=True)
-            torch.save(outputs.preds, predictions_path)
+        # Save test predictions at each epoch (instead of each step)
+        predictions_path = os.path.join(self.save_dir, "predictions", f"test_predictions_epoch_{self.current_epoch}.pt")
+        os.makedirs(os.path.dirname(predictions_path), exist_ok=True)
+        torch.save(outputs.preds, predictions_path)
 
         self.log_metrics('test', outputs)
 
@@ -609,7 +614,7 @@ class ESTForStreamClassificationLM(L.LightningModule):
             self.gradient_checkpointing_enable()
 
         # Learning rate scheduler
-        if self.use_lr_scheduler:
+        if self.use_lr_scheduler and self.lr_scheduler_type is not None:
             if self.lr_scheduler_type == "cosine":
                 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                     optimizer,
@@ -1117,21 +1122,8 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_c
                     return True
                 return False
 
-        class NoPositiveSamplesCallback(Callback):
-            def __init__(self):
-                self.no_positive_count = 0
-
-            def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-                if batch['labels'].sum() == 0:
-                    self.no_positive_count += 1
-
-            def on_train_epoch_end(self, trainer, pl_module):
-                print(f"Batches with no positive samples: {self.no_positive_count}")
-                self.no_positive_count = 0        
-
-        # Add these callbacks
+        # Add the callbacks
         callbacks.append(NCCLErrorHandler())
-        callbacks.append(NoPositiveSamplesCallback())
 
         logger.info("Setting up trainer")
         

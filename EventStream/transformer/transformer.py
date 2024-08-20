@@ -855,6 +855,11 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
 
         self._current_epoch = 0
 
+    def save_embeddings(self, embeddings, epoch):
+        embeddings_path = os.path.join(self.save_dir, "embeddings", f"embeddings_epoch_{epoch}.pt")
+        os.makedirs(os.path.dirname(embeddings_path), exist_ok=True)
+        torch.save(embeddings, embeddings_path)
+    
     def gradient_checkpointing_enable(self):
         self.gradient_checkpointing = True
         # Enable gradient checkpointing for all sub-modules if necessary
@@ -985,24 +990,16 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
         if hasattr(self, 'bn_f'):
             hidden_states = self.bn_f(hidden_states.transpose(1, 2)).transpose(1, 2)
 
-        # Add last hidden state
-        if output_hidden_states:
-            all_hidden_states = all_hidden_states + (hidden_states,)
-
-        if output_attentions and self._current_epoch % 10 == 0:
+        # Save attention weights at each epoch if output_attentions is True
+        if output_attentions:
             attention_path = os.path.join(self.attention_dir, f"attention_weights_epoch_{self._current_epoch}.pt")
             torch.save(all_self_attentions, attention_path)
 
-        if output_hidden_states and self._current_epoch % 10 == 0:
+        # Save hidden states at each epoch if output_hidden_states is True
+        if output_hidden_states:
             hidden_states_path = os.path.join(self.save_dir, "hidden_states", f"hidden_states_epoch_{self._current_epoch}.pt")
             os.makedirs(os.path.dirname(hidden_states_path), exist_ok=True)
             torch.save(all_hidden_states, hidden_states_path)
-
-        # Save embeddings
-        if self._current_epoch % 10 == 0:
-            embeddings_path = os.path.join(self.save_dir, "embeddings", f"embeddings_epoch_{self._current_epoch}.pt")
-            os.makedirs(os.path.dirname(embeddings_path), exist_ok=True)
-            torch.save(hidden_states, embeddings_path)
     
         if not return_dict:
             return tuple(
