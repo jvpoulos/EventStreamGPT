@@ -768,7 +768,6 @@ class ConditionallyIndependentPointProcessInputLayer(nn.Module):
 
         self.embedding_dropout = nn.Dropout(p=config.input_dropout)
         self.dynamic_values_encoder = nn.Linear(1, config.hidden_size)
-        self.missing_value_embedding = nn.Parameter(torch.randn(config.hidden_size))
         self.dynamic_values_norm = nn.BatchNorm1d(1)
 
     def forward(self, batch: dict | torch.Tensor) -> torch.Tensor:
@@ -781,12 +780,8 @@ class ConditionallyIndependentPointProcessInputLayer(nn.Module):
         else:
             raise TypeError("Input 'batch' should be a dictionary or a Tensor.")
         
-        # Replace NaN values in dynamic_indices with the OOV index
-        dynamic_indices = torch.where(torch.isnan(dynamic_indices), torch.full_like(dynamic_indices, self.oov_index), dynamic_indices)
-        
         data_embed: torch.Tensor = self.data_embedding_layer(dynamic_indices)
         
-        # Reshape data_embed if necessary
         if len(data_embed.shape) == 2:
             batch_size, total_elements = data_embed.shape
             hidden_size = self.config.hidden_size
@@ -794,6 +789,7 @@ class ConditionallyIndependentPointProcessInputLayer(nn.Module):
             data_embed = data_embed.view(batch_size, seq_len, hidden_size)
         
         if dynamic_values is not None:
+            # Create a mask for non-null values
             mask = ~torch.isnan(dynamic_values)
             
             valid_values = dynamic_values[mask]
@@ -804,14 +800,13 @@ class ConditionallyIndependentPointProcessInputLayer(nn.Module):
                 
                 valid_values_embed = valid_values_embed.to(dtype=data_embed.dtype)
                 
-                # Reshape valid_values_embed to match data_embed's shape
                 batch_size, seq_len = dynamic_values.shape
                 hidden_size = self.config.hidden_size
                 
                 reshaped_valid_values_embed = torch.zeros(batch_size, seq_len, hidden_size, device=valid_values_embed.device, dtype=valid_values_embed.dtype)
                 reshaped_valid_values_embed[mask] = valid_values_embed.squeeze(1)
                 
-                # Use the mask to update data_embed
+                # Use the mask to update data_embed only for non-null values
                 data_embed = torch.where(mask.unsqueeze(-1), reshaped_valid_values_embed, data_embed)
         
         data_embed = self.embedding_dropout(data_embed)
@@ -847,9 +842,6 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
 
         self.gradient_checkpointing = config.use_gradient_checkpointing
 
-        self.attention_dir = os.path.join(self.save_dir, "attention_weights")
-        os.makedirs(self.attention_dir, exist_ok=True)
-
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -884,17 +876,6 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
     @current_epoch.setter
     def current_epoch(self, value):
         self._current_epoch = value
- 
-    def extract_embeddings(self, batch):
-        with torch.no_grad():
-            outputs = self.forward(batch, output_hidden_states=True)
-            embeddings = outputs.last_hidden_state
-        return embeddings
-
-    def save_embeddings(self, embeddings, epoch):
-        embeddings_path = os.path.join(self.save_dir, "embeddings", f"embeddings_epoch_{epoch}.pt")
-        os.makedirs(os.path.dirname(embeddings_path), exist_ok=True)
-        torch.save(embeddings, embeddings_path)
 
     def forward(
         self,
@@ -904,12 +885,11 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
         seq_attention_mask: torch.Tensor | None = None,
         head_mask: torch.Tensor | None = None,
         use_cache: bool | None = None,
-        output_attentions: bool | None = None,
-        output_hidden_states: bool | None = None,
         return_dict: bool | None = None,
     ) -> tuple[torch.Tensor] | TransformerOutputWithPast:
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        output_attentions = False
+        output_hidden_states = False
+        
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -921,12 +901,8 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
                 raise ValueError("Either batch or input_embeds must be provided")
             input_embeds = self.input_layer(batch)
 
-        # Handle NaNs more efficiently
-        nan_mask = torch.isnan(input_embeds)
-        if nan_mask.any():
-            logger.warning(f"{nan_mask.sum()} NaNs detected in input_embeds. Replacing with zeros.")
-            input_embeds = input_embeds.clone()
-            input_embeds[nan_mask] = 0.0
+        # We don't need to handle NaNs here as they are only present in dynamic_values
+        # and are handled in the input layer
 
         if batch is not None and 'event_mask' in batch and batch['event_mask'] is not None:
             seq_attention_mask = expand_mask(batch['event_mask'], input_embeds.dtype)
@@ -985,32 +961,18 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
             if output_attentions:
                 all_self_attentions = all_self_attentions + (extra_return_info["attn_weights"],)
 
-        # Apply LayerNorm and/or BatchNorm based on configuration
         hidden_states = self.ln_f(hidden_states)
         if hasattr(self, 'bn_f'):
             hidden_states = self.bn_f(hidden_states.transpose(1, 2)).transpose(1, 2)
 
-        # Save attention weights at each epoch if output_attentions is True
-        if output_attentions:
-            attention_path = os.path.join(self.attention_dir, f"attention_weights_epoch_{self._current_epoch}.pt")
-            torch.save(all_self_attentions, attention_path)
-
-        # Save hidden states at each epoch if output_hidden_states is True
-        if output_hidden_states:
-            hidden_states_path = os.path.join(self.save_dir, "hidden_states", f"hidden_states_epoch_{self._current_epoch}.pt")
-            os.makedirs(os.path.dirname(hidden_states_path), exist_ok=True)
-            torch.save(all_hidden_states, hidden_states_path)
-    
         if not return_dict:
-            return tuple(
-                v for v in [hidden_states, presents, all_hidden_states, all_self_attentions] if v is not None
-            )
+            return tuple(v for v in [hidden_states, presents] if v is not None)
 
         return TransformerOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=presents,
-            hidden_states=all_hidden_states,
-            attentions=all_self_attentions,
+            hidden_states=None,
+            attentions=None
         )
         
 class NestedAttentionPointProcessInputLayer(torch.nn.Module):

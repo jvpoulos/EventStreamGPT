@@ -424,10 +424,6 @@ class ESTForStreamClassificationLM(L.LightningModule):
         if batch is None:
             return None
 
-        # Extract and save embeddings
-        embeddings = self.model.encoder.extract_embeddings(batch)
-        self.model.encoder.save_embeddings(embeddings, self.current_epoch)
-
         labels = batch.pop('labels')  # Remove labels from input
 
         with torch.cuda.amp.autocast():
@@ -896,6 +892,9 @@ class CollateFunction:
                 'static_indices': torch.stack([self.pad_sequence(item['static_indices'], self.static_size) for item in batch]),
                 'static_measurement_indices': torch.stack([self.pad_sequence(item['static_measurement_indices'], self.static_size) for item in batch]),
                 'time': torch.stack([self.pad_sequence(item['time'], self.max_seq_len, pad_value=0.0) for item in batch]),
+                'InitialA1c_normalized': torch.stack([item['InitialA1c_normalized'] for item in batch]),
+                'AgeYears_normalized': torch.stack([item['AgeYears_normalized'] for item in batch]),
+                'SDI_score_normalized': torch.stack([item['SDI_score_normalized'] for item in batch]),
             }
             
             if self.include_labels:
@@ -967,12 +966,6 @@ def worker_init_fn(worker_id):
 @task_wrapper
 def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_config: VocabularyConfig, oov_index: int, wandb_logger: WandbLogger | None = None):
 
-    # Close out existing wandb sessions
-    if wandb.run:
-        wandb.finish()
-    wandb.init(mode="disabled")
-    wandb.finish()
-
     logging.basicConfig(level=logging.DEBUG)
     logger = logging.getLogger(__name__)
 
@@ -1000,14 +993,10 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_c
         logger.info(f"Using data directory: {cfg.data_config.save_dir}")
         logger.info(f"Using DL reps directory: {cfg.data_config.dl_reps_dir}")
         
-        # Always initialize wandb
-        if wandb.run is None:
-            wandb.init(project=cfg.wandb_logger_kwargs.get('project', 'default_project'),
-                       name=cfg.wandb_logger_kwargs.get('name', 'default_run'),
-                       config=cfg.to_dict())
-        
         # Always create a new WandbLogger
-        wandb_logger = WandbLogger(experiment=wandb.run)
+        wandb_logger = WandbLogger(project=cfg.wandb_logger_kwargs.get('project', 'default_project'),
+                                   name=cfg.wandb_logger_kwargs.get('name', 'default_run'),
+                                   config=cfg.to_dict())
 
         L.seed_everything(cfg.seed)
 
