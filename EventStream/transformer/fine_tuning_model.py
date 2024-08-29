@@ -82,25 +82,18 @@ class ESTForStreamClassification(nn.Module):
             key: value.to(self.logit_layer.weight.device) if isinstance(value, torch.Tensor) else value
             for key, value in batch.items()
         }
-        
+
         # Extract normalized static features
         static_norm_features = torch.stack([
             pytorch_batch['InitialA1c_normalized'],
             pytorch_batch['AgeYears_normalized'],
             pytorch_batch['SDI_score_normalized']
         ], dim=-1)
-        
+
         static_norm_embed = self.static_norm_encoder(static_norm_features)
-        
-        try:
-            encoded = self.encoder(pytorch_batch)
-            event_encoded = encoded.last_hidden_state
-        except RuntimeError as e:
-            print(f"Error in encoder: {e}")
-            for k, v in pytorch_batch.items():
-                if isinstance(v, torch.Tensor):
-                    print(f"{k} shape: {v.shape}, dtype: {v.dtype}, device: {v.device}")
-            raise
+
+        encoded = self.encoder(pytorch_batch)
+        event_encoded = encoded.last_hidden_state
 
         if self.config.task_specific_params["pooling_method"] == "mean":
             pooled_dynamic = event_encoded.mean(dim=1)
@@ -113,7 +106,12 @@ class ESTForStreamClassification(nn.Module):
         static_embed = self.static_indices_embedding(static_indices).mean(dim=1)
 
         # Combine all embeddings
-        combined_embed = self.static_weight * static_embed + self.dynamic_weight * pooled_dynamic + static_norm_embed
+        if self.config.use_addition_for_static:
+            combined_embed = self.static_weight * static_embed + self.dynamic_weight * pooled_dynamic + self.static_weight * static_norm_embed
+        else:
+            combined_embed = torch.cat([self.static_weight * static_embed, 
+                                        self.dynamic_weight * pooled_dynamic, 
+                                        self.static_weight * static_norm_embed], dim=-1)
         
         intermediate = self.intermediate(combined_embed)
         logits = self.logit_layer(intermediate).squeeze(-1)

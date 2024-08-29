@@ -750,6 +750,7 @@ class ConditionallyIndependentPointProcessInputLayer(nn.Module):
         super().__init__()
         self.config = config
         self.oov_index = oov_index
+        self.use_addition_for_static = config.use_addition_for_static
 
         self.data_embedding_layer = DataEmbeddingLayer(
             n_total_embeddings=max(vocab_sizes_by_measurement.values()) + 125,
@@ -776,55 +777,65 @@ class ConditionallyIndependentPointProcessInputLayer(nn.Module):
         if isinstance(batch, torch.Tensor):
             dynamic_indices = batch
             dynamic_values = None
+            continuous_static = None
         elif isinstance(batch, dict):
             dynamic_indices = batch['dynamic_indices']
             dynamic_values = batch.get('dynamic_values')
+            continuous_static = torch.stack([
+                batch['SDI_score_normalized'].squeeze(),
+                batch['AgeYears_normalized'].squeeze(),
+                batch['InitialA1c_normalized'].squeeze()
+            ], dim=-1) if all(key in batch for key in ['SDI_score_normalized', 'AgeYears_normalized', 'InitialA1c_normalized']) else None
         else:
             raise TypeError("Input 'batch' should be a dictionary or a Tensor.")
-        
+
         data_embed: torch.Tensor = self.data_embedding_layer(dynamic_indices)
-        
+
         if len(data_embed.shape) == 2:
             batch_size, total_elements = data_embed.shape
             hidden_size = self.config.hidden_size
             seq_len = total_elements // hidden_size
             data_embed = data_embed.view(batch_size, seq_len, hidden_size)
-        
+
         if dynamic_values is not None:
             # Create a mask for non-null values
             mask = ~torch.isnan(dynamic_values)
-            
             valid_values = dynamic_values[mask]
-            
+
             if valid_values.numel() > 0:
                 valid_values_normalized = self.dynamic_values_norm(valid_values.unsqueeze(1)).squeeze(1)
                 valid_values_embed = self.dynamic_values_encoder(valid_values_normalized.unsqueeze(-1))
-                
                 valid_values_embed = valid_values_embed.to(dtype=data_embed.dtype)
-                
+
                 batch_size, seq_len = dynamic_values.shape
                 hidden_size = self.config.hidden_size
-                
+
                 reshaped_valid_values_embed = torch.zeros(batch_size, seq_len, hidden_size, device=valid_values_embed.device, dtype=valid_values_embed.dtype)
                 reshaped_valid_values_embed[mask] = valid_values_embed.squeeze(1)
-                
+
                 # Use the mask to update data_embed only for non-null values
                 data_embed = torch.where(mask.unsqueeze(-1), reshaped_valid_values_embed, data_embed)
-        
+
         if isinstance(batch, dict):
             if 'static_indices' in batch:
                 static_embed = self.static_embedding(batch['static_indices'])
                 data_embed = torch.cat([data_embed, static_embed], dim=1)
-            
+
             # Handle continuous static variables
-            continuous_static = torch.stack([
-                batch['SDI_score_normalized'],
-                batch['AgeYears_normalized'],
-                batch['InitialA1c_normalized']
-            ], dim=-1)
-            continuous_static_embed = self.continuous_static_projection(continuous_static)
-            data_embed = torch.cat([data_embed, continuous_static_embed.unsqueeze(1)], dim=1)
-        
+            if continuous_static is not None:
+                continuous_static_embed = self.continuous_static_projection(continuous_static)
+                continuous_static_embed = continuous_static_embed.unsqueeze(1).expand(-1, data_embed.size(1), -1)
+
+                # Sanity check for shapes
+                assert data_embed.shape == continuous_static_embed.shape, f"Shape mismatch: data_embed {data_embed.shape}, continuous_static_embed {continuous_static_embed.shape}"
+
+                if self.use_addition_for_static:
+                    data_embed = data_embed + continuous_static_embed  # Element-wise addition
+                else:
+                    data_embed = torch.cat([data_embed, continuous_static_embed], dim=-1)  # Concatenation
+
+                print(f"After combining static: data_embed shape: {data_embed.shape}")
+
         return self.embedding_dropout(data_embed)
         
 class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTrainedModel):

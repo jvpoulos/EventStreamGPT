@@ -252,16 +252,20 @@ class DataEmbeddingLayer(torch.nn.Module):
             self.cat_proj = torch.nn.Linear(categorical_embedding_dim, out_dim)
             self.num_proj = torch.nn.Linear(numerical_embedding_dim, out_dim)
 
+        self.static_continuous_embed_layer = torch.nn.Linear(3, out_dim)  # 3 for InitialA1c, AgeYears, SDI_score
+
         self.static_weight = static_weight / (static_weight + dynamic_weight)
         self.dynamic_weight = dynamic_weight / (static_weight + dynamic_weight)
         self.categorical_weight = categorical_weight / (categorical_weight + numerical_weight)
-        self.numerical_weight = numerical_weight / (categorical_weight + numerical_weight)
+        self.numerical_weight = numerical_weight / (categorical_weight + numerical_weight)   
 
     def forward(self, input_data: PytorchBatch | torch.Tensor) -> torch.Tensor:
         if isinstance(input_data, torch.Tensor):
             result = self._embed(input_data, None, None, None, None)
         elif isinstance(input_data, PytorchBatch):
             result = self._dynamic_embedding(input_data)
+            result += self._static_embedding(input_data)
+            result += self._static_continuous_embedding(input_data)
         else:
             raise TypeError("Input 'input_data' should be a PytorchBatch object or a Tensor.")
         return result
@@ -281,6 +285,14 @@ class DataEmbeddingLayer(torch.nn.Module):
         result = self._embed(dynamic_indices, measurement_indices, values, values_mask, None)
         return result
 
+    def _static_continuous_embedding(self, batch: PytorchBatch) -> torch.Tensor:
+        static_continuous_features = torch.stack([
+            batch.InitialA1c_normalized,
+            batch.AgeYears_normalized,
+            batch.SDI_score_normalized
+        ], dim=-1)
+        return self.static_continuous_embed_layer(static_continuous_features)
+        
     def _embed(
         self,
         indices: torch.Tensor,

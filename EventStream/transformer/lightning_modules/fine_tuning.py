@@ -898,13 +898,18 @@ class CollateFunction:
                 'static_indices': torch.stack([self.pad_sequence(item['static_indices'], self.static_size) for item in batch]),
                 'static_measurement_indices': torch.stack([self.pad_sequence(item['static_measurement_indices'], self.static_size) for item in batch]),
                 'time': torch.stack([self.pad_sequence(item['time'], self.max_seq_len, pad_value=0.0) for item in batch]),
-                'InitialA1c_normalized': torch.stack([item['InitialA1c_normalized'] for item in batch]),
-                'AgeYears_normalized': torch.stack([item['AgeYears_normalized'] for item in batch]),
-                'SDI_score_normalized': torch.stack([item['SDI_score_normalized'] for item in batch]),
             }
-            
+
+            # Handle continuous static variables
+            for col in ['InitialA1c_normalized', 'AgeYears_normalized', 'SDI_score_normalized']:
+                collated_batch[col] = torch.stack([item[col] for item in batch]).squeeze(1)
+
             if self.include_labels:
-                collated_batch['labels'] = torch.stack([item['labels'] for item in batch])
+                collated_batch['labels'] = torch.stack([item['labels'] for item in batch]).squeeze(1)
+
+            # Log shapes for debugging
+            for key, value in collated_batch.items():
+                self.logger.debug(f"{key} shape: {value.shape}, dtype: {value.dtype}")
 
             return collated_batch
         except Exception as e:

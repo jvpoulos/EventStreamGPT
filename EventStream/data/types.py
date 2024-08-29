@@ -169,6 +169,11 @@ class PytorchBatch:
     end_idx: torch.LongTensor | None = None
     subject_id: torch.LongTensor | None = None
 
+    InitialA1c_normalized: torch.FloatTensor | None = None
+    AgeYears_normalized: torch.FloatTensor | None = None
+    SDI_score_normalized: torch.FloatTensor | None = None
+    time_to_index: torch.FloatTensor | None = None
+
     stream_labels: dict[str, torch.FloatTensor | torch.LongTensor] | None = None
     event_type: torch.Tensor | None = None
 
@@ -237,12 +242,6 @@ class PytorchBatch:
         seq_index = slice(None) if len(index) < 2 else index[1]
         meas_index = slice(None) if len(index) < 3 else index[2]
 
-    def _handle_slice(self, tensor, batch_index, seq_index, meas_index):
-        if isinstance(batch_index, slice) or isinstance(seq_index, slice) or isinstance(meas_index, slice):
-            return tensor[batch_index, seq_index, meas_index]
-        else:
-            return tensor[batch_index, seq_index, meas_index]
-        
         return PytorchBatch(
             event_mask=self.event_mask[batch_index, seq_index] if self.event_mask is not None else None,
             time_delta=self.time_delta[batch_index, seq_index] if self.time_delta is not None else None,
@@ -267,8 +266,18 @@ class PytorchBatch:
                 else {k: v[batch_index] for k, v in self.stream_labels.items()}
             ),
             time=None if self.time is None else self.time[batch_index, seq_index],
-            event_type=self.event_type[batch_index, seq_index] if self.event_type is not None else None,  # Add this line
+            event_type=self.event_type[batch_index, seq_index] if self.event_type is not None else None,
+            InitialA1c_normalized=self.InitialA1c_normalized[batch_index],
+            AgeYears_normalized=self.AgeYears_normalized[batch_index],
+            SDI_score_normalized=self.SDI_score_normalized[batch_index],
+            time_to_index=self.time_to_index[batch_index, seq_index]
         )
+
+    def _handle_slice(self, tensor, batch_index, seq_index, meas_index):
+        if isinstance(batch_index, slice) or isinstance(seq_index, slice) or isinstance(meas_index, slice):
+            return tensor[batch_index, seq_index, meas_index]
+        else:
+            return tensor[batch_index, seq_index, meas_index]
 
     def __getitem__(self, item: str | tuple[int | slice]) -> Union[torch.Tensor, "PytorchBatch"]:
         match item:

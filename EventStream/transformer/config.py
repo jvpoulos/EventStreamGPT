@@ -539,6 +539,7 @@ class StructuredTransformerConfig(PretrainedConfig):
         # For decoding
         use_cache: bool = True,
         use_gradient_checkpointing: bool = False,
+        use_addition_for_static: bool = True,
         device=None,
         **kwargs,
     ):
@@ -862,6 +863,7 @@ class StructuredTransformerConfig(PretrainedConfig):
         self.do_full_block_in_dep_graph_attention = do_full_block_in_dep_graph_attention
 
         self.use_cache = use_cache
+        self.use_addition_for_static = use_addition_for_static
 
         assert not kwargs.get("is_encoder_decoder", False), "Can't be used in encoder/decoder mode!"
         kwargs["is_encoder_decoder"] = False
