@@ -769,6 +769,8 @@ class ConditionallyIndependentPointProcessInputLayer(nn.Module):
         self.embedding_dropout = nn.Dropout(p=config.input_dropout)
         self.dynamic_values_encoder = nn.Linear(1, config.hidden_size)
         self.dynamic_values_norm = nn.BatchNorm1d(1)
+        self.static_embedding = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.continuous_static_projection = nn.Linear(3, config.hidden_size)  # For the 3 continuous static variables
 
     def forward(self, batch: dict | torch.Tensor) -> torch.Tensor:
         if isinstance(batch, torch.Tensor):
@@ -809,8 +811,21 @@ class ConditionallyIndependentPointProcessInputLayer(nn.Module):
                 # Use the mask to update data_embed only for non-null values
                 data_embed = torch.where(mask.unsqueeze(-1), reshaped_valid_values_embed, data_embed)
         
-        data_embed = self.embedding_dropout(data_embed)
-        return data_embed
+        if isinstance(batch, dict):
+            if 'static_indices' in batch:
+                static_embed = self.static_embedding(batch['static_indices'])
+                data_embed = torch.cat([data_embed, static_embed], dim=1)
+            
+            # Handle continuous static variables
+            continuous_static = torch.stack([
+                batch['SDI_score_normalized'],
+                batch['AgeYears_normalized'],
+                batch['InitialA1c_normalized']
+            ], dim=-1)
+            continuous_static_embed = self.continuous_static_projection(continuous_static)
+            data_embed = torch.cat([data_embed, continuous_static_embed.unsqueeze(1)], dim=1)
+        
+        return self.embedding_dropout(data_embed)
         
 class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTrainedModel):
     def __init__(self, config: StructuredTransformerConfig, vocabulary_config: VocabularyConfig, oov_index: int, save_dir: str = "./model_outputs"):
@@ -899,6 +914,11 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
         if input_embeds is None:
             if batch is None:
                 raise ValueError("Either batch or input_embeds must be provided")
+            # Ensure batch contains the continuous static variables
+            if isinstance(batch, dict):
+                for var in ['SDI_score_normalized', 'AgeYears_normalized', 'InitialA1c_normalized']:
+                    if var not in batch:
+                        raise ValueError(f"Batch is missing {var}")
             input_embeds = self.input_layer(batch)
 
         # We don't need to handle NaNs here as they are only present in dynamic_values

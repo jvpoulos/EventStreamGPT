@@ -426,9 +426,12 @@ class ESTForStreamClassificationLM(L.LightningModule):
 
         labels = batch.pop('labels')  # Remove labels from input
 
-        with torch.cuda.amp.autocast():
-            outputs = self.model(batch, labels=labels)
-            loss = outputs.loss
+        outputs = self.model(batch, labels=labels)
+        loss = outputs.loss
+
+        if torch.isnan(loss) or torch.isinf(loss):
+            logger.warning(f"NaN or Inf loss detected in validation step {batch_idx}")
+            loss = torch.where(torch.isnan(loss) | torch.isinf(loss), torch.full_like(loss, 1e-8), loss)
 
         self.log_metrics('train', outputs)
         
@@ -440,16 +443,28 @@ class ESTForStreamClassificationLM(L.LightningModule):
             return None
         
         labels = batch.pop('labels')  # Remove labels from input
+
+        # Log input data statistics
+        logger.info(f"Validation step {batch_idx}: Input data stats:")
+        for key, value in batch.items():
+            if isinstance(value, torch.Tensor):
+                logger.info(f"{key}: shape={value.shape}, dtype={value.dtype}, min={value.min().item()}, max={value.max().item()}, mean={value.float().mean().item()}")
+        
         outputs = self.model(batch, labels=labels)
         
         # Log information about the outputs
         logger.info(f"Validation step {batch_idx}: loss = {outputs.loss}")
-        if torch.isnan(outputs.loss):
-            logger.warning(f"NaN loss detected in validation step {batch_idx}")
+        if torch.isnan(outputs.loss) or torch.isinf(outputs.loss):
+            logger.warning(f"NaN or Inf loss detected in validation step {batch_idx}")
             logger.info(f"Batch contents: {batch}")
             logger.info(f"Labels: {labels}")
             logger.info(f"Model outputs: {outputs}")
-     
+        
+        # Check for NaN or Inf values in model parameters
+        for name, param in self.model.named_parameters():
+            if torch.isnan(param).any() or torch.isinf(param).any():
+                logger.warning(f"NaN or Inf detected in model parameter: {name}")
+        
         # Save validation predictions at each epoch
         predictions_path = os.path.join(self.save_dir, "predictions", f"val_predictions_epoch_{self.current_epoch}.pt")
         os.makedirs(os.path.dirname(predictions_path), exist_ok=True)
@@ -595,21 +610,12 @@ class ESTForStreamClassificationLM(L.LightningModule):
         self._log_epoch_metrics('test')
 
     def configure_optimizers(self):
-        # Initialize optimizer
         optimizer = torch.optim.AdamW(
             self.parameters(),
             lr=self.learning_rate,
             weight_decay=self.weight_decay
         )
 
-        # Initialize GradScaler for mixed precision training
-        self.scaler = torch.cuda.amp.GradScaler()
-
-        # Gradient checkpointing
-        if self.config.use_gradient_checkpointing:
-            self.gradient_checkpointing_enable()
-
-        # Learning rate scheduler
         if self.use_lr_scheduler and self.lr_scheduler_type is not None:
             if self.lr_scheduler_type == "cosine":
                 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -1095,7 +1101,6 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_c
             ),
             EarlyStopping(
                 monitor='val_auc_epoch',
-                min_delta=0.001,
                 patience=cfg.optimization_config['patience'],
                 verbose=True,
                 mode='max',
