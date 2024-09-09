@@ -1415,7 +1415,7 @@ class DatasetBase(
                     self._write_df(df, fp)
 
     @TimeableMixin.TimeAs
-    def cache_deep_learning_representation(self, subjects_per_output_file: int | None = None, do_overwrite: bool = False, static_indices_vocab=None, dynamic_measurement_indices_vocab=None):
+    def cache_deep_learning_representation(self, subjects_per_output_file: int | None = None, do_overwrite: bool = False):
         """Writes a deep-learning friendly representation of the dataset to disk.
 
         The deep learning format produced will have one row per subject, with the following columns:
@@ -1465,55 +1465,12 @@ class DatasetBase(
             )
             subject_chunks = [list(c) for c in subject_chunks]
 
-        # Path for fitted parameters
-        fitted_params_path = self.config.save_dir / "fitted_params.pkl"
-        fitted_params = None
-
         for chunk_idx, subjects_list in self._tqdm(list(enumerate(subject_chunks))):
-            for split, subjects in self.split_subjects.items():
-                fp = DL_dir / f"{split}_{chunk_idx}.{self.DF_SAVE_FORMAT}"
+            cached_df = self.build_DL_cached_representation(subject_ids=subjects_list, do_sort_outputs=True)
 
-                # Filter subjects for this split and chunk
-                split_subjects = [s for s in subjects_list if s in subjects] if subjects_list else subjects
-
-                if split == 'train':
-                    # For training data, we fit the parameters
-                    cached_df = self.build_DL_cached_representation(
-                        subject_ids=split_subjects, 
-                        do_sort_outputs=True,
-                        static_indices_vocab=static_indices_vocab,
-                        dynamic_measurement_indices_vocab=dynamic_measurement_indices_vocab
-                    )
-                    
-                    # Save fitted parameters after processing training data
-                    if hasattr(self, 'fitted_params'):
-                        fitted_params = self.fitted_params
-                        with open(fitted_params_path, "wb") as f:
-                            pickle.dump(fitted_params, f)
-                        print(f"Fitted parameters saved to {fitted_params_path}")
-                    else:
-                        print("Warning: fitted_params not found after processing training data")
-                else:
-                    # For validation and test data, we use the fitted parameters
-                    if fitted_params is None:
-                        if fitted_params_path.exists():
-                            with open(fitted_params_path, "rb") as f:
-                                fitted_params = pickle.load(f)
-                            print(f"Loaded fitted parameters from {fitted_params_path}")
-                        else:
-                            raise ValueError(f"Fitted parameters not found at {fitted_params_path}. Process training data first.")
-                    
-                    cached_df = self.build_DL_cached_representation(
-                        subject_ids=split_subjects, 
-                        do_sort_outputs=True,
-                        static_indices_vocab=static_indices_vocab,
-                        dynamic_measurement_indices_vocab=dynamic_measurement_indices_vocab,
-                        fitted_params=fitted_params
-                    )
-
-                if cached_df.is_empty():
-                    print(f"Warning: Cached data is empty for chunk {chunk_idx}, split {split}. Skipping this chunk.")
-                    continue
+            if cached_df.is_empty():
+                print(f"Warning: Cached data is empty for chunk {chunk_idx}. Skipping this chunk.")
+                continue
 
                 print(f"All columns in split_cached_df for {split}:", cached_df.columns)
                 print(f"Shape of split_cached_df for {split}:", cached_df.shape)
@@ -1529,24 +1486,21 @@ class DatasetBase(
                     "dynamic_measurement_indices",
                     "dynamic_values",
                     "static_indices",
-                    "static_measurement_indices",
-                    "InitialA1c_normalized",
-                    "AgeYears_normalized",
-                    "SDI_score_normalized"
+                    "static_measurement_indices"
                 ]
 
                 # Get the columns that actually exist in the DataFrame
                 existing_columns = [col for col in all_columns if col in cached_df.columns]
 
                 if not existing_columns:
-                    raise ValueError(f"None of the expected columns were found in the DataFrame for {split}.")
+                    raise ValueError("None of the expected columns were found in the DataFrame.")
 
-                print(f"Columns found in the DataFrame for {split}:", existing_columns)
+                print("Columns found in the DataFrame:", existing_columns)
 
                 # Perform the selection
-                split_cached_df = cached_df.select(existing_columns)
+                cached_df = cached_df.select(existing_columns)
 
-                self._write_df(split_cached_df, fp, do_overwrite=do_overwrite)
+                self._write_df(cached_df, fp, do_overwrite=do_overwrite)
                 
     @property
     def vocabulary_config(self) -> VocabularyConfig:

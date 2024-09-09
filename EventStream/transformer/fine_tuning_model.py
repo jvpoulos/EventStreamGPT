@@ -5,7 +5,7 @@ from torch import nn
 import torch.utils.checkpoint
 import torch.nn.functional as F
 from torch.nn import LayerNorm
-from torchmetrics.classification import BinaryAUROC
+from torchmetrics.classification import BinaryAUROC, BinaryAveragePrecision, BinaryF1Score
 from pytorch_lightning.callbacks import EarlyStopping
 
 from ..data.types import PytorchBatch
@@ -44,8 +44,6 @@ class ESTForStreamClassification(nn.Module):
         self.static_indices_embedding = nn.Embedding(config.vocab_size, config.hidden_size)
         self.static_measurement_indices_embedding = nn.Embedding(len(vocabulary_config.measurements_idxmap), config.hidden_size)
 
-        self.static_norm_encoder = nn.Linear(3, config.hidden_size)
-
         self.categorical_embeddings = nn.ModuleDict({
             'Female': nn.Embedding(2, config.hidden_size),
             'Married': nn.Embedding(2, config.hidden_size),
@@ -54,8 +52,6 @@ class ESTForStreamClassification(nn.Module):
             'Veteran': nn.Embedding(2, config.hidden_size)
         })
         
-        self.continuous_encoder = nn.Linear(3, config.hidden_size)
-
         self.dynamic_values_encoder = nn.Linear(1, config.hidden_size)
         
         self.layer_norm = nn.LayerNorm(config.hidden_size) if config.use_layer_norm else nn.Identity()
@@ -76,25 +72,24 @@ class ESTForStreamClassification(nn.Module):
         self.apply(self._init_weights)
         
         self.auroc = BinaryAUROC()
+        self.auprc = BinaryAveragePrecision()
+        self.f1_score = BinaryF1Score()
 
     def forward(self, batch, labels=None):
+        # Remove labels from the input to the encoder
+        encoder_input = {k: v for k, v in batch.items() if k != 'labels'}
+        
+        # Move all tensors to the correct device
         pytorch_batch = {
             key: value.to(self.logit_layer.weight.device) if isinstance(value, torch.Tensor) else value
-            for key, value in batch.items()
+            for key, value in encoder_input.items()
         }
 
-        # Extract normalized static features
-        static_norm_features = torch.stack([
-            pytorch_batch['InitialA1c_normalized'],
-            pytorch_batch['AgeYears_normalized'],
-            pytorch_batch['SDI_score_normalized']
-        ], dim=-1)
-
-        static_norm_embed = self.static_norm_encoder(static_norm_features)
-
+        # Encode the input
         encoded = self.encoder(pytorch_batch)
         event_encoded = encoded.last_hidden_state
 
+        # Pool the dynamic embeddings
         if self.config.task_specific_params["pooling_method"] == "mean":
             pooled_dynamic = event_encoded.mean(dim=1)
         elif self.config.task_specific_params["pooling_method"] == "max":
@@ -102,29 +97,31 @@ class ESTForStreamClassification(nn.Module):
         else:
             raise ValueError(f"Unknown pooling method: {self.config.task_specific_params['pooling_method']}")
 
+        # Process static indices
         static_indices = pytorch_batch['static_indices']
         static_embed = self.static_indices_embedding(static_indices).mean(dim=1)
 
-        # Combine all embeddings
-        if self.config.use_addition_for_static:
-            combined_embed = self.static_weight * static_embed + self.dynamic_weight * pooled_dynamic + self.static_weight * static_norm_embed
-        else:
-            combined_embed = torch.cat([self.static_weight * static_embed, 
-                                        self.dynamic_weight * pooled_dynamic, 
-                                        self.static_weight * static_norm_embed], dim=-1)
+        # Combine embeddings
+        combined_embed = self.static_weight * static_embed + self.dynamic_weight * pooled_dynamic
         
+        # Process through intermediate layers
         intermediate = self.intermediate(combined_embed)
         logits = self.logit_layer(intermediate).squeeze(-1)
         probs = torch.sigmoid(logits)
 
-        loss, accuracy, auc = None, None, None
+        # Calculate metrics if labels are provided
+        loss, accuracy, auc, auprc, f1 = None, None, None, None, None
         if labels is not None:
             labels = labels.to(logits.device).float()
             loss = self.criteria(logits, labels)
             loss = loss.mean()
             with torch.no_grad():
                 self.auroc.update(probs, labels.int())
+                self.auprc.update(probs, labels.int())
+                self.f1_score.update(probs, labels.int())
                 auc = self.auroc.compute()
+                auprc = self.auprc.compute()
+                f1 = self.f1_score.compute()
                 accuracy = ((probs > 0.5) == labels).float().mean()
         
         return StreamClassificationModelOutput(
@@ -132,12 +129,16 @@ class ESTForStreamClassification(nn.Module):
             preds=logits,
             labels=labels if labels is not None else None,
             accuracy=accuracy,
-            auc=auc
+            auc=auc,
+            auprc=auprc,
+            f1=f1
         )
 
     def on_epoch_start(self):
-        # ensure that the metric is calculated independently for each epoch
+        # Reset all metrics at the start of each epoch
         self.auroc.reset()
+        self.auprc.reset()
+        self.f1_score.reset()
 
     def gradient_checkpointing_enable(self):
         self.encoder.gradient_checkpointing = True

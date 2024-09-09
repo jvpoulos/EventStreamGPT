@@ -745,6 +745,12 @@ class TemporalPositionEncoding(torch.nn.Module):
 
         return temporal_embeddings
 
+import torch
+import torch.nn as nn
+import logging
+
+logger = logging.getLogger(__name__)
+
 class ConditionallyIndependentPointProcessInputLayer(nn.Module):
     def __init__(self, config: StructuredTransformerConfig, vocab_sizes_by_measurement: dict[str, int], oov_index: int):
         super().__init__()
@@ -771,23 +777,20 @@ class ConditionallyIndependentPointProcessInputLayer(nn.Module):
         self.dynamic_values_encoder = nn.Linear(1, config.hidden_size)
         self.dynamic_values_norm = nn.BatchNorm1d(1)
         self.static_embedding = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.continuous_static_projection = nn.Linear(3, config.hidden_size)  # For the 3 continuous static variables
+        self.static_measurement_indices_embedding = nn.Embedding(len(vocab_sizes_by_measurement), config.hidden_size)
+        self.time_embedding = nn.Linear(1, config.hidden_size)
+        self.dynamic_measurement_indices_embedding = nn.Embedding(len(vocab_sizes_by_measurement), config.hidden_size)
 
     def forward(self, batch: dict | torch.Tensor) -> torch.Tensor:
-        if isinstance(batch, torch.Tensor):
-            dynamic_indices = batch
-            dynamic_values = None
-            continuous_static = None
-        elif isinstance(batch, dict):
-            dynamic_indices = batch['dynamic_indices']
-            dynamic_values = batch.get('dynamic_values')
-            continuous_static = torch.stack([
-                batch['SDI_score_normalized'].squeeze(),
-                batch['AgeYears_normalized'].squeeze(),
-                batch['InitialA1c_normalized'].squeeze()
-            ], dim=-1) if all(key in batch for key in ['SDI_score_normalized', 'AgeYears_normalized', 'InitialA1c_normalized']) else None
-        else:
-            raise TypeError("Input 'batch' should be a dictionary or a Tensor.")
+        if not isinstance(batch, dict):
+            raise TypeError("Input 'batch' should be a dictionary.")
+
+        dynamic_indices = batch['dynamic_indices']
+        dynamic_values = batch.get('dynamic_values')
+        static_indices = batch.get('static_indices')
+        static_measurement_indices = batch.get('static_measurement_indices')
+        dynamic_measurement_indices = batch.get('dynamic_measurement_indices')
+        time = batch.get('time')
 
         data_embed: torch.Tensor = self.data_embedding_layer(dynamic_indices)
 
@@ -798,7 +801,6 @@ class ConditionallyIndependentPointProcessInputLayer(nn.Module):
             data_embed = data_embed.view(batch_size, seq_len, hidden_size)
 
         if dynamic_values is not None:
-            # Create a mask for non-null values
             mask = ~torch.isnan(dynamic_values)
             valid_values = dynamic_values[mask]
 
@@ -813,28 +815,28 @@ class ConditionallyIndependentPointProcessInputLayer(nn.Module):
                 reshaped_valid_values_embed = torch.zeros(batch_size, seq_len, hidden_size, device=valid_values_embed.device, dtype=valid_values_embed.dtype)
                 reshaped_valid_values_embed[mask] = valid_values_embed.squeeze(1)
 
-                # Use the mask to update data_embed only for non-null values
                 data_embed = torch.where(mask.unsqueeze(-1), reshaped_valid_values_embed, data_embed)
 
-        if isinstance(batch, dict):
-            if 'static_indices' in batch:
-                static_embed = self.static_embedding(batch['static_indices'])
+        if static_indices is not None:
+            static_embed = self.static_embedding(static_indices)
+            if self.use_addition_for_static:
+                data_embed += static_embed.mean(dim=1).unsqueeze(1)
+            else:
                 data_embed = torch.cat([data_embed, static_embed], dim=1)
 
-            # Handle continuous static variables
-            if continuous_static is not None:
-                continuous_static_embed = self.continuous_static_projection(continuous_static)
-                continuous_static_embed = continuous_static_embed.unsqueeze(1).expand(-1, data_embed.size(1), -1)
+        if static_measurement_indices is not None:
+            static_measurement_embed = self.static_measurement_indices_embedding(static_measurement_indices)
+            data_embed = torch.cat([data_embed, static_measurement_embed], dim=1)
 
-                # Sanity check for shapes
-                assert data_embed.shape == continuous_static_embed.shape, f"Shape mismatch: data_embed {data_embed.shape}, continuous_static_embed {continuous_static_embed.shape}"
+        if dynamic_measurement_indices is not None:
+            dynamic_measurement_embed = self.dynamic_measurement_indices_embedding(dynamic_measurement_indices)
+            data_embed += dynamic_measurement_embed
 
-                if self.use_addition_for_static:
-                    data_embed = data_embed + continuous_static_embed  # Element-wise addition
-                else:
-                    data_embed = torch.cat([data_embed, continuous_static_embed], dim=-1)  # Concatenation
+        if time is not None:
+            time_embed = self.time_embedding(time.unsqueeze(-1))
+            data_embed += time_embed
 
-                print(f"After combining static: data_embed shape: {data_embed.shape}")
+        logger.debug(f"Final data_embed shape: {data_embed.shape}")
 
         return self.embedding_dropout(data_embed)
         

@@ -1832,17 +1832,51 @@ class Dataset(DatasetBase):
             events_df = self.events_df
             dynamic_measurements_df = self.dynamic_measurements_df
 
+        static_categorical_columns = ['Female', 'Married', 'GovIns', 'English', 'Veteran']
+        static_continuous_columns = ['InitialA1c', 'AgeYears', 'SDI_score']
+        all_static_columns = static_categorical_columns + static_continuous_columns
+
+        # Create static_data, including discretized versions of continuous columns
+        unique_columns = list(dict.fromkeys(["subject_id"] + subject_measures + all_static_columns + [f"{col}_discretized" for col in static_continuous_columns]))
         static_data = subjects_df.select(
-            "subject_id",
-            *[pl.col(m) for m in subject_measures],
-            "InitialA1c", "A1cGreaterThan7", "Female", "Married", "GovIns", 
-            "English", "AgeYears", "SDI_score", "Veteran"
+            *[pl.col(m) for m in unique_columns]
         )
+
+        # Use the create_static_indices_and_measurements function
+        static_indices_and_measurements = [
+            create_static_indices_and_measurements(row, self.static_indices_vocab, self.static_measurement_indices_vocab)
+            for row in static_data.select(static_categorical_columns + [f"{col}_discretized" for col in static_continuous_columns]).iter_rows(named=True)
+        ]
+
+        static_indices = [item[0] for item in static_indices_and_measurements]
+        static_measurement_indices = [item[1] for item in static_indices_and_measurements]
+
+        static_data = static_data.with_columns([
+            pl.Series(name="static_indices", values=static_indices, dtype=pl.List(pl.UInt32)),
+            pl.Series(name="static_measurement_indices", values=static_measurement_indices, dtype=pl.List(pl.UInt32))
+        ])
+
+        # Remove any normalized columns if they exist
+        columns_to_drop = [f"{col}_normalized" for col in static_continuous_columns]
+        existing_columns = [col for col in columns_to_drop if col in static_data.columns]
+        if existing_columns:
+            static_data = static_data.drop(existing_columns)
+
+        # Remove temporary columns if they were created
+        temp_columns = [f"{col}_index" for col in static_categorical_columns] + [f"{col}_measurement_index" for col in static_categorical_columns]
+        existing_temp_columns = [col for col in temp_columns if col in static_data.columns]
+        if existing_temp_columns:
+            static_data = static_data.drop(existing_temp_columns)
 
         subject_id_dtype = pl.UInt32
         static_data = static_data.with_columns(pl.col("subject_id").cast(subject_id_dtype))
         events_df = events_df.with_columns(pl.col("subject_id").cast(subject_id_dtype))
         dynamic_measurements_df = dynamic_measurements_df.with_columns(pl.col("subject_id").cast(subject_id_dtype))
+
+        # Apply split_event_type to events_df
+        events_df = events_df.with_columns([
+            pl.col("event_type").map_elements(split_event_type).alias("event_type")
+        ])
 
         dynamic_data = dynamic_measurements_df.select(
             "event_id",
@@ -1850,10 +1884,35 @@ class Dataset(DatasetBase):
             "dynamic_values"
         )
 
+        # Join dynamic_data with events_df to get event_type
+        dynamic_data = dynamic_data.join(
+            events_df.select("event_id", "event_type"),
+            on="event_id"
+        )
+
+        # Define event_type_mapping
+        event_type_mapping = {"DIAGNOSIS": 1, "PROCEDURE": 2, "LAB": 3}
+
+        print("Sample of dynamic_data before transformation:")
+        print(dynamic_data.head())
+
+        def map_event_type(event_type):
+            return event_type_mapping.get(event_type, 0)  # Return 0 for unknown event types
+
         dynamic_data = dynamic_data.with_columns([
-            pl.col("dynamic_indices").cast(pl.UInt32),
-            pl.col("dynamic_values").cast(pl.Float64)
+            pl.col("event_type").map_elements(map_event_type).cast(pl.UInt32).alias("dynamic_measurement_indices")
         ])
+
+        print("Sample of dynamic_data after transformation:")
+        print(dynamic_data.head())
+
+        # Add a check for any unexpected values
+        unique_values = dynamic_data.select(pl.col("dynamic_measurement_indices").explode()).unique()
+        print("Unique values in dynamic_measurement_indices:", unique_values)
+
+        unexpected_values = set(unique_values.to_series().to_list()) - set([1, 2, 3])
+        if unexpected_values:
+            print(f"WARNING: Unexpected values found in dynamic_measurement_indices: {unexpected_values}")
 
         event_data = events_df.select(
             "subject_id",
@@ -1865,49 +1924,44 @@ class Dataset(DatasetBase):
             dynamic_data,
             on="event_id",
             how="left"
+        ).join(
+            subjects_df.select("subject_id", "IndexDate"),
+            on="subject_id",
+            how="left"
         )
 
-        for col in ["dynamic_indices", "dynamic_values"]:
-            if col not in event_data.columns:
-                event_data = event_data.with_columns(pl.lit(None).alias(col))
-
-        event_data = event_data.with_columns([
-            pl.col("dynamic_indices").cast(pl.UInt32),
-            pl.col("dynamic_values").cast(pl.Float64)
-        ])
-
-        if do_sort_outputs:
-            event_data = event_data.sort("event_id")
-
-        out = static_data.join(event_data, on="subject_id", how="inner")
-
         # Add start_time column
-        out = out.with_columns(pl.col("timestamp").min().over("subject_id").alias("start_time"))
+        event_data = event_data.with_columns(pl.col("timestamp").min().over("subject_id").alias("start_time"))
 
         # Add time column (minutes since start_time)
-        out = out.with_columns((pl.col("timestamp") - pl.col("start_time")).dt.total_minutes().alias("time"))
+        event_data = event_data.with_columns(
+            ((pl.col("timestamp") - pl.col("start_time")).dt.total_minutes()).alias("time")
+        )
 
-        # Add static_indices
-        static_columns = ['InitialA1c', 'A1cGreaterThan7', 'Female', 'Married', 'GovIns', 'English', 'AgeYears', 'SDI_score', 'Veteran']
-        out = out.with_columns([
-            pl.struct(static_columns).apply(lambda x: [self.static_indices_vocab.get(f"{col}_{str(x[col])}", 0) for col in static_columns]).alias("static_indices")
+        # Add time_to_index column
+        event_data = event_data.with_columns(
+            ((pl.col("timestamp") - pl.col("IndexDate")).dt.total_minutes()).alias("time_to_index")
+        )
+
+        # Group by subject_id to create lists
+        out = event_data.group_by("subject_id").agg([
+            pl.col("start_time").first().alias("start_time"),
+            pl.col("time").alias("time"),
+            pl.col("time_to_index").alias("time_to_index"),
+            pl.col("dynamic_indices").alias("dynamic_indices"),
+            pl.col("dynamic_measurement_indices").alias("dynamic_measurement_indices"),
+            pl.col("dynamic_values").alias("dynamic_values")
         ])
 
-        # Add static_measurement_indices and dynamic_measurement_indices
-        static_measurement_indices = pl.Series([self.unified_measurements_idxmap[m] for m in static_columns])
-        out = out.with_columns(pl.lit(static_measurement_indices).alias("static_measurement_indices"))
-
-        dynamic_measurement_indices = pl.Series([self.unified_measurements_idxmap[m] for m in dynamic_measures])
-        out = out.with_columns(pl.lit(dynamic_measurement_indices).alias("dynamic_measurement_indices"))
-
-        # Rename columns to match required format
-        out = out.rename({
-            "dynamic_indices": "dynamic_indices",
-            "dynamic_values": "dynamic_values"
-        })
+        # Join with static data
+        out = static_data.join(out, on="subject_id", how="left")
 
         if do_sort_outputs:
             out = out.sort("subject_id")
+
+        # Save dynamic_indices vocab and dynamic_measurement_indices vocab
+        with open(self.config.save_dir / "dynamic_indices_vocab.json", "w") as f:
+            json.dump(self.code_mapping, f, indent=2)
 
         return out
 

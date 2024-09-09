@@ -5,6 +5,10 @@ import datetime
 import os
 import torch.distributed as dist
 import random
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix, roc_curve, auc
+import seaborn as sns
 from collections.abc import Sequence
 from collections import defaultdict
 from pathlib import Path
@@ -900,10 +904,6 @@ class CollateFunction:
                 'time': torch.stack([self.pad_sequence(item['time'], self.max_seq_len, pad_value=0.0) for item in batch]),
             }
 
-            # Handle continuous static variables
-            for col in ['InitialA1c_normalized', 'AgeYears_normalized', 'SDI_score_normalized']:
-                collated_batch[col] = torch.stack([item[col] for item in batch]).squeeze(1)
-
             if self.include_labels:
                 collated_batch['labels'] = torch.stack([item['labels'] for item in batch]).squeeze(1)
 
@@ -973,6 +973,31 @@ class CollateFunction:
 def worker_init_fn(worker_id):
     np.random.seed(worker_id)
     random.seed(worker_id)
+
+def plot_confusion_matrix(y_true, y_pred, save_path):
+    cm = confusion_matrix(y_true, y_pred)
+    plt.figure(figsize=(10,7))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
+    plt.title('Confusion Matrix')
+    plt.ylabel('True label')
+    plt.xlabel('Predicted label')
+    plt.savefig(save_path)
+    plt.close()
+
+def plot_auc_curve(y_true, y_pred, save_path):
+    fpr, tpr, _ = roc_curve(y_true, y_pred)
+    roc_auc = auc(fpr, tpr)
+    plt.figure()
+    plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {roc_auc:.2f})')
+    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('Receiver Operating Characteristic (ROC) Curve')
+    plt.legend(loc="lower right")
+    plt.savefig(save_path)
+    plt.close()
 
 @task_wrapper
 def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_config: VocabularyConfig, oov_index: int, wandb_logger: WandbLogger | None = None):
@@ -1153,6 +1178,37 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_c
         tuning_metrics = trainer.validate(model=LM, dataloaders=tuning_dataloader, ckpt_path="last") if len(tuning_pyd) > 0 else None
         held_out_metrics = trainer.test(model=LM, dataloaders=held_out_dataloader, ckpt_path="last") if len(held_out_pyd) > 0 else None
 
+        # Collect patient-level predictions and true labels
+        patient_predictions = {}
+        patient_true_labels = {}
+
+        LM.eval()
+        with torch.no_grad():
+            for batch in tuning_dataloader:
+                outputs = LM(batch)
+                preds = torch.sigmoid(outputs.preds).cpu().numpy()
+                labels = outputs.labels.cpu().numpy()
+                patient_ids = batch['patient_id'].cpu().numpy()
+
+                for patient_id, pred, label in zip(patient_ids, preds, labels):
+                    if patient_id not in patient_predictions:
+                        patient_predictions[patient_id] = []
+                        patient_true_labels[patient_id] = label
+                    patient_predictions[patient_id].append(pred)
+
+        # Aggregate predictions for each patient (e.g., by taking the mean)
+        patient_final_predictions = {patient_id: np.mean(preds) for patient_id, preds in patient_predictions.items()}
+
+        # Convert to arrays for plotting
+        y_true = np.array(list(patient_true_labels.values()))
+        y_pred = np.array(list(patient_final_predictions.values()))
+
+        # Plot confusion matrix
+        plot_confusion_matrix(y_true, y_pred > 0.5, os.path.join(cfg.save_dir, 'confusion_matrix.png'))
+
+        # Plot AUC curve
+        plot_auc_curve(y_true, y_pred, os.path.join(cfg.save_dir, 'auc_curve.png'))
+    
         logger.info("Evaluation completed.")
         
         return None, tuning_metrics, held_out_metrics
