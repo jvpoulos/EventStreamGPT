@@ -1,5 +1,5 @@
 import enum
-from typing import Union
+from typing import Union, Dict
 
 import torch
 
@@ -259,16 +259,54 @@ class DataEmbeddingLayer(torch.nn.Module):
         self.categorical_weight = categorical_weight / (categorical_weight + numerical_weight)
         self.numerical_weight = numerical_weight / (categorical_weight + numerical_weight)   
 
-    def forward(self, input_data: PytorchBatch | torch.Tensor) -> torch.Tensor:
-        if isinstance(input_data, torch.Tensor):
-            result = self._embed(input_data, None, None, None, None)
+    def forward(self, input_data: Union[PytorchBatch, torch.Tensor, Dict[str, torch.Tensor]]) -> torch.Tensor:
+        if isinstance(input_data, dict):
+            dynamic_indices = input_data.get('dynamic_indices')
+            dynamic_values = input_data.get('dynamic_values')
+            dynamic_measurement_indices = input_data.get('dynamic_measurement_indices')
+            static_indices = input_data.get('static_indices')
+            static_measurement_indices = input_data.get('static_measurement_indices')
+            time = input_data.get('time')
+
+            if dynamic_indices is None:
+                raise ValueError("'dynamic_indices' must be provided in the input dictionary.")
+
+            # Handle the case where dynamic_indices is a dictionary
+            if isinstance(dynamic_indices, dict):
+                dynamic_indices = dynamic_indices['dynamic_indices'].to(self.categorical_embed_layer.weight.device)
+            elif isinstance(dynamic_indices, torch.Tensor):
+                dynamic_indices = dynamic_indices.to(self.categorical_embed_layer.weight.device)
+            else:
+                raise TypeError(f"Unexpected type for dynamic_indices: {type(dynamic_indices)}")
+
+            result = self._embed(dynamic_indices, dynamic_measurement_indices, dynamic_values, None, None)
+
+            if static_indices is not None:
+                if isinstance(static_indices, dict):
+                    static_indices = static_indices['static_indices'].to(self.categorical_embed_layer.weight.device)
+                elif isinstance(static_indices, torch.Tensor):
+                    static_indices = static_indices.to(self.categorical_embed_layer.weight.device)
+                else:
+                    raise TypeError(f"Unexpected type for static_indices: {type(static_indices)}")
+                result += self._embed(static_indices, static_measurement_indices)
+
+            if time is not None:
+                result += self._embed_time(time)
+
+            return result
+        elif isinstance(input_data, torch.Tensor):
+            return self._embed(input_data, None, None, None, None)
         elif isinstance(input_data, PytorchBatch):
             result = self._dynamic_embedding(input_data)
             result += self._static_embedding(input_data)
-            result += self._static_continuous_embedding(input_data)
+            return result
         else:
-            raise TypeError("Input 'input_data' should be a PytorchBatch object or a Tensor.")
-        return result
+            raise TypeError("Input 'input_data' should be a PytorchBatch object, a Tensor, or a dictionary.")
+
+    def _embed_time(self, time: torch.Tensor) -> torch.Tensor:
+        # Implement time embedding if needed
+        # This is a placeholder implementation
+        return torch.zeros_like(time).unsqueeze(-1).expand(-1, -1, self.out_dim)
 
     def _dynamic_embedding(self, batch: PytorchBatch) -> torch.Tensor:
         dynamic_indices = batch.dynamic_indices.to(torch.long)
@@ -301,8 +339,17 @@ class DataEmbeddingLayer(torch.nn.Module):
         values_mask: torch.Tensor | None,
         cat_mask: torch.Tensor | None,
     ) -> torch.Tensor:
+        if indices is None:
+            raise ValueError("'indices' cannot be None")
+
+        if not isinstance(indices, torch.Tensor):
+            raise TypeError(f"'indices' must be a torch.Tensor, got {type(indices)}")
+
+        print(f"Indices shape: {indices.shape}, dtype: {indices.dtype}, device: {indices.device}")
+        print(f"Indices min: {indices.min()}, max: {indices.max()}")
+
         if self.oov_index is not None:
-            indices = torch.where(indices >= self.n_total_embeddings, self.oov_index, indices)
+            indices = torch.where(indices >= self.n_total_embeddings, torch.tensor(self.oov_index, device=indices.device), indices)
         
         torch._assert(
             indices.max() < self.n_total_embeddings,
@@ -353,7 +400,11 @@ class DataEmbeddingLayer(torch.nn.Module):
         if values is None:
             return cat_embeds
 
-        num_values = torch.where(values_mask, values, torch.zeros_like(values))
+        if values_mask is None:
+            num_values = values
+        else:
+            num_values = torch.where(values_mask, values, torch.zeros_like(values))
+        
         if self.do_normalize_by_measurement_index:
             num_values *= meas_norm
 

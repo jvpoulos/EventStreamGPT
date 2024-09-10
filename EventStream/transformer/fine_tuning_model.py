@@ -15,7 +15,8 @@ from .transformer import (
     ConditionallyIndependentPointProcessTransformer,
     NestedAttentionPointProcessTransformer,
     StructuredTransformerPreTrainedModel,
-    ConditionallyIndependentPointProcessInputLayer
+    ConditionallyIndependentPointProcessInputLayer,
+    CustomLayerNorm
 )
 from .utils import safe_masked_max, safe_weighted_avg
 
@@ -34,29 +35,28 @@ class ESTForStreamClassification(nn.Module):
         self.optimization_config = optimization_config
         self.oov_index = oov_index
         self.save_dir = save_dir
-
-        self.encoder = ConditionallyIndependentPointProcessTransformer(config, vocabulary_config, oov_index=oov_index, save_dir=self.save_dir)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        self.logit_layer = torch.nn.Linear(config.hidden_size, 1)
+        self.encoder = ConditionallyIndependentPointProcessTransformer(config, vocabulary_config, oov_index=oov_index, save_dir=self.save_dir).to(self.device)
+        
+        self.logit_layer = torch.nn.Linear(config.hidden_size, 1).to(self.device)
         self.criteria = torch.nn.BCEWithLogitsLoss(reduction='none')
         self.dropout = torch.nn.Dropout(config.intermediate_dropout)
         
-        self.static_indices_embedding = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.static_measurement_indices_embedding = nn.Embedding(len(vocabulary_config.measurements_idxmap), config.hidden_size)
-
+        self.static_indices_embedding = nn.Embedding(config.vocab_size, config.hidden_size).to(self.device)
         self.categorical_embeddings = nn.ModuleDict({
             'Female': nn.Embedding(2, config.hidden_size),
             'Married': nn.Embedding(2, config.hidden_size),
             'GovIns': nn.Embedding(2, config.hidden_size),
             'English': nn.Embedding(2, config.hidden_size),
             'Veteran': nn.Embedding(2, config.hidden_size)
-        })
+        }).to(self.device)
         
-        self.dynamic_values_encoder = nn.Linear(1, config.hidden_size)
+        self.dynamic_values_encoder = nn.Linear(1, config.hidden_size).to(self.device)
         
-        self.layer_norm = nn.LayerNorm(config.hidden_size) if config.use_layer_norm else nn.Identity()
+        self.layer_norm = CustomLayerNorm(config.hidden_size) if config.use_layer_norm else nn.Identity()
         self.batch_norm = nn.BatchNorm1d(config.hidden_size) if config.use_batch_norm else nn.Identity()
-        self.dynamic_values_norm = nn.BatchNorm1d(1)
+        self.dynamic_values_norm = nn.BatchNorm1d(1).to(self.device)
         
         self.intermediate = nn.Sequential(
             nn.Linear(config.hidden_size, config.hidden_size),
@@ -64,30 +64,31 @@ class ESTForStreamClassification(nn.Module):
             self.layer_norm,
             self.batch_norm,
             self.dropout
-        )
+        ).to(self.device)
         
-        self.static_weight = nn.Parameter(torch.tensor(config.static_embedding_weight))
-        self.dynamic_weight = nn.Parameter(torch.tensor(config.dynamic_embedding_weight))
+        self.static_weight = nn.Parameter(torch.tensor(config.static_embedding_weight)).to(self.device)
+        self.dynamic_weight = nn.Parameter(torch.tensor(config.dynamic_embedding_weight)).to(self.device)
         
         self.apply(self._init_weights)
         
-        self.auroc = BinaryAUROC()
-        self.auprc = BinaryAveragePrecision()
-        self.f1_score = BinaryF1Score()
+        self.auroc = BinaryAUROC().to(self.device)
+        self.auprc = BinaryAveragePrecision().to(self.device)
+        self.f1_score = BinaryF1Score().to(self.device)
 
-    def forward(self, batch, labels=None):
-        # Remove labels from the input to the encoder
-        encoder_input = {k: v for k, v in batch.items() if k != 'labels'}
-        
-        # Move all tensors to the correct device
-        pytorch_batch = {
-            key: value.to(self.logit_layer.weight.device) if isinstance(value, torch.Tensor) else value
-            for key, value in encoder_input.items()
-        }
-
+    def forward(self, dynamic_indices, dynamic_values=None, static_indices=None, static_measurement_indices=None, time=None, labels=None):
         # Encode the input
-        encoded = self.encoder(pytorch_batch)
+        encoded = self.encoder(
+            dynamic_indices=dynamic_indices,
+            dynamic_values=dynamic_values,
+            static_indices=static_indices,
+            static_measurement_indices=static_measurement_indices,
+            time=time
+        )
         event_encoded = encoded.last_hidden_state
+
+        # Handle 4D input
+        if event_encoded.dim() == 4:
+            event_encoded = event_encoded.squeeze(2)  # Remove the dep_graph dimension
 
         # Pool the dynamic embeddings
         if self.config.task_specific_params["pooling_method"] == "mean":
@@ -98,8 +99,10 @@ class ESTForStreamClassification(nn.Module):
             raise ValueError(f"Unknown pooling method: {self.config.task_specific_params['pooling_method']}")
 
         # Process static indices
-        static_indices = pytorch_batch['static_indices']
-        static_embed = self.static_indices_embedding(static_indices).mean(dim=1)
+        if static_indices is not None:
+            static_embed = self.static_indices_embedding(static_indices).mean(dim=1)
+        else:
+            static_embed = torch.zeros_like(pooled_dynamic)
 
         # Combine embeddings
         combined_embed = self.static_weight * static_embed + self.dynamic_weight * pooled_dynamic
@@ -112,7 +115,6 @@ class ESTForStreamClassification(nn.Module):
         # Calculate metrics if labels are provided
         loss, accuracy, auc, auprc, f1 = None, None, None, None, None
         if labels is not None:
-            labels = labels.to(logits.device).float()
             loss = self.criteria(logits, labels)
             loss = loss.mean()
             with torch.no_grad():
@@ -133,6 +135,11 @@ class ESTForStreamClassification(nn.Module):
             auprc=auprc,
             f1=f1
         )
+
+    def to(self, device):
+        super().to(device)
+        self.device = device
+        return self
 
     def on_epoch_start(self):
         # Reset all metrics at the start of each epoch

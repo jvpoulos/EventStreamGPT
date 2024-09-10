@@ -1223,6 +1223,8 @@ class StreamClassificationModelOutput(ModelOutput):
     labels: torch.LongTensor | torch.FloatTensor = None
     auc: torch.FloatTensor = None
     accuracy: torch.FloatTensor = None
+    auprc: torch.FloatTensor = None
+    f1: torch.FloatTensor = None
     debug_info: dict = None
 
 

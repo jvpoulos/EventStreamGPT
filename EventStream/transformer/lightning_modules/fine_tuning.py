@@ -128,8 +128,6 @@ class ESTForStreamClassificationLM(L.LightningModule):
         self.train_dataset = None
         self.val_dataset = None
 
-        self.embedding_save_interval = 10
-
         # Load the vocabulary_config from a file
         vocabulary_config_path = "/home/jvp/diabetes_pred/data/labs/vocabulary_config.json"
         with open(vocabulary_config_path, "r") as f:
@@ -148,6 +146,7 @@ class ESTForStreamClassificationLM(L.LightningModule):
                 oov_index=self.oov_index,
                 save_dir=self.save_dir
             )
+
         if self.config.use_gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
             self._set_static_graph()
@@ -404,6 +403,12 @@ class ESTForStreamClassificationLM(L.LightningModule):
         if hasattr(outputs, 'auc') and outputs.auc is not None:
             metrics[f'{prefix}_auc'] = outputs.auc
 
+        if hasattr(outputs, 'auprc') and outputs.auprc is not None:
+            metrics[f'{prefix}_auprc'] = outputs.auprc
+
+        if hasattr(outputs, 'f1') and outputs.f1 is not None:
+            metrics[f'{prefix}_f1'] = outputs.f1
+
         for name, value in metrics.items():
             if isinstance(value, torch.Tensor):
                 value = value.detach().cpu().item()
@@ -428,13 +433,12 @@ class ESTForStreamClassificationLM(L.LightningModule):
         if batch is None:
             return None
 
-        labels = batch.pop('labels')  # Remove labels from input
-
+        labels = batch.pop('labels').to(self.device)  # Move labels to the correct device
         outputs = self.model(batch, labels=labels)
         loss = outputs.loss
 
         if torch.isnan(loss) or torch.isinf(loss):
-            logger.warning(f"NaN or Inf loss detected in validation step {batch_idx}")
+            logger.warning(f"NaN or Inf loss detected in training step {batch_idx}")
             loss = torch.where(torch.isnan(loss) | torch.isinf(loss), torch.full_like(loss, 1e-8), loss)
 
         self.log_metrics('train', outputs)
@@ -446,7 +450,8 @@ class ESTForStreamClassificationLM(L.LightningModule):
             logger.warning("Received None batch in validation_step")
             return None
         
-        labels = batch.pop('labels')  # Remove labels from input
+        labels = batch.pop('labels').to(self.device)  # Move labels to the correct device
+        outputs = self.model(batch, labels=labels)
 
         # Log input data statistics
         logger.info(f"Validation step {batch_idx}: Input data stats:")
@@ -482,7 +487,7 @@ class ESTForStreamClassificationLM(L.LightningModule):
             logger.warning("Received None batch in test_step")
             return None
         
-        labels = batch.pop('labels')  # Remove labels from input
+        labels = batch.pop('labels').to(self.device)  # Move labels to the correct device
         outputs = self.model(batch, labels=labels)
         loss = outputs.loss
 
@@ -574,41 +579,44 @@ class ESTForStreamClassificationLM(L.LightningModule):
             raise FileNotFoundError("Code mapping file not found. Please run preprocessing first.")
 
     def forward(self, batch, **kwargs):
+        # Move batch to the correct device
         if isinstance(batch, dict):
+            batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
             for key, value in batch.items():
-                if torch.isnan(value).any():
-                    print(f"NaNs detected in batch['{key}']")
-        elif torch.isnan(batch).any():
-            print("NaNs detected in batch tensor")
-
-        if not isinstance(batch, dict):
+                if isinstance(value, torch.Tensor) and torch.isnan(value).any():
+                    logger.warning(f"NaNs detected in batch['{key}']")
+        else:
             raise TypeError("Input 'batch' should be a dictionary.")
-        
+
         dynamic_indices = batch.get("dynamic_indices")
         dynamic_values = batch.get("dynamic_values")
         static_indices = batch.get("static_indices")
         static_measurement_indices = batch.get("static_measurement_indices")
-        
+        time = batch.get("time")
+        labels = batch.get("labels")
+
         if dynamic_indices is None:
             raise ValueError("'dynamic_indices' must be provided in the batch.")
 
-        if 'dynamic_indices' in batch:
-            batch['dynamic_indices'] = batch['dynamic_indices'].long()
+        # Move kwargs tensors to the correct device
+        kwargs = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in kwargs.items()}
 
         outputs = self.model(
             dynamic_indices=dynamic_indices,
             dynamic_values=dynamic_values,
             static_indices=static_indices,
             static_measurement_indices=static_measurement_indices,
+            time=time,
+            labels=labels,
             **kwargs
         )
-    
-        if torch.isnan(outputs.loss).any() or torch.isinf(outputs.loss).any():
+
+        if hasattr(outputs, 'loss') and (torch.isnan(outputs.loss).any() or torch.isinf(outputs.loss).any()):
             logger.warning("NaN or Inf detected in model outputs")
             logger.info(f"Inputs: {batch}")
             logger.info(f"Outputs: {outputs}")
 
-        return outputs.last_hidden_state if hasattr(outputs, 'last_hidden_state') else outputs
+        return outputs
 
     def on_test_epoch_end(self):
         self._log_epoch_metrics('test')
@@ -879,7 +887,7 @@ class FinetuneConfig:
             self.wandb_logger_kwargs["project"] = reloaded_pretrain_config.wandb_logger_kwargs.project
 
 class CollateFunction:
-    def __init__(self, vocab_size, oov_index, include_labels=True, static_size=8, max_seq_len=512):
+    def __init__(self, vocab_size, oov_index, include_labels=True, static_size=8, max_seq_len=None):
         self.vocab_size = vocab_size
         self.oov_index = oov_index
         self.include_labels = include_labels
@@ -1078,18 +1086,18 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_c
             logger.info(f"Item {i} static_measurement_indices shape: {item['static_measurement_indices'].shape}")
             logger.info(f"Item {i} labels: {item['labels']}")
 
-        # Check for maximum sequence length
-        max_seq_len = max(max(len(item['dynamic_indices']) for item in train_pyd),
-                          max(len(item['dynamic_indices']) for item in tuning_pyd),
-                          max(len(item['dynamic_indices']) for item in held_out_pyd))
-        logger.info(f"Maximum sequence length in datasets: {max_seq_len}")
-        if max_seq_len > config.max_seq_len:
-            logger.warning(f"Maximum sequence length ({max_seq_len}) exceeds config.max_seq_len ({config.max_seq_len}). Updating config.")
-            config.max_seq_len = max_seq_len   
-            
-        logger.info("Creating data loaders")
-        collate_fn = CollateFunction(config.vocab_size, oov_index, include_labels=True, static_size=8, max_seq_len=config.max_seq_len)
+        # # Check for maximum sequence length
+        # max_seq_len = max(max(len(item['dynamic_indices']) for item in train_pyd),
+        #                   max(len(item['dynamic_indices']) for item in tuning_pyd),
+        #                   max(len(item['dynamic_indices']) for item in held_out_pyd))
+        # logger.info(f"Maximum sequence length in datasets: {max_seq_len}")
+        # if max_seq_len > config.max_seq_len:
+        #     logger.warning(f"Maximum sequence length ({max_seq_len}) exceeds config.max_seq_len ({config.max_seq_len}). Updating config.")
+        #     config.max_seq_len = max_seq_len
         
+        logger.info("Creating data loaders")
+        collate_fn = CollateFunction(config.vocab_size, oov_index, include_labels=True, static_size=8, max_seq_len=cfg.config.max_seq_len)
+
         train_dataloader = DataLoader(
             train_pyd,
             batch_size=optimization_config['batch_size'],
