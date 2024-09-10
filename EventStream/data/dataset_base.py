@@ -1415,7 +1415,7 @@ class DatasetBase(
                     self._write_df(df, fp)
 
     @TimeableMixin.TimeAs
-    def cache_deep_learning_representation(self, subjects_per_output_file: int | None = None, do_overwrite: bool = False):
+    def cache_deep_learning_representation(self, subjects_per_output_file: int | None = None, do_overwrite: bool = False, static_indices_vocab=None, dynamic_measurement_indices_vocab=None):
         """Writes a deep-learning friendly representation of the dataset to disk.
 
         The deep learning format produced will have one row per subject, with the following columns:
@@ -1466,22 +1466,28 @@ class DatasetBase(
             subject_chunks = [list(c) for c in subject_chunks]
 
         for chunk_idx, subjects_list in self._tqdm(list(enumerate(subject_chunks))):
-            cached_df = self.build_DL_cached_representation(subject_ids=subjects_list, do_sort_outputs=True)
+            cached_df = self.build_DL_cached_representation(subject_ids=subjects_list, do_sort_outputs=True, 
+                                                            static_indices_vocab=static_indices_vocab,
+                                                            dynamic_measurement_indices_vocab=dynamic_measurement_indices_vocab)
 
             if cached_df.is_empty():
                 print(f"Warning: Cached data is empty for chunk {chunk_idx}. Skipping this chunk.")
                 continue
 
-                print(f"All columns in split_cached_df for {split}:", cached_df.columns)
-                print(f"Shape of split_cached_df for {split}:", cached_df.shape)
-                print(f"First few rows of split_cached_df for {split}:")
-                print(cached_df.head())
+            for split, subjects in self.split_subjects.items():
+                fp = DL_dir / f"{split}_{chunk_idx}.{self.DF_SAVE_FORMAT}"
+
+                split_cached_df = self._filter_col_inclusion(cached_df, {"subject_id": subjects})
+
+                print("All columns in split_cached_df:", split_cached_df.columns)
+                print("Shape of split_cached_df:", split_cached_df.shape)
+                print("First few rows of split_cached_df:")
+                print(split_cached_df.head())
 
                 # Define all the columns we're interested in
                 all_columns = [
                     "subject_id",
                     "time",
-                    "start_time",
                     "dynamic_indices",
                     "dynamic_measurement_indices",
                     "dynamic_values",
@@ -1490,7 +1496,7 @@ class DatasetBase(
                 ]
 
                 # Get the columns that actually exist in the DataFrame
-                existing_columns = [col for col in all_columns if col in cached_df.columns]
+                existing_columns = [col for col in all_columns if col in split_cached_df.columns]
 
                 if not existing_columns:
                     raise ValueError("None of the expected columns were found in the DataFrame.")
@@ -1498,9 +1504,9 @@ class DatasetBase(
                 print("Columns found in the DataFrame:", existing_columns)
 
                 # Perform the selection
-                cached_df = cached_df.select(existing_columns)
+                split_cached_df = split_cached_df.select(existing_columns)
 
-                self._write_df(cached_df, fp, do_overwrite=do_overwrite)
+                self._write_df(split_cached_df, fp, do_overwrite=do_overwrite)
                 
     @property
     def vocabulary_config(self) -> VocabularyConfig:

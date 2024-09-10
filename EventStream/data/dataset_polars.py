@@ -120,6 +120,10 @@ class Dataset(DatasetBase):
         # Create the code mapping if not provided
         self.code_mapping = code_mapping or self._create_code_mapping()
         self.inverse_mapping = {v: k for k, v in self.code_mapping.items()}
+
+        # Use the provided vocabularies or create them if not provided
+        self.static_indices_vocab = static_indices_vocab or self._create_static_indices_vocab()
+        self.static_measurement_indices_vocab = static_measurement_indices_vocab or self._create_static_measurement_indices_vocab()
         
         # Print some information about the code mapping
         print(f"Code mapping size: {len(self.code_mapping)}")
@@ -173,6 +177,20 @@ class Dataset(DatasetBase):
     """Use C++ parquet implementation vs Rust parquet implementation for writing parquets."""
     STREAMING = True
     """Execute any lazy query in streaming mode."""
+
+    def _create_static_indices_vocab(self):
+        static_categorical_columns = ['Female', 'Married', 'GovIns', 'English', 'Veteran']
+        vocab = {}
+        idx = 1
+        for col in static_categorical_columns:
+            unique_values = self.subjects_df.select(col).unique().sort(col)
+            vocab[col] = {str(val[0]): i + idx for i, val in enumerate(unique_values.rows())}
+            idx += len(vocab[col])
+        return vocab
+
+    def _create_static_measurement_indices_vocab(self):
+        static_columns = ['Female', 'Married', 'GovIns', 'English', 'Veteran', 'InitialA1c', 'AgeYears', 'SDI_score']
+        return {col: idx for idx, col in enumerate(static_columns, start=1)}
 
     @staticmethod
     def get_smallest_valid_uint_type(num: Union[int, float]) -> pl.DataType:
@@ -1657,13 +1675,13 @@ class Dataset(DatasetBase):
                 source_df = source_df.with_columns(inliers_col)
 
             # Apply normalization
-            if self.config.normalizer_config is not None:
-                M = self._get_preprocessing_model(self.config.normalizer_config, for_fit=False)
-                if "normalizer" in source_df.columns:
-                    normalized_vals_col = M.predict_from_polars(vals_col, pl.col("normalizer"))
-                    source_df = source_df.with_columns(normalized_vals_col.alias(f"{vals_col_name}_normalized"))
-                else:
-                    print(f"Warning: 'normalizer' column not found for measure {measure}. Skipping normalization.")
+            # if self.config.normalizer_config is not None:
+            #     M = self._get_preprocessing_model(self.config.normalizer_config, for_fit=False)
+            #     if "normalizer" in source_df.columns:
+            #         normalized_vals_col = M.predict_from_polars(vals_col, pl.col("normalizer"))
+            #         source_df = source_df.with_columns(normalized_vals_col.alias(f"{vals_col_name}_normalized"))
+            #     else:
+            #         print(f"Warning: 'normalizer' column not found for measure {measure}. Skipping normalization.")
 
             result_df = source_df.drop(cols_to_drop_at_end)
             
@@ -1808,7 +1826,7 @@ class Dataset(DatasetBase):
         return melted_df
 
     @TimeableMixin.TimeAs
-    def build_DL_cached_representation(self, subject_ids: list[int] | None = None, do_sort_outputs: bool = False) -> DF_T:
+    def build_DL_cached_representation(self, subject_ids: list[int] | None = None, do_sort_outputs: bool = False, static_indices_vocab=None, dynamic_measurement_indices_vocab=None) -> DF_T:
         print("Starting build_DL_cached_representation")
         subject_measures, event_measures, dynamic_measures = [], [], ["dynamic_indices"]
         for m in self.unified_measurements_vocab[1:]:
@@ -1835,39 +1853,45 @@ class Dataset(DatasetBase):
         static_categorical_columns = ['Female', 'Married', 'GovIns', 'English', 'Veteran']
         static_continuous_columns = ['InitialA1c', 'AgeYears', 'SDI_score']
         all_static_columns = static_categorical_columns + static_continuous_columns
+        
+        # Create static_data first, avoiding duplicate columns
+        unique_columns = list(dict.fromkeys(["subject_id"] + all_static_columns))
+        static_data = subjects_df.select(*unique_columns)
 
-        # Create static_data, including discretized versions of continuous columns
-        unique_columns = list(dict.fromkeys(["subject_id"] + subject_measures + all_static_columns + [f"{col}_discretized" for col in static_continuous_columns]))
-        static_data = subjects_df.select(
-            *[pl.col(m) for m in unique_columns]
-        )
+        print("Sample of static_data before transformation:")
+        print(static_data.head())
 
-        # Use the create_static_indices_and_measurements function
-        static_indices_and_measurements = [
-            create_static_indices_and_measurements(row, self.static_indices_vocab, self.static_measurement_indices_vocab)
-            for row in static_data.select(static_categorical_columns + [f"{col}_discretized" for col in static_continuous_columns]).iter_rows(named=True)
-        ]
+        print("static_indices_vocab:", self.static_indices_vocab)
+        print("static_measurement_indices_vocab:", self.static_measurement_indices_vocab)
 
-        static_indices = [item[0] for item in static_indices_and_measurements]
-        static_measurement_indices = [item[1] for item in static_indices_and_measurements]
-
+        # Create static_indices column (only for categorical columns)
         static_data = static_data.with_columns([
-            pl.Series(name="static_indices", values=static_indices, dtype=pl.List(pl.UInt32)),
-            pl.Series(name="static_measurement_indices", values=static_measurement_indices, dtype=pl.List(pl.UInt32))
+            pl.struct(static_categorical_columns).map_elements(
+                lambda x: [
+                    self.static_indices_vocab[col].get(str(x[col]), 0)
+                    for col in static_categorical_columns if x[col] is not None
+                ]
+            ).cast(pl.List(pl.UInt32)).alias("static_indices")
         ])
 
-        # Remove any normalized columns if they exist
-        columns_to_drop = [f"{col}_normalized" for col in static_continuous_columns]
-        existing_columns = [col for col in columns_to_drop if col in static_data.columns]
-        if existing_columns:
-            static_data = static_data.drop(existing_columns)
+        # Create static_measurement_indices column (for all static columns)
+        static_data = static_data.with_columns([
+            pl.struct(all_static_columns).map_elements(
+                lambda x: [
+                    self.static_measurement_indices_vocab[col]
+                    for col in all_static_columns if x[col] is not None
+                ]
+            ).cast(pl.List(pl.UInt32)).alias("static_measurement_indices")
+        ])
 
-        # Remove temporary columns if they were created
-        temp_columns = [f"{col}_index" for col in static_categorical_columns] + [f"{col}_measurement_index" for col in static_categorical_columns]
-        existing_temp_columns = [col for col in temp_columns if col in static_data.columns]
-        if existing_temp_columns:
-            static_data = static_data.drop(existing_temp_columns)
+        print("Sample of static_data after transformation:")
+        print(static_data.head())
 
+        print("Sample values of static_indices:")
+        print(static_data['static_indices'].head())
+        print("Sample values of static_measurement_indices:")
+        print(static_data['static_measurement_indices'].head())
+        
         subject_id_dtype = pl.UInt32
         static_data = static_data.with_columns(pl.col("subject_id").cast(subject_id_dtype))
         events_df = events_df.with_columns(pl.col("subject_id").cast(subject_id_dtype))
@@ -1913,6 +1937,10 @@ class Dataset(DatasetBase):
         unexpected_values = set(unique_values.to_series().to_list()) - set([1, 2, 3])
         if unexpected_values:
             print(f"WARNING: Unexpected values found in dynamic_measurement_indices: {unexpected_values}")
+                
+        print("static_indices_vocab sample:", {k: v for k, v in list(static_indices_vocab.items())[:5]})
+        print("static_measurement_indices_vocab:", self.static_measurement_indices_vocab)
+        print("dynamic_measurement_indices_vocab:", event_type_mapping)
 
         event_data = events_df.select(
             "subject_id",
@@ -1924,30 +1952,18 @@ class Dataset(DatasetBase):
             dynamic_data,
             on="event_id",
             how="left"
-        ).join(
-            subjects_df.select("subject_id", "IndexDate"),
-            on="subject_id",
-            how="left"
         )
 
         # Add start_time column
         event_data = event_data.with_columns(pl.col("timestamp").min().over("subject_id").alias("start_time"))
 
         # Add time column (minutes since start_time)
-        event_data = event_data.with_columns(
-            ((pl.col("timestamp") - pl.col("start_time")).dt.total_minutes()).alias("time")
-        )
-
-        # Add time_to_index column
-        event_data = event_data.with_columns(
-            ((pl.col("timestamp") - pl.col("IndexDate")).dt.total_minutes()).alias("time_to_index")
-        )
+        event_data = event_data.with_columns((pl.col("timestamp") - pl.col("start_time")).dt.total_minutes().alias("time"))
 
         # Group by subject_id to create lists
         out = event_data.group_by("subject_id").agg([
             pl.col("start_time").first().alias("start_time"),
             pl.col("time").alias("time"),
-            pl.col("time_to_index").alias("time_to_index"),
             pl.col("dynamic_indices").alias("dynamic_indices"),
             pl.col("dynamic_measurement_indices").alias("dynamic_measurement_indices"),
             pl.col("dynamic_values").alias("dynamic_values")
@@ -1962,6 +1978,9 @@ class Dataset(DatasetBase):
         # Save dynamic_indices vocab and dynamic_measurement_indices vocab
         with open(self.config.save_dir / "dynamic_indices_vocab.json", "w") as f:
             json.dump(self.code_mapping, f, indent=2)
+        
+        with open(self.config.save_dir / "dynamic_measurement_indices_vocab.json", "w") as f:
+            json.dump(event_type_mapping, f, indent=2)
 
         return out
 

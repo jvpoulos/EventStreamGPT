@@ -927,11 +927,6 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
         if input_embeds is None:
             if batch is None:
                 raise ValueError("Either batch or input_embeds must be provided")
-            # Ensure batch contains the continuous static variables
-            if isinstance(batch, dict):
-                for var in ['SDI_score_normalized', 'AgeYears_normalized', 'InitialA1c_normalized']:
-                    if var not in batch:
-                        raise ValueError(f"Batch is missing {var}")
             input_embeds = self.input_layer(batch)
 
         # We don't need to handle NaNs here as they are only present in dynamic_values
