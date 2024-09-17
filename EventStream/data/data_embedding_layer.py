@@ -345,9 +345,6 @@ class DataEmbeddingLayer(torch.nn.Module):
         if not isinstance(indices, torch.Tensor):
             raise TypeError(f"'indices' must be a torch.Tensor, got {type(indices)}")
 
-        print(f"Indices shape: {indices.shape}, dtype: {indices.dtype}, device: {indices.device}")
-        print(f"Indices min: {indices.min()}, max: {indices.max()}")
-
         if self.oov_index is not None:
             indices = torch.where(indices >= self.n_total_embeddings, torch.tensor(self.oov_index, device=indices.device), indices)
         

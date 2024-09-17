@@ -36,6 +36,7 @@ class ESTForStreamClassification(nn.Module):
         self.oov_index = oov_index
         self.save_dir = save_dir
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.to(self.device)  # Move the entire model to the device
         
         self.encoder = ConditionallyIndependentPointProcessTransformer(config, vocabulary_config, oov_index=oov_index, save_dir=self.save_dir).to(self.device)
         
@@ -75,15 +76,18 @@ class ESTForStreamClassification(nn.Module):
         self.auprc = BinaryAveragePrecision().to(self.device)
         self.f1_score = BinaryF1Score().to(self.device)
 
-    def forward(self, dynamic_indices, dynamic_values=None, static_indices=None, static_measurement_indices=None, time=None, labels=None):
+    def forward(self, dynamic_indices, dynamic_values=None, dynamic_measurement_indices=None, static_indices=None, static_measurement_indices=None, time=None, labels=None):
+
         # Encode the input
         encoded = self.encoder(
             dynamic_indices=dynamic_indices,
             dynamic_values=dynamic_values,
+            dynamic_measurement_indices=dynamic_measurement_indices,
             static_indices=static_indices,
             static_measurement_indices=static_measurement_indices,
             time=time
         )
+
         event_encoded = encoded.last_hidden_state
 
         # Handle 4D input

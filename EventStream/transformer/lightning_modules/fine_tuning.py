@@ -451,7 +451,6 @@ class ESTForStreamClassificationLM(L.LightningModule):
             return None
         
         labels = batch.pop('labels').to(self.device)  # Move labels to the correct device
-        outputs = self.model(batch, labels=labels)
 
         # Log input data statistics
         logger.info(f"Validation step {batch_idx}: Input data stats:")
@@ -688,6 +687,7 @@ class FinetuneConfig:
     sweep: bool = False
     use_labs: bool = False
     do_debug_mode: bool = False
+    use_static_features: bool = False
     data_config: PytorchDatasetConfig = field(default_factory=PytorchDatasetConfig)
 
     save_dir: Optional[str] = (
@@ -915,10 +915,6 @@ class CollateFunction:
             if self.include_labels:
                 collated_batch['labels'] = torch.stack([item['labels'] for item in batch]).squeeze(1)
 
-            # Log shapes for debugging
-            for key, value in collated_batch.items():
-                self.logger.debug(f"{key} shape: {value.shape}, dtype: {value.dtype}")
-
             return collated_batch
         except Exception as e:
             self.logger.error(f"Error in collate function: {str(e)}")
@@ -981,31 +977,6 @@ class CollateFunction:
 def worker_init_fn(worker_id):
     np.random.seed(worker_id)
     random.seed(worker_id)
-
-def plot_confusion_matrix(y_true, y_pred, save_path):
-    cm = confusion_matrix(y_true, y_pred)
-    plt.figure(figsize=(10,7))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
-    plt.title('Confusion Matrix')
-    plt.ylabel('True label')
-    plt.xlabel('Predicted label')
-    plt.savefig(save_path)
-    plt.close()
-
-def plot_auc_curve(y_true, y_pred, save_path):
-    fpr, tpr, _ = roc_curve(y_true, y_pred)
-    roc_auc = auc(fpr, tpr)
-    plt.figure()
-    plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {roc_auc:.2f})')
-    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
-    plt.xlim([0.0, 1.0])
-    plt.ylim([0.0, 1.05])
-    plt.xlabel('False Positive Rate')
-    plt.ylabel('True Positive Rate')
-    plt.title('Receiver Operating Characteristic (ROC) Curve')
-    plt.legend(loc="lower right")
-    plt.savefig(save_path)
-    plt.close()
 
 @task_wrapper
 def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_config: VocabularyConfig, oov_index: int, wandb_logger: WandbLogger | None = None):
@@ -1071,30 +1042,17 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_c
             **model_params
         ).to(device)
 
+        if not cfg.use_static_features:
+            # Remove static features from the batch
+            for dataset in [train_pyd, tuning_pyd, held_out_pyd]:
+                dataset.static_indices = None
+                dataset.static_measurement_indices = None
+
         # Set the datasets
         LM.train_dataset = train_pyd
         LM.val_dataset = tuning_pyd
 
         logger.info(f"Train dataset length: {len(train_pyd)}")
-        for i in range(min(5, len(train_pyd))):
-            item = train_pyd[i]
-            # logger.info(f"Item {i}: {item}")
-            logger.info(f"Item {i} keys: {item.keys()}")
-            logger.info(f"Item {i} dynamic_indices shape: {item['dynamic_indices'].shape}")
-            logger.info(f"Item {i} dynamic_values shape: {item['dynamic_values'].shape}")
-            logger.info(f"Item {i} static_indices shape: {item['static_indices'].shape}")
-            logger.info(f"Item {i} static_measurement_indices shape: {item['static_measurement_indices'].shape}")
-            logger.info(f"Item {i} labels: {item['labels']}")
-
-        # # Check for maximum sequence length
-        # max_seq_len = max(max(len(item['dynamic_indices']) for item in train_pyd),
-        #                   max(len(item['dynamic_indices']) for item in tuning_pyd),
-        #                   max(len(item['dynamic_indices']) for item in held_out_pyd))
-        # logger.info(f"Maximum sequence length in datasets: {max_seq_len}")
-        # if max_seq_len > config.max_seq_len:
-        #     logger.warning(f"Maximum sequence length ({max_seq_len}) exceeds config.max_seq_len ({config.max_seq_len}). Updating config.")
-        #     config.max_seq_len = max_seq_len
-        
         logger.info("Creating data loaders")
         collate_fn = CollateFunction(config.vocab_size, oov_index, include_labels=True, static_size=8, max_seq_len=cfg.config.max_seq_len)
 
@@ -1186,39 +1144,8 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_c
         tuning_metrics = trainer.validate(model=LM, dataloaders=tuning_dataloader, ckpt_path="last") if len(tuning_pyd) > 0 else None
         held_out_metrics = trainer.test(model=LM, dataloaders=held_out_dataloader, ckpt_path="last") if len(held_out_pyd) > 0 else None
 
-        # Collect patient-level predictions and true labels
-        patient_predictions = {}
-        patient_true_labels = {}
-
-        LM.eval()
-        with torch.no_grad():
-            for batch in tuning_dataloader:
-                outputs = LM(batch)
-                preds = torch.sigmoid(outputs.preds).cpu().numpy()
-                labels = outputs.labels.cpu().numpy()
-                patient_ids = batch['patient_id'].cpu().numpy()
-
-                for patient_id, pred, label in zip(patient_ids, preds, labels):
-                    if patient_id not in patient_predictions:
-                        patient_predictions[patient_id] = []
-                        patient_true_labels[patient_id] = label
-                    patient_predictions[patient_id].append(pred)
-
-        # Aggregate predictions for each patient (e.g., by taking the mean)
-        patient_final_predictions = {patient_id: np.mean(preds) for patient_id, preds in patient_predictions.items()}
-
-        # Convert to arrays for plotting
-        y_true = np.array(list(patient_true_labels.values()))
-        y_pred = np.array(list(patient_final_predictions.values()))
-
-        # Plot confusion matrix
-        plot_confusion_matrix(y_true, y_pred > 0.5, os.path.join(cfg.save_dir, 'confusion_matrix.png'))
-
-        # Plot AUC curve
-        plot_auc_curve(y_true, y_pred, os.path.join(cfg.save_dir, 'auc_curve.png'))
-    
         logger.info("Evaluation completed.")
-        
+
         return None, tuning_metrics, held_out_metrics
 
     except Exception as e:

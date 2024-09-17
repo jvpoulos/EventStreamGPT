@@ -150,97 +150,109 @@ class InnerSelfAttention(nn.Module):
         self.out_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
 
     def _split_heads(self, tensor, num_heads, attn_head_size):
+        logger.debug(f"_split_heads - Input tensor shape: {tensor.shape}")
         if tensor.dim() == 3:
-            # Handle 3D tensors (batch_size, seq_length, hidden_size)
-            new_shape = tensor.size()[:-1] + (num_heads, attn_head_size)
-            tensor = tensor.view(new_shape)
+            batch_size, seq_length, hidden_size = tensor.size()
+            tensor = tensor.view(batch_size, seq_length, num_heads, attn_head_size)
             return tensor.permute(0, 2, 1, 3)  # (batch, head, seq_length, head_features)
         elif tensor.dim() == 4:
-            # Handle 4D tensors (batch_size, seq_length, dep_graph_len, hidden_size)
-            batch_size, seq_len, dep_graph_len, hidden_size = tensor.shape
-            tensor = tensor.view(batch_size, seq_len * dep_graph_len, num_heads, attn_head_size)
+            batch_size, seq_length, dep_graph_len, hidden_size = tensor.size()
+            tensor = tensor.view(batch_size, seq_length * dep_graph_len, num_heads, attn_head_size)
             return tensor.permute(0, 2, 1, 3)  # (batch, head, seq_length * dep_graph_len, head_features)
         else:
             raise ValueError(f"Unexpected tensor shape: {tensor.shape}")
 
     def _merge_heads(self, tensor, num_heads, attn_head_size):
-        if tensor.dim() == 4:
-            # Handle 4D tensors (batch, head, seq_length, head_features)
-            tensor = tensor.permute(0, 2, 1, 3).contiguous()
-            new_shape = tensor.size()[:-2] + (num_heads * attn_head_size,)
-            return tensor.view(new_shape)
-        else:
-            raise ValueError(f"Unexpected tensor shape: {tensor.shape}")
+        """
+        Merges attn_head_size dim and num_attn_heads dim into hidden_size
+        """
+        logger.debug(f"_merge_heads - Input tensor shape: {tensor.shape}")
+        batch_size, _, seq_length, _ = tensor.size()
+        tensor = tensor.permute(0, 2, 1, 3).contiguous()
+        merged = tensor.view(batch_size, seq_length, num_heads * attn_head_size)
+        logger.debug(f"_merge_heads - Output tensor shape: {merged.shape}")
+        return merged
 
     def _attn(self, query, key, value, attention_mask=None, head_mask=None):
         """Performs the attention operation.
-
         Args:
             query: The query tensor.
             key: The key tensor.
             value: The value tensor.
             attention_mask: A mask to be applied on the attention weights.
             head_mask: A mask to be applied on the attention heads.
-
         Returns:
             A tuple containing the output of the attention operation and the attention weights.
         """
+        logger.debug(f"Query shape: {query.shape}")
+        logger.debug(f"Key shape: {key.shape}")
+        logger.debug(f"Value shape: {value.shape}")
+        if attention_mask is not None:
+            logger.debug(f"Original attention mask shape: {attention_mask.shape}")
 
-        if self.use_flash_attention:
-            # Reshape inputs for Flash Attention
-            qkv = torch.stack([query, key, value], dim=2)
-            qkv = qkv.transpose(0, 1).contiguous()  # [seqlen, bsz, 3, num_heads, head_dim]
+        bsz, num_heads, seq_len, head_dim = query.shape
+
+        if self.use_flash_attention and not self.config.use_cache:
+            try:
+                # Reshape inputs for Flash Attention
+                qkv = torch.stack([query, key, value], dim=2)
+                qkv = qkv.transpose(1, 2).contiguous()  # [bsz, seq_len, 3, num_heads, head_dim]
+                
+                # Call Flash Attention
+                attn_output = flash_attn_qkvpacked_func(
+                    qkv,
+                    dropout_p=self.attn_dropout.p if self.training else 0.0,
+                    softmax_scale=None,  # Let the function use default scale
+                    causal=self.causal
+                )
+                
+                # Reshape output
+                attn_output = attn_output.transpose(1, 2)  # [bsz, num_heads, seq_len, head_dim]
+                return attn_output, None  # Flash Attention doesn't return attention weights
+            except RuntimeError as e:
+                logger.warning(f"Flash Attention failed: {str(e)}. Falling back to standard attention.")
+
+        # Standard attention implementation
+        attn_weights = torch.matmul(query, key.transpose(-1, -2)) / math.sqrt(self.head_dim)
+
+        if self.causal:
+            causal_mask = torch.triu(torch.ones(seq_len, seq_len, dtype=torch.bool, device=query.device), diagonal=1)
+            causal_mask = causal_mask.view(1, 1, seq_len, seq_len).expand(bsz, num_heads, -1, -1)
+            attn_weights = attn_weights.masked_fill(causal_mask, float('-inf'))
+
+        if attention_mask is not None:
+            # Ensure attention_mask is on the same device as query
+            attention_mask = attention_mask.to(query.device)
+
+            # Reshape attention_mask to match the expected dimensions
+            if attention_mask.dim() == 2:
+                attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+            elif attention_mask.dim() == 3:
+                attention_mask = attention_mask.unsqueeze(1)
+
+            # Adjust the sequence length dimension of the attention mask
+            if attention_mask.size(-1) != seq_len:
+                if attention_mask.size(-1) < seq_len:
+                    attention_mask = F.pad(attention_mask, (0, seq_len - attention_mask.size(-1)), value=float('-inf'))
+                else:
+                    attention_mask = attention_mask[..., :seq_len]
+
+            # Expand attention_mask to match attn_weights shape
+            attention_mask = attention_mask.expand(bsz, num_heads, seq_len, seq_len)
             
-            # Call Flash Attention
-            context = flash_attn_qkvpacked_func(
-                qkv,
-                dropout_p=self.attn_dropout.p if self.training else 0.0,
-                softmax_scale=None,  # Let the function use default scale
-                causal=self.causal
-            )
-            
-            # Reshape output
-            context = context.transpose(0, 1)  # [bsz, seqlen, num_heads, head_dim]
-            return context, None  # Flash Attention doesn't return attention weights
-        else:
-            # Keep the attention weights computation in fp32 to avoid overflow issues
-            query = query.to(torch.float32)
-            key = key.to(torch.float32)
+            # Apply attention mask
+            attn_weights = attn_weights + attention_mask
 
-            # query, key, and value are all of shape (batch, head, seq_length, head_features)
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1)
+        attn_weights = self.attn_dropout(attn_weights)
 
-            attn_weights = torch.matmul(query, key.transpose(-1, -2))
-            # attn_weights is of shape batch, head, query_seq_length, key_seq_length
+        if head_mask is not None:
+            attn_weights = attn_weights * head_mask
 
-            # Move the tensors to the appropriate device
-            query = query.to(attn_weights.device)
-            key = key.to(attn_weights.device)
-            value = value.to(attn_weights.device)
+        attn_output = torch.matmul(attn_weights, value)
 
-            query_length, key_length = query.size(-2), key.size(-2)
-            causal_mask = self.bias[:, :, key_length - query_length : key_length, :key_length].to(torch.bool)
-            mask_value = torch.finfo(attn_weights.dtype).min
-            # Need to be a tensor, otherwise we get error:
-            # `RuntimeError: expected scalar type float but found double`.
-            # Need to be on the same device, otherwise `RuntimeError: ..., x and y to be on the same device`
-            mask_value = torch.tensor(mask_value, dtype=attn_weights.dtype).to(attn_weights.device)
-            attn_weights = torch.where(causal_mask, attn_weights, mask_value)
-
-            if attention_mask is not None:
-                # Apply the attention mask
-                attn_weights = attn_weights + attention_mask
-
-            attn_weights = nn.functional.softmax(attn_weights, dim=-1)
-            attn_weights = attn_weights.to(value.dtype)
-            attn_weights = self.attn_dropout(attn_weights)
-
-            # Mask heads if we want to
-            if head_mask is not None:
-                attn_weights = attn_weights * head_mask
-
-            attn_output = torch.matmul(attn_weights, value)
-
-            return attn_output, attn_weights
+        logger.debug(f"Attention output shape: {attn_output.shape}")
+        return attn_output, attn_weights
 
     def forward(
         self,
@@ -252,25 +264,19 @@ class InnerSelfAttention(nn.Module):
         output_attentions=False,
         static_kv_first: bool = False,
     ):
-        original_shape = hidden_states.shape
-        if hidden_states.dim() == 4:
-            # For 4D input, reshape to 3D for compatibility with linear layers
-            batch_size, seq_len, dep_graph_len, hidden_size = hidden_states.shape
-            hidden_states = hidden_states.view(-1, hidden_size)
-
+        logger.debug(f"InnerSelfAttention input hidden_states shape: {hidden_states.shape}")
+        
         query = self.q_proj(hidden_states)
         key = self.k_proj(hidden_states)
         value = self.v_proj(hidden_states)
 
-        # Reshape back to 4D if necessary
-        if len(original_shape) == 4:
-            query = query.view(*original_shape)
-            key = key.view(*original_shape)
-            value = value.view(*original_shape)
-
         query = self._split_heads(query, self.num_heads, self.head_dim)
         key = self._split_heads(key, self.num_heads, self.head_dim)
         value = self._split_heads(value, self.num_heads, self.head_dim)
+
+        logger.debug(f"Query shape after split_heads: {query.shape}")
+        logger.debug(f"Key shape after split_heads: {key.shape}")
+        logger.debug(f"Value shape after split_heads: {value.shape}")
 
         if static_kv_first:
             query = query[:, :, 1:, :]
@@ -283,14 +289,13 @@ class InnerSelfAttention(nn.Module):
         present = (key, value) if use_cache else None
 
         attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask)
+        logger.debug(f"Attention output shape after _attn: {attn_output.shape}")
 
         attn_output = self._merge_heads(attn_output, self.num_heads, self.head_dim)
+        logger.debug(f"Attention output shape after _merge_heads: {attn_output.shape}")
+
         attn_output = self.out_proj(attn_output)
         attn_output = self.resid_dropout(attn_output)
-
-        # Reshape output back to 4D if necessary
-        if len(original_shape) == 4:
-            attn_output = attn_output.view(*original_shape)
 
         outputs = {"present_key_value": present}
         if output_attentions:
@@ -777,73 +782,95 @@ class ConditionallyIndependentPointProcessInputLayer(nn.Module):
         self.static_embedding = nn.Embedding(config.vocab_size, config.hidden_size)
         self.time_embedding = nn.Linear(1, config.hidden_size)
 
-    def forward(self, batch: dict | torch.Tensor) -> torch.Tensor:
+    def forward(self, batch: Union[dict, torch.Tensor]) -> torch.Tensor:
+        logger.debug("Entering ConditionallyIndependentPointProcessInputLayer.forward")
         if isinstance(batch, dict):
-            dynamic_indices = batch['dynamic_indices']
+            logger.debug(f"Batch keys: {batch.keys()}")
+            for key, value in batch.items():
+                if isinstance(value, torch.Tensor):
+                    logger.debug(f"{key} shape: {value.shape}")
+            
+            dynamic_indices = batch.get('dynamic_indices')
             dynamic_values = batch.get('dynamic_values')
             dynamic_measurement_indices = batch.get('dynamic_measurement_indices')
             static_indices = batch.get('static_indices')
+            static_measurement_indices = batch.get('static_measurement_indices')
             time = batch.get('time')
-
-            data_embed: torch.Tensor = self.data_embedding_layer({
-                'dynamic_indices': dynamic_indices,
-                'dynamic_values': dynamic_values,
-                'dynamic_measurement_indices': dynamic_measurement_indices
-            })
-                
-            # Ensure data_embed is 3D: [batch_size, seq_len, hidden_size]
-            if len(data_embed.shape) == 2:
-                batch_size, total_elements = data_embed.shape
-                hidden_size = self.config.hidden_size
-                seq_len = total_elements // hidden_size
-                data_embed = data_embed.view(batch_size, seq_len, hidden_size)
-
-            max_seq_len = data_embed.shape[1]
-
-            # Process dynamic values
-            if dynamic_values is not None:
-                dynamic_values = dynamic_values[:, :max_seq_len]
-                mask = ~torch.isnan(dynamic_values)
-                valid_values = dynamic_values[mask]
-
-                if valid_values.numel() > 0:
-                    valid_values_normalized = self.dynamic_values_norm(valid_values.unsqueeze(1)).squeeze(1)
-                    valid_values_embed = self.dynamic_values_encoder(valid_values_normalized.unsqueeze(-1))
-                    valid_values_embed = valid_values_embed.to(dtype=data_embed.dtype)
-
-                    batch_size, seq_len = dynamic_values.shape
-                    hidden_size = self.config.hidden_size
-
-                    reshaped_valid_values_embed = torch.zeros(batch_size, seq_len, hidden_size, device=valid_values_embed.device, dtype=valid_values_embed.dtype)
-                    reshaped_valid_values_embed[mask] = valid_values_embed.squeeze(1)
-
-                    data_embed = torch.where(mask.unsqueeze(-1), reshaped_valid_values_embed, data_embed)
-
-            # Process static indices
-            if static_indices is not None:
-                static_embed = self.static_embedding(static_indices)
-                if self.use_addition_for_static:
-                    data_embed += static_embed.mean(dim=1).unsqueeze(1)
-                else:
-                    static_embed = static_embed.unsqueeze(1).expand(-1, max_seq_len, -1)
-                    data_embed = torch.cat([data_embed, static_embed], dim=-1)
-
-            # Process time
-            if time is not None:
-                time = time[:, :max_seq_len]
-                time_embed = self.time_embedding(time.unsqueeze(-1))
-                data_embed = data_embed + time_embed
-
-            # Ensure final data_embed has the correct shape
-            if data_embed.size(-1) != self.config.hidden_size:
-                logger.warning(f"Mismatch in embedding dimension: {data_embed.size(-1)} vs {self.config.hidden_size}")
-                data_embed = data_embed[..., :self.config.hidden_size]
-
-            return self.embedding_dropout(data_embed)
         elif isinstance(batch, torch.Tensor):
-            return self.data_embedding_layer(batch)
+            dynamic_indices = batch
+            dynamic_values = None
+            static_indices = None
+            static_measurement_indices = None
+            time = None
         else:
             raise TypeError("Input 'batch' should be a dictionary or a Tensor.")
+
+        logger.debug(f"dynamic_indices shape: {dynamic_indices.shape if dynamic_indices is not None else None}")
+        logger.debug(f"dynamic_values shape: {dynamic_values.shape if dynamic_values is not None else None}")
+        logger.debug(f"dynamic_measurement_indices shape: {dynamic_measurement_indices.shape if dynamic_measurement_indices is not None else None}")
+        logger.debug(f"static_indices shape: {static_indices.shape if static_indices is not None else None}")
+        logger.debug(f"static_measurement_indices shape: {static_measurement_indices.shape if static_measurement_indices is not None else None}")
+        logger.debug(f"time shape: {time.shape if time is not None else None}")
+
+        data_embed: torch.Tensor = self.data_embedding_layer({
+            'dynamic_indices': dynamic_indices,
+            'dynamic_values': dynamic_values,
+            'dynamic_measurement_indices': dynamic_measurement_indices
+        })
+
+        logger.debug(f"data_embed shape after data_embedding_layer: {data_embed.shape}")
+            
+        # Ensure data_embed is 3D: [batch_size, seq_len, hidden_size]
+        if len(data_embed.shape) == 2:
+            batch_size, total_elements = data_embed.shape
+            hidden_size = self.config.hidden_size
+            seq_len = total_elements // hidden_size
+            data_embed = data_embed.view(batch_size, seq_len, hidden_size)
+
+        max_seq_len = data_embed.shape[1]
+
+        # Process dynamic values
+        if dynamic_values is not None:
+            dynamic_values = dynamic_values[:, :max_seq_len]
+            mask = ~torch.isnan(dynamic_values)
+            valid_values = dynamic_values[mask]
+
+            if valid_values.numel() > 0:
+                valid_values_normalized = self.dynamic_values_norm(valid_values.unsqueeze(1)).squeeze(1)
+                valid_values_embed = self.dynamic_values_encoder(valid_values_normalized.unsqueeze(-1))
+                valid_values_embed = valid_values_embed.to(dtype=data_embed.dtype)
+
+                batch_size, seq_len = dynamic_values.shape
+                hidden_size = self.config.hidden_size
+
+                reshaped_valid_values_embed = torch.zeros(batch_size, seq_len, hidden_size, device=valid_values_embed.device, dtype=valid_values_embed.dtype)
+                reshaped_valid_values_embed[mask] = valid_values_embed.squeeze(1)
+
+                data_embed = torch.where(mask.unsqueeze(-1), reshaped_valid_values_embed, data_embed)
+
+        # Process static indices
+        if static_indices is not None:
+            static_embed = self.static_embedding(static_indices)
+            if self.use_addition_for_static:
+                data_embed += static_embed.mean(dim=1).unsqueeze(1)
+            else:
+                static_embed = static_embed.unsqueeze(1).expand(-1, max_seq_len, -1)
+                data_embed = torch.cat([data_embed, static_embed], dim=-1)
+
+        # Process time
+        if time is not None:
+            time = time[:, :max_seq_len]
+            time_embed = self.time_embedding(time.unsqueeze(-1))
+            data_embed = data_embed + time_embed
+
+        # Ensure final data_embed has the correct shape
+        if data_embed.size(-1) != self.config.hidden_size:
+            logger.warning(f"Mismatch in embedding dimension: {data_embed.size(-1)} vs {self.config.hidden_size}")
+            data_embed = data_embed[..., :self.config.hidden_size]
+
+        logger.debug(f"Final data_embed shape: {data_embed.shape}")
+        logger.debug("Exiting ConditionallyIndependentPointProcessInputLayer.forward")
+        return self.embedding_dropout(data_embed)
 
 class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTrainedModel):
     def __init__(self, config: StructuredTransformerConfig, vocabulary_config: VocabularyConfig, oov_index: int, save_dir: str = "./model_outputs"):
@@ -880,6 +907,7 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
         self,
         dynamic_indices: Union[torch.Tensor, Dict[str, torch.Tensor]],
         dynamic_values: torch.Tensor | None = None,
+        dynamic_measurement_indices: torch.Tensor | None = None,
         static_indices: torch.Tensor | None = None,
         static_measurement_indices: torch.Tensor | None = None,
         time: torch.Tensor | None = None,
@@ -892,6 +920,14 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
         output_hidden_states: bool | None = None,
         return_dict: bool | None = None,
     ) -> tuple[torch.Tensor] | TransformerOutputWithPast:
+
+        logger.debug("Entering ConditionallyIndependentPointProcessTransformer.forward")
+        logger.debug(f"Input shapes: dynamic_indices: {dynamic_indices.shape if isinstance(dynamic_indices, torch.Tensor) else type(dynamic_indices)}, "
+                     f"dynamic_values: {dynamic_values.shape if dynamic_values is not None else None}, "
+                    f"dynamic_measurement_indices: {dynamic_measurement_indices.shape if dynamic_measurement_indices is not None else None}, "
+                     f"static_indices: {static_indices.shape if static_indices is not None else None}, "
+                     f"static_measurement_indices: {static_measurement_indices.shape if static_measurement_indices is not None else None}, "
+                     f"time: {time.shape if time is not None else None}")
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         use_cache = use_cache if use_cache is not None else self.config.use_cache
@@ -901,15 +937,33 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
             past = tuple([None] * len(self.h))
 
         if input_embeds is None:
+            logger.debug("Generating input embeddings")
+            if isinstance(dynamic_indices, dict):
+                logger.debug(f"dynamic_indices keys: {dynamic_indices.keys()}")
+                dynamic_indices = dynamic_indices.get('dynamic_indices')
+            
+            if dynamic_indices is None:
+                logger.error("dynamic_indices is None")
+                raise ValueError("dynamic_indices cannot be None")
+
             input_embeds = self.input_layer({
                 'dynamic_indices': dynamic_indices,
                 'dynamic_values': dynamic_values,
+                'dynamic_measurement_indices': dynamic_measurement_indices,
                 'static_indices': static_indices,
                 'static_measurement_indices': static_measurement_indices,
                 'time': time
             })
+        else:
+            logger.debug("Using provided input embeddings")
+
+        if input_embeds is None:
+            logger.error("input_embeds is None after processing")
+            raise ValueError("Failed to generate input embeddings")
 
         hidden_states = input_embeds
+        logger.debug(f"hidden_states shape after input layer: {hidden_states.shape}")
+
         original_shape = hidden_states.shape
 
         if seq_attention_mask is None:
@@ -977,6 +1031,7 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
         if not return_dict:
             return tuple(v for v in [hidden_states, presents, all_hidden_states, all_self_attentions] if v is not None)
 
+        logger.debug("Exiting ConditionallyIndependentPointProcessTransformer.forward")
         return TransformerOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=presents,
