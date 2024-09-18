@@ -102,14 +102,12 @@ class ESTForStreamClassification(nn.Module):
         else:
             raise ValueError(f"Unknown pooling method: {self.config.task_specific_params['pooling_method']}")
 
-        # Process static indices
-        if static_indices is not None:
+        # Process static indices only if use_static_features is True
+        if self.config.use_static_features and static_indices is not None:
             static_embed = self.static_indices_embedding(static_indices).mean(dim=1)
+            combined_embed = self.static_weight * static_embed + self.dynamic_weight * pooled_dynamic
         else:
-            static_embed = torch.zeros_like(pooled_dynamic)
-
-        # Combine embeddings
-        combined_embed = self.static_weight * static_embed + self.dynamic_weight * pooled_dynamic
+            combined_embed = pooled_dynamic
         
         # Process through intermediate layers
         intermediate = self.intermediate(combined_embed)

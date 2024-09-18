@@ -105,6 +105,12 @@ class ESTForStreamClassificationLM(L.LightningModule):
         self.train_metrics = {}
         self.val_metrics = {}
         self.test_metrics = {}
+
+        # Initialize prediction storage
+        self.val_predictions = []
+        self.val_labels = []
+        self.test_predictions = []
+        self.test_labels = []
         
         # Set optimization parameters
         self.learning_rate = self.optimization_config.init_lr
@@ -127,6 +133,8 @@ class ESTForStreamClassificationLM(L.LightningModule):
 
         self.train_dataset = None
         self.val_dataset = None
+
+        self.use_static_features = cfg.use_static_features
 
         # Load the vocabulary_config from a file
         vocabulary_config_path = "/home/jvp/diabetes_pred/data/labs/vocabulary_config.json"
@@ -473,10 +481,9 @@ class ESTForStreamClassificationLM(L.LightningModule):
             if torch.isnan(param).any() or torch.isinf(param).any():
                 logger.warning(f"NaN or Inf detected in model parameter: {name}")
         
-        # Save validation predictions at each epoch
-        predictions_path = os.path.join(self.save_dir, "predictions", f"val_predictions_epoch_{self.current_epoch}.pt")
-        os.makedirs(os.path.dirname(predictions_path), exist_ok=True)
-        torch.save(outputs.preds, predictions_path)
+        # Store predictions and labels
+        self.val_predictions.append(outputs.preds.detach().cpu())
+        self.val_labels.append(labels.detach().cpu())
 
         self.log_metrics('val', outputs)
         return outputs.loss
@@ -490,10 +497,9 @@ class ESTForStreamClassificationLM(L.LightningModule):
         outputs = self.model(batch, labels=labels)
         loss = outputs.loss
 
-        # Save test predictions at each epoch (instead of each step)
-        predictions_path = os.path.join(self.save_dir, "predictions", f"test_predictions_epoch_{self.current_epoch}.pt")
-        os.makedirs(os.path.dirname(predictions_path), exist_ok=True)
-        torch.save(outputs.preds, predictions_path)
+        # Store predictions and labels
+        self.test_predictions.append(outputs.preds.detach().cpu())
+        self.test_labels.append(labels.detach().cpu())
 
         self.log_metrics('test', outputs)
 
@@ -567,6 +573,21 @@ class ESTForStreamClassificationLM(L.LightningModule):
         self.gradient_norm_changes = []
 
     def on_validation_epoch_end(self):
+        # Concatenate all predictions and labels
+        all_preds = torch.cat(self.val_predictions)
+        all_labels = torch.cat(self.val_labels)
+
+        # Save predictions and labels for the entire validation set
+        predictions_path = os.path.join(self.save_dir, "predictions", f"val_predictions_epoch_{self.current_epoch}.pt")
+        labels_path = os.path.join(self.save_dir, "labels", f"val_labels_epoch_{self.current_epoch}.pt")
+        os.makedirs(os.path.dirname(predictions_path), exist_ok=True)
+        os.makedirs(os.path.dirname(labels_path), exist_ok=True)
+        torch.save(all_preds, predictions_path)
+        torch.save(all_labels, labels_path)
+
+        # Clear the lists for the next epoch
+        self.val_predictions = []
+        self.val_labels = []
         self.log_accumulated_metrics('val')
 
     def _load_code_mapping(self):
@@ -578,6 +599,7 @@ class ESTForStreamClassificationLM(L.LightningModule):
             raise FileNotFoundError("Code mapping file not found. Please run preprocessing first.")
 
     def forward(self, batch, **kwargs):
+        self.logger.info(f"Forward method input keys: {locals().keys()}")
         # Move batch to the correct device
         if isinstance(batch, dict):
             batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
@@ -587,26 +609,21 @@ class ESTForStreamClassificationLM(L.LightningModule):
         else:
             raise TypeError("Input 'batch' should be a dictionary.")
 
-        dynamic_indices = batch.get("dynamic_indices")
-        dynamic_values = batch.get("dynamic_values")
-        static_indices = batch.get("static_indices")
-        static_measurement_indices = batch.get("static_measurement_indices")
-        time = batch.get("time")
-        labels = batch.get("labels")
-
-        if dynamic_indices is None:
-            raise ValueError("'dynamic_indices' must be provided in the batch.")
-
         # Move kwargs tensors to the correct device
         kwargs = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in kwargs.items()}
 
+        if not self.cfg.use_static_features:
+            batch.pop('static_indices', None)
+            batch.pop('static_measurement_indices', None)
+
         outputs = self.model(
-            dynamic_indices=dynamic_indices,
-            dynamic_values=dynamic_values,
-            static_indices=static_indices,
-            static_measurement_indices=static_measurement_indices,
-            time=time,
-            labels=labels,
+            dynamic_indices=batch.get("dynamic_indices"),
+            dynamic_values=batch.get("dynamic_values"),
+            dynamic_measurement_indices=batch.get("dynamic_measurement_indices"),
+            static_indices=batch.get("static_indices"),
+            static_measurement_indices=batch.get("static_measurement_indices"),
+            time=batch.get("time"),
+            labels=batch.get("labels"),
             **kwargs
         )
 
@@ -618,6 +635,22 @@ class ESTForStreamClassificationLM(L.LightningModule):
         return outputs
 
     def on_test_epoch_end(self):
+        # Concatenate all predictions and labels
+        all_preds = torch.cat(self.test_predictions)
+        all_labels = torch.cat(self.test_labels)
+
+        # Save predictions and labels for the entire test set
+        predictions_path = os.path.join(self.save_dir, "predictions", f"test_predictions_epoch_{self.current_epoch}.pt")
+        labels_path = os.path.join(self.save_dir, "labels", f"test_labels_epoch_{self.current_epoch}.pt")
+        os.makedirs(os.path.dirname(predictions_path), exist_ok=True)
+        os.makedirs(os.path.dirname(labels_path), exist_ok=True)
+        torch.save(all_preds, predictions_path)
+        torch.save(all_labels, labels_path)
+
+        # Clear the lists
+        self.test_predictions = []
+        self.test_labels = []
+
         self._log_epoch_metrics('test')
 
     def configure_optimizers(self):
@@ -687,7 +720,7 @@ class FinetuneConfig:
     sweep: bool = False
     use_labs: bool = False
     do_debug_mode: bool = False
-    use_static_features: bool = False
+    use_static_features: bool = True
     data_config: PytorchDatasetConfig = field(default_factory=PytorchDatasetConfig)
 
     save_dir: Optional[str] = (
@@ -887,15 +920,18 @@ class FinetuneConfig:
             self.wandb_logger_kwargs["project"] = reloaded_pretrain_config.wandb_logger_kwargs.project
 
 class CollateFunction:
-    def __init__(self, vocab_size, oov_index, include_labels=True, static_size=8, max_seq_len=None):
+    def __init__(self, vocab_size, oov_index, include_labels=True, static_size=8, max_seq_len=None, use_static_features=True):
         self.vocab_size = vocab_size
         self.oov_index = oov_index
         self.include_labels = include_labels
         self.static_size = static_size
         self.max_seq_len = max_seq_len
+        self.use_static_features = use_static_features
         self.logger = logging.getLogger(__name__)
+        self.logger.info(f"CollateFunction initialized with use_static_features: {self.use_static_features}")
 
     def __call__(self, batch):
+        self.logger.info(f"CollateFunction use_static_features: {self.use_static_features}")
         try:
             # Filter out None items
             batch = [item for item in batch if item is not None]
@@ -907,14 +943,17 @@ class CollateFunction:
                 'dynamic_indices': torch.stack([self.pad_sequence(item['dynamic_indices'], self.max_seq_len) for item in batch]),
                 'dynamic_values': torch.stack([self.pad_sequence(item['dynamic_values'], self.max_seq_len, pad_value=0.0) for item in batch]),
                 'dynamic_measurement_indices': torch.stack([self.pad_sequence(item['dynamic_measurement_indices'], self.max_seq_len) for item in batch]),
-                'static_indices': torch.stack([self.pad_sequence(item['static_indices'], self.static_size) for item in batch]),
-                'static_measurement_indices': torch.stack([self.pad_sequence(item['static_measurement_indices'], self.static_size) for item in batch]),
                 'time': torch.stack([self.pad_sequence(item['time'], self.max_seq_len, pad_value=0.0) for item in batch]),
             }
+
+            if self.use_static_features:
+                collated_batch['static_indices'] = torch.stack([self.pad_sequence(item['static_indices'], self.static_size) for item in batch])
+                collated_batch['static_measurement_indices'] = torch.stack([self.pad_sequence(item['static_measurement_indices'], self.static_size) for item in batch])
 
             if self.include_labels:
                 collated_batch['labels'] = torch.stack([item['labels'] for item in batch]).squeeze(1)
 
+            self.logger.info(f"Collated batch keys: {collated_batch.keys()}")
             return collated_batch
         except Exception as e:
             self.logger.error(f"Error in collate function: {str(e)}")
@@ -988,6 +1027,9 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_c
     logger.info(f"Tuning dataset length: {len(tuning_pyd)}")
     logger.info(f"Held-out dataset length: {len(held_out_pyd)}")
 
+    logger.info(f"FinetuneConfig use_static_features: {cfg.use_static_features}")
+    logger.info(f"Config use_static_features: {cfg.config.use_static_features}")
+
     try:
         # Update data config
         cfg.update_data_config()
@@ -1054,7 +1096,15 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_c
 
         logger.info(f"Train dataset length: {len(train_pyd)}")
         logger.info("Creating data loaders")
-        collate_fn = CollateFunction(config.vocab_size, oov_index, include_labels=True, static_size=8, max_seq_len=cfg.config.max_seq_len)
+        logger.info(f"cfg.use_static_features: {cfg.use_static_features}")
+        collate_fn = CollateFunction(
+            vocab_size=config.vocab_size,
+            oov_index=oov_index,
+            include_labels=True,
+            static_size=8,
+            max_seq_len=cfg.config.max_seq_len,
+            use_static_features=cfg.use_static_features
+        )
 
         train_dataloader = DataLoader(
             train_pyd,
