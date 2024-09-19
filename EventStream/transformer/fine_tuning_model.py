@@ -130,7 +130,7 @@ class ESTForStreamClassification(nn.Module):
         
         return StreamClassificationModelOutput(
             loss=loss,
-            preds=logits,
+            preds=probs,
             labels=labels if labels is not None else None,
             accuracy=accuracy,
             auc=auc,
