@@ -9,6 +9,7 @@ e3cc4487fe66e03ec85970ea2db8e5fb34c455f4/src/transformers/models/gpt_neo/modelin
 
 import math
 import os
+import numpy as np
 
 import torch
 import torch.utils.checkpoint
@@ -82,7 +83,6 @@ def expand_mask(mask: torch.BoolTensor, dtype: torch.dtype) -> torch.Tensor:
     attention_mask = (1.0 - attention_mask) * torch.finfo(dtype).min
 
     return attention_mask
-
 
 class InnerSelfAttention(nn.Module):
     """This class implements the inner self-attention mechanism.
@@ -302,7 +302,7 @@ class InnerSelfAttention(nn.Module):
             outputs["attn_weights"] = attn_weights
 
         return attn_output, outputs
-
+        
 class CustomLayerNorm(nn.Module):
     def __init__(self, normalized_shape, eps=1e-5):
         super().__init__()

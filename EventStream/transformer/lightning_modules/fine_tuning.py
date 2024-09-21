@@ -49,6 +49,7 @@ from ...data.pytorch_dataset import PytorchDataset
 from ...utils import hydra_dataclass, task_wrapper
 from ..config import OptimizationConfig, StructuredTransformerConfig
 from ..fine_tuning_model import ESTForStreamClassification
+from ..transformer import InnerSelfAttention
 from ..model_output import StreamClassificationModelOutput
 from ..utils import str_summary
 
@@ -65,6 +66,10 @@ import numpy as np
 from torch.cuda.amp import autocast, GradScaler
 
 from dataclasses import dataclass, field
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import confusion_matrix, roc_curve, auc
 
 # Configure the logger
 logger = logging.getLogger(__name__)
@@ -99,7 +104,7 @@ class ESTForStreamClassificationLM(L.LightningModule):
         self.gradient_norm_changes = []
         self.max_outliers_to_log = 10
         self.batch_indices = []  # Store batch indices instead of subject_ids
-        self.current_epoch = 0
+        self._epoch_counter = 0
         
         # Initialize metrics dictionaries
         self.train_metrics = {}
@@ -188,10 +193,27 @@ class ESTForStreamClassificationLM(L.LightningModule):
         # Initialize metric accumulator
         self.metric_accumulator = defaultdict(list)
 
-    def on_train_epoch_start(self):
-        self.current_epoch += 1
-        if hasattr(self.model.encoder, 'current_epoch'):
-            self.model.encoder.current_epoch = self.current_epoch
+    def on_validation_start(self):
+        self.model.eval()
+        for module in self.model.modules():
+            if isinstance(module, InnerSelfAttention):
+                module.inference_mode = True
+
+    def on_validation_end(self):
+        for module in self.model.modules():
+            if isinstance(module, InnerSelfAttention):
+                module.inference_mode = False
+
+    def on_test_start(self):
+        self.model.eval()
+        for module in self.model.modules():
+            if isinstance(module, InnerSelfAttention):
+                module.inference_mode = True
+
+    def on_test_end(self):
+        for module in self.model.modules():
+            if isinstance(module, InnerSelfAttention):
+                module.inference_mode = False
         
     def train_dataloader(self):
         return DataLoader(
@@ -363,42 +385,6 @@ class ESTForStreamClassificationLM(L.LightningModule):
         else:
             raise ValueError(f"{self.config.problem_type} not valid")
 
-    def _log_metric_dict(
-        self,
-        preds: torch.Tensor,
-        labels: torch.Tensor,
-        metrics: dict[str, torchmetrics.Metric],
-        skip_metrics: Sequence[str],
-        prefix: str,
-    ):
-        """This helper function logs the set of named metrics for the predictions `preds` and labels `labels`.
-
-        Args:
-            `preds` (`torch.Tensor`): The predictions for this metric calculation.
-            `labels` (`torch.Tensor`): The labels for this metric calculation.
-            `metrics` (`Dict[str, torchmetrics.Metric]`): The metrics to log, by name.
-            `skip_metrics` (`Sequence[str]`):
-                A list of metrics to skip. Entries are not full metric names, but rather are partial names and
-                any metric whose name contains an element of `skip_metrics` will be skipped.
-                For example, if `skip_metrics = ['AUROC', 'AUPRC']`, then a metric with name `'macro_AUROC'`
-                or `'micro_AUPRC'` would be skipped, whereas a metric named `'weighted_accuracy'` would not.
-            `prefix` (`str`):
-                The prefix that should be used when logging metric results. Will likely be 'train', 'tuning',
-                or 'held_out', for example.
-        """
-        for metric_name, metric in metrics.items():
-            if any(to_skip in metric_name for to_skip in skip_metrics):
-                continue
-
-            try:
-                metric(preds, labels.long())
-                self.log(f"{prefix}_{metric_name}", metric)
-            except (ValueError, IndexError) as e:
-                print(
-                    f"Failed to compute {metric_name} "
-                    f"with preds ({str_summary(preds)}) and labels ({str_summary(labels)}): {e}."
-                )
-
     def log_metrics(self, prefix, outputs):
         metrics = {}
         
@@ -429,13 +415,41 @@ class ESTForStreamClassificationLM(L.LightningModule):
         if prefix == 'val':
             self.log(f'{prefix}_loss', metrics[f'{prefix}_loss'], on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
 
-    @property
-    def current_epoch(self):
-        return self._current_epoch
+    def plot_visualizations(self, preds, labels, epoch, split):
+        # Ensure preds and labels are on CPU and in numpy format
+        preds_np = preds.cpu().numpy()
+        labels_np = labels.cpu().numpy()
 
-    @current_epoch.setter
-    def current_epoch(self, value):
-        self._current_epoch = value
+        # Confusion Matrix
+        cm = confusion_matrix(labels_np, (preds_np > 0.5).astype(float))
+        plt.figure(figsize=(10,7))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
+        plt.title(f'Confusion Matrix ({split.capitalize()} Set) - Epoch {epoch}')
+        plt.ylabel('True label')
+        plt.xlabel('Predicted label')
+        confusion_matrix_plot = wandb.Image(plt)
+        plt.close()
+
+        # ROC Curve
+        fpr, tpr, _ = roc_curve(labels_np, preds_np)
+        roc_auc = auc(fpr, tpr)
+        plt.figure()
+        plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {roc_auc:.2f})')
+        plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+        plt.xlim([0.0, 1.0])
+        plt.ylim([0.0, 1.05])
+        plt.xlabel('False Positive Rate')
+        plt.ylabel('True Positive Rate')
+        plt.title(f'ROC Curve ({split.capitalize()} Set) - Epoch {epoch}')
+        plt.legend(loc="lower right")
+        roc_curve_plot = wandb.Image(plt)
+        plt.close()
+
+        # Log both plots to wandb
+        wandb.log({
+            f"{split}_confusion_matrix": confusion_matrix_plot,
+            f"{split}_roc_curve": roc_curve_plot
+        })
 
     def training_step(self, batch, batch_idx):
         if batch is None:
@@ -514,24 +528,6 @@ class ESTForStreamClassificationLM(L.LightningModule):
         total_norm = total_norm ** 0.5
         self.gradient_stats[stage].append(total_norm)
 
-    def _accumulate_metrics(self, prefix, metrics):
-        for key, value in metrics.items():
-            if isinstance(value, torch.Tensor):
-                value = value.item()
-            if key not in self.__dict__[f'{prefix}_metrics']:
-                self.__dict__[f'{prefix}_metrics'][key] = []
-            self.__dict__[f'{prefix}_metrics'][key].append(value)
-
-    def _log_epoch_metrics(self, prefix):
-        metrics = self.__dict__[f'{prefix}_metrics']
-        for key, values in metrics.items():
-            if values:  # Check if the list is not empty
-                avg_value = sum(values) / len(values)
-                self.log(f'{prefix}_{key}_epoch', avg_value, on_step=False, on_epoch=True, logger=True, sync_dist=True)
-        
-        # Clear accumulated metrics
-        self.__dict__[f'{prefix}_metrics'].clear()
-
     def on_train_epoch_end(self):
         self.log_accumulated_metrics('train')
         # Log gradient statistics
@@ -577,9 +573,12 @@ class ESTForStreamClassificationLM(L.LightningModule):
         all_preds = torch.cat(self.val_predictions)
         all_labels = torch.cat(self.val_labels)
 
+        # Plot visualizations
+        self.plot_visualizations(all_preds.cpu(), all_labels.cpu(), self.trainer.current_epoch, 'val')
+
         # Save predictions and labels for the entire validation set
-        predictions_path = os.path.join(self.save_dir, "predictions", f"val_predictions_epoch_{self.current_epoch}.pt")
-        labels_path = os.path.join(self.save_dir, "labels", f"val_labels_epoch_{self.current_epoch}.pt")
+        predictions_path = os.path.join(self.save_dir, "predictions", f"val_predictions_epoch_{self.trainer.current_epoch}.pt")
+        labels_path = os.path.join(self.save_dir, "labels", f"val_labels_epoch_{self.trainer.current_epoch}.pt")
         os.makedirs(os.path.dirname(predictions_path), exist_ok=True)
         os.makedirs(os.path.dirname(labels_path), exist_ok=True)
         torch.save(all_preds, predictions_path)
@@ -589,14 +588,6 @@ class ESTForStreamClassificationLM(L.LightningModule):
         self.val_predictions = []
         self.val_labels = []
         self.log_accumulated_metrics('val')
-
-    def _load_code_mapping(self):
-        mapping_file = Path("data/code_mapping.json")
-        if mapping_file.exists():
-            with open(mapping_file, 'r') as f:
-                return json.load(f)
-        else:
-            raise FileNotFoundError("Code mapping file not found. Please run preprocessing first.")
 
     def forward(self, batch, **kwargs):
         self.logger.info(f"Forward method input keys: {locals().keys()}")
@@ -639,9 +630,12 @@ class ESTForStreamClassificationLM(L.LightningModule):
         all_preds = torch.cat(self.test_predictions)
         all_labels = torch.cat(self.test_labels)
 
+        # Plot visualizations
+        self.plot_visualizations(all_preds.cpu(), all_labels.cpu(), self.trainer.current_epoch, 'test')
+
         # Save predictions and labels for the entire test set
-        predictions_path = os.path.join(self.save_dir, "predictions", f"test_predictions_epoch_{self.current_epoch}.pt")
-        labels_path = os.path.join(self.save_dir, "labels", f"test_labels_epoch_{self.current_epoch}.pt")
+        predictions_path = os.path.join(self.save_dir, "predictions", f"test_predictions_epoch_{self.trainer.current_epoch}.pt")
+        labels_path = os.path.join(self.save_dir, "labels", f"test_labels_epoch_{self.trainer.current_epoch}.pt")
         os.makedirs(os.path.dirname(predictions_path), exist_ok=True)
         os.makedirs(os.path.dirname(labels_path), exist_ok=True)
         torch.save(all_preds, predictions_path)
@@ -651,7 +645,7 @@ class ESTForStreamClassificationLM(L.LightningModule):
         self.test_predictions = []
         self.test_labels = []
 
-        self._log_epoch_metrics('test')
+        self.log_accumulated_metrics('test')
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
