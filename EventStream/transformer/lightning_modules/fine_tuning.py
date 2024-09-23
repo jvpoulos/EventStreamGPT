@@ -420,8 +420,15 @@ class ESTForStreamClassificationLM(L.LightningModule):
         preds_np = preds.cpu().numpy()
         labels_np = labels.cpu().numpy()
 
+        # Check if the task is binary classification
+        if np.unique(labels_np).size != 2:
+            raise ValueError("This visualization is designed for binary classification tasks only.")
+
+        # Convert predictions to binary
+        preds_binary = (preds_np > 0.5).astype(float)
+
         # Confusion Matrix
-        cm = confusion_matrix(labels_np, (preds_np > 0.5).astype(float))
+        cm = confusion_matrix(labels_np, preds_binary)
         plt.figure(figsize=(10,7))
         sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
         plt.title(f'Confusion Matrix ({split.capitalize()} Set) - Epoch {epoch}')
@@ -431,10 +438,11 @@ class ESTForStreamClassificationLM(L.LightningModule):
         plt.close()
 
         # ROC Curve
+        auroc = BinaryAUROC()
+        auroc_value = auroc(torch.tensor(preds_np), torch.tensor(labels_np).int())
         fpr, tpr, _ = roc_curve(labels_np, preds_np)
-        roc_auc = auc(fpr, tpr)
         plt.figure()
-        plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {roc_auc:.2f})')
+        plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {auroc_value:.2f})')
         plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
         plt.xlim([0.0, 1.0])
         plt.ylim([0.0, 1.05])

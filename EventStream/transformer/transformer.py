@@ -150,28 +150,23 @@ class InnerSelfAttention(nn.Module):
         self.out_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
 
     def _split_heads(self, tensor, num_heads, attn_head_size):
-        logger.debug(f"_split_heads - Input tensor shape: {tensor.shape}")
         if tensor.dim() == 3:
-            batch_size, seq_length, hidden_size = tensor.size()
-            tensor = tensor.view(batch_size, seq_length, num_heads, attn_head_size)
-            return tensor.permute(0, 2, 1, 3)  # (batch, head, seq_length, head_features)
+            batch_size, seq_length, _ = tensor.size()
+            return tensor.view(batch_size, seq_length, num_heads, attn_head_size).permute(0, 2, 1, 3)
         elif tensor.dim() == 4:
-            batch_size, seq_length, dep_graph_len, hidden_size = tensor.size()
-            tensor = tensor.view(batch_size, seq_length * dep_graph_len, num_heads, attn_head_size)
-            return tensor.permute(0, 2, 1, 3)  # (batch, head, seq_length * dep_graph_len, head_features)
+            return tensor
         else:
-            raise ValueError(f"Unexpected tensor shape: {tensor.shape}")
+            raise ValueError(f"Unexpected tensor dimensions: {tensor.dim()}")
 
     def _merge_heads(self, tensor, num_heads, attn_head_size):
-        """
-        Merges attn_head_size dim and num_attn_heads dim into hidden_size
-        """
-        logger.debug(f"_merge_heads - Input tensor shape: {tensor.shape}")
-        batch_size, _, seq_length, _ = tensor.size()
-        tensor = tensor.permute(0, 2, 1, 3).contiguous()
-        merged = tensor.view(batch_size, seq_length, num_heads * attn_head_size)
-        logger.debug(f"_merge_heads - Output tensor shape: {merged.shape}")
-        return merged
+        if tensor.dim() == 3:
+            # If the tensor is already in the correct shape, return it
+            return tensor
+        elif tensor.dim() == 4:
+            batch_size, num_heads, seq_length, attn_head_size = tensor.size()
+            return tensor.permute(0, 2, 1, 3).contiguous().view(batch_size, seq_length, num_heads * attn_head_size)
+        else:
+            raise ValueError(f"Unexpected tensor dimensions: {tensor.dim()}")
 
     def _attn(self, query, key, value, attention_mask=None, head_mask=None):
         """Performs the attention operation.
@@ -192,7 +187,7 @@ class InnerSelfAttention(nn.Module):
 
         bsz, num_heads, seq_len, head_dim = query.shape
 
-        if self.use_flash_attention and not self.config.use_cache:
+        if self.use_flash_attention and self.training:
             try:
                 # Reshape inputs for Flash Attention
                 qkv = torch.stack([query, key, value], dim=2)
@@ -254,18 +249,7 @@ class InnerSelfAttention(nn.Module):
         logger.debug(f"Attention output shape: {attn_output.shape}")
         return attn_output, attn_weights
 
-    def forward(
-        self,
-        hidden_states,
-        attention_mask=None,
-        layer_past=None,
-        head_mask=None,
-        use_cache=False,
-        output_attentions=False,
-        static_kv_first: bool = False,
-    ):
-        logger.debug(f"InnerSelfAttention input hidden_states shape: {hidden_states.shape}")
-        
+    def forward(self, hidden_states, attention_mask=None, layer_past=None, head_mask=None, use_cache=False, output_attentions=False, static_kv_first: bool = False):
         query = self.q_proj(hidden_states)
         key = self.k_proj(hidden_states)
         value = self.v_proj(hidden_states)
@@ -274,32 +258,23 @@ class InnerSelfAttention(nn.Module):
         key = self._split_heads(key, self.num_heads, self.head_dim)
         value = self._split_heads(value, self.num_heads, self.head_dim)
 
-        logger.debug(f"Query shape after split_heads: {query.shape}")
-        logger.debug(f"Key shape after split_heads: {key.shape}")
-        logger.debug(f"Value shape after split_heads: {value.shape}")
-
-        if static_kv_first:
-            query = query[:, :, 1:, :]
-
-        if layer_past is not None:
-            past_key, past_value = layer_past
-            key = torch.cat((past_key, key), dim=-2)
-            value = torch.cat((past_value, value), dim=-2)
-
-        present = (key, value) if use_cache else None
-
-        attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask)
-        logger.debug(f"Attention output shape after _attn: {attn_output.shape}")
+        if self.use_flash_attention and self.training:
+            # Use Flash Attention implementation
+            qkv = torch.stack([query, key, value], dim=2)
+            attn_output = flash_attn_qkvpacked_func(qkv, causal=self.causal)
+        else:
+            # Standard attention implementation
+            attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask)
 
         attn_output = self._merge_heads(attn_output, self.num_heads, self.head_dim)
-        logger.debug(f"Attention output shape after _merge_heads: {attn_output.shape}")
-
         attn_output = self.out_proj(attn_output)
         attn_output = self.resid_dropout(attn_output)
 
-        outputs = {"present_key_value": present}
+        outputs = {"attn_output": attn_output}
         if output_attentions:
             outputs["attn_weights"] = attn_weights
+        if use_cache:
+            outputs["present"] = torch.stack((key, value))
 
         return attn_output, outputs
         
@@ -527,9 +502,11 @@ class InnerBlock(nn.Module):
             logger.debug(f"After MLP shape: {feed_forward_hidden_states.shape}")
             
             hidden_states = residual + feed_forward_hidden_states
-
-            if not use_cache:
-                outputs.pop("present_key_value", None)
+            return_dict = {"hidden_states": hidden_states}
+            if use_cache:
+                return_dict["present"] = outputs.get("present")
+            if output_attentions:
+                return_dict["attn_weights"] = outputs.get("attn_weights")
             
             logger.debug(f"InnerBlock output hidden_states shape: {hidden_states.shape}")
             return hidden_states, outputs
@@ -1013,10 +990,10 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
             hidden_states, extra_return_info = outputs
 
             if use_cache is True:
-                presents = presents + (extra_return_info["present_key_value"],)
+                presents = presents + (extra_return_info.get("present"),)
 
             if output_attentions:
-                all_self_attentions = all_self_attentions + (extra_return_info["attn_weights"],)
+                all_self_attentions = all_self_attentions + (extra_return_info.get("attn_weights"),)
 
         hidden_states = self.ln_f(hidden_states)
         if hasattr(self, 'bn_f'):
