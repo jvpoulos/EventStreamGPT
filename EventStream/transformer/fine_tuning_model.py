@@ -1,12 +1,14 @@
 """A model for fine-tuning on classification tasks."""
 import torch
 import math
+from collections import defaultdict
 from torch import nn
 import torch.utils.checkpoint
 import torch.nn.functional as F
 from torch.nn import LayerNorm
 from torchmetrics.classification import BinaryAUROC, BinaryAveragePrecision, BinaryF1Score
 from pytorch_lightning.callbacks import EarlyStopping
+from pytorch_lightning import LightningModule
 
 from ..data.types import PytorchBatch
 from .config import StructuredEventProcessingMode, StructuredTransformerConfig, OptimizationConfig
@@ -28,36 +30,34 @@ import logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
-class ESTForStreamClassification(nn.Module):
+class ESTForStreamClassification(LightningModule):
     def __init__(self, config: StructuredTransformerConfig, vocabulary_config: VocabularyConfig, optimization_config: OptimizationConfig, oov_index: int, save_dir: str = "./model_outputs"):
         super().__init__()
         self.config = config
         self.optimization_config = optimization_config
         self.oov_index = oov_index
         self.save_dir = save_dir
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.to(self.device)  # Move the entire model to the device
+
+        self.encoder = ConditionallyIndependentPointProcessTransformer(config, vocabulary_config, oov_index=oov_index, save_dir=self.save_dir)
         
-        self.encoder = ConditionallyIndependentPointProcessTransformer(config, vocabulary_config, oov_index=oov_index, save_dir=self.save_dir).to(self.device)
-        
-        self.logit_layer = torch.nn.Linear(config.hidden_size, 1).to(self.device)
+        self.logit_layer = torch.nn.Linear(config.hidden_size, 1)
         self.criteria = torch.nn.BCEWithLogitsLoss(reduction='none')
         self.dropout = torch.nn.Dropout(config.intermediate_dropout)
         
-        self.static_indices_embedding = nn.Embedding(config.vocab_size, config.hidden_size).to(self.device)
+        self.static_indices_embedding = nn.Embedding(config.vocab_size, config.hidden_size)
         self.categorical_embeddings = nn.ModuleDict({
             'Female': nn.Embedding(2, config.hidden_size),
             'Married': nn.Embedding(2, config.hidden_size),
             'GovIns': nn.Embedding(2, config.hidden_size),
             'English': nn.Embedding(2, config.hidden_size),
             'Veteran': nn.Embedding(2, config.hidden_size)
-        }).to(self.device)
+        })
         
-        self.dynamic_values_encoder = nn.Linear(1, config.hidden_size).to(self.device)
+        self.dynamic_values_encoder = nn.Linear(1, config.hidden_size)
         
         self.layer_norm = CustomLayerNorm(config.hidden_size) if config.use_layer_norm else nn.Identity()
         self.batch_norm = nn.BatchNorm1d(config.hidden_size) if config.use_batch_norm else nn.Identity()
-        self.dynamic_values_norm = nn.BatchNorm1d(1).to(self.device)
+        self.dynamic_values_norm = nn.BatchNorm1d(1)
         
         self.intermediate = nn.Sequential(
             nn.Linear(config.hidden_size, config.hidden_size),
@@ -65,16 +65,19 @@ class ESTForStreamClassification(nn.Module):
             self.layer_norm,
             self.batch_norm,
             self.dropout
-        ).to(self.device)
+        )
         
-        self.static_weight = nn.Parameter(torch.tensor(config.static_embedding_weight)).to(self.device)
-        self.dynamic_weight = nn.Parameter(torch.tensor(config.dynamic_embedding_weight)).to(self.device)
+        self.static_weight = nn.Parameter(torch.tensor(config.static_embedding_weight))
+        self.dynamic_weight = nn.Parameter(torch.tensor(config.dynamic_embedding_weight))
         
         self.apply(self._init_weights)
         
-        self.auroc = BinaryAUROC().to(self.device)
-        self.auprc = BinaryAveragePrecision().to(self.device)
-        self.f1_score = BinaryF1Score().to(self.device)
+        self.auroc = BinaryAUROC()
+        self.auprc = BinaryAveragePrecision()
+        self.f1_score = BinaryF1Score()
+
+        # Initialize metric accumulator
+        self.metric_accumulator = defaultdict(list)
 
     def forward(self, dynamic_indices, dynamic_values=None, dynamic_measurement_indices=None, static_indices=None, static_measurement_indices=None, time=None, labels=None):
 
@@ -137,11 +140,6 @@ class ESTForStreamClassification(nn.Module):
             auprc=auprc,
             f1=f1
         )
-
-    def to(self, device):
-        super().to(device)
-        self.device = device
-        return self
 
     def on_epoch_start(self):
         # Reset all metrics at the start of each epoch

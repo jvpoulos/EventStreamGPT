@@ -304,28 +304,6 @@ class ESTForStreamClassificationLM(L.LightningModule):
     def gradient_checkpointing_enable(self):
         self.model.gradient_checkpointing_enable()
     
-    def get_gradient_norm(self):
-        total_norm = 0.0
-        for p in self.parameters():
-            if p.grad is not None:
-                param_norm = p.grad.data.norm(2)
-                total_norm += param_norm.item() ** 2
-        return total_norm ** 0.5
-
-    def on_before_optimizer_step(self, optimizer):
-        # Custom gradient clipping logic here
-        if self.trainer.gradient_clip_val is not None:
-            params = [p for group in optimizer.param_groups for p in group['params']]
-            torch.nn.utils.clip_grad_norm_(params, self.trainer.gradient_clip_val)
-
-    def on_after_optimizer_step(self, optimizer):
-        self.grad_norm_after = self.get_gradient_norm()
-        self.log('grad_norm_after', self.grad_norm_after, on_step=True, on_epoch=False, prog_bar=False, logger=True)
-        
-        # Calculate and store gradient norm change
-        grad_norm_change = self.grad_norm_after - self.grad_norm_before
-        self.gradient_norm_changes.append((grad_norm_change, self.batch_indices[-1]))
-
     def __reduce__(self):
         return (self.__class__, (self.config, self.optimization_config, self.cfg))
 
@@ -411,10 +389,6 @@ class ESTForStreamClassificationLM(L.LightningModule):
         # Log all metrics at once
         self.log_dict(metrics, on_step=(prefix == 'train'), on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
 
-        # For validation, we only want to log the loss on_epoch
-        if prefix == 'val':
-            self.log(f'{prefix}_loss', metrics[f'{prefix}_loss'], on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-
     def plot_visualizations(self, preds, labels, epoch, split):
         # Ensure preds and labels are on CPU and in numpy format
         preds_np = preds.cpu().numpy()
@@ -463,14 +437,15 @@ class ESTForStreamClassificationLM(L.LightningModule):
         if batch is None:
             return None
 
-        labels = batch.pop('labels').to(self.device)  # Move labels to the correct device
-        outputs = self.model(batch, labels=labels)
+        # Forward pass
+        outputs = self(batch)
         loss = outputs.loss
 
         if torch.isnan(loss) or torch.isinf(loss):
             logger.warning(f"NaN or Inf loss detected in training step {batch_idx}")
             loss = torch.where(torch.isnan(loss) | torch.isinf(loss), torch.full_like(loss, 1e-8), loss)
 
+        # Log metrics
         self.log_metrics('train', outputs)
         
         return loss
@@ -479,34 +454,18 @@ class ESTForStreamClassificationLM(L.LightningModule):
         if batch is None:
             logger.warning("Received None batch in validation_step")
             return None
-        
-        labels = batch.pop('labels').to(self.device)  # Move labels to the correct device
 
-        # Log input data statistics
-        logger.info(f"Validation step {batch_idx}: Input data stats:")
-        for key, value in batch.items():
-            if isinstance(value, torch.Tensor):
-                logger.info(f"{key}: shape={value.shape}, dtype={value.dtype}, min={value.min().item()}, max={value.max().item()}, mean={value.float().mean().item()}")
+        # Forward pass
+        outputs = self(batch)
         
-        outputs = self.model(batch, labels=labels)
-        
-        # Log information about the outputs
-        logger.info(f"Validation step {batch_idx}: loss = {outputs.loss}")
         if torch.isnan(outputs.loss) or torch.isinf(outputs.loss):
             logger.warning(f"NaN or Inf loss detected in validation step {batch_idx}")
-            logger.info(f"Batch contents: {batch}")
-            logger.info(f"Labels: {labels}")
-            logger.info(f"Model outputs: {outputs}")
         
-        # Check for NaN or Inf values in model parameters
-        for name, param in self.model.named_parameters():
-            if torch.isnan(param).any() or torch.isinf(param).any():
-                logger.warning(f"NaN or Inf detected in model parameter: {name}")
-        
-        # Store predictions and labels
+        # Store predictions and labels for visualizations later
         self.val_predictions.append(outputs.preds.detach().cpu())
-        self.val_labels.append(labels.detach().cpu())
+        self.val_labels.append(batch['labels'].detach().cpu())  # Access labels from batch
 
+        # Log metrics
         self.log_metrics('val', outputs)
         return outputs.loss
 
@@ -514,18 +473,18 @@ class ESTForStreamClassificationLM(L.LightningModule):
         if batch is None:
             logger.warning("Received None batch in test_step")
             return None
-        
-        labels = batch.pop('labels').to(self.device)  # Move labels to the correct device
-        outputs = self.model(batch, labels=labels)
-        loss = outputs.loss
+
+        # Forward pass
+        outputs = self(batch)
 
         # Store predictions and labels
         self.test_predictions.append(outputs.preds.detach().cpu())
-        self.test_labels.append(labels.detach().cpu())
+        self.test_labels.append(batch['labels'].detach().cpu())  # Access labels from batch
 
+        # Log metrics
         self.log_metrics('test', outputs)
 
-        return loss
+        return outputs.loss
 
     def log_gradients(self, stage):
         total_norm = 0
@@ -536,20 +495,34 @@ class ESTForStreamClassificationLM(L.LightningModule):
         total_norm = total_norm ** 0.5
         self.gradient_stats[stage].append(total_norm)
 
+    def log_accumulated_metrics(self, prefix):
+        """
+        Logs the accumulated metrics for the given prefix (train, val, or test) over the epoch.
+        Args:
+            prefix (str): The phase of training ('train', 'val', 'test').
+        """
+        for name, values in self.metric_accumulator.items():
+            # Ensure that only metrics for the current prefix are processed
+            if name.startswith(prefix) and len(values) > 0:
+                # Log the average of the accumulated metric values
+                avg_value = sum(values) / len(values)
+                self.log(f'{name}_epoch', avg_value, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+
+        # Reset the metric accumulator for the next epoch
+        self.metric_accumulator = defaultdict(list)
+
     def on_train_epoch_end(self):
+        # Log accumulated metrics for the training phase
         self.log_accumulated_metrics('train')
-        # Log gradient statistics
+
+        # Log gradient statistics (if needed)
         self.log_gradient_statistics()
         
-        # Log subject_ids with highest gradient increases
+        # Optionally log gradient instability
         self.log_gradient_instability()
+        
+        # Reset gradient stats for the next epoch
         self.gradient_stats = {k: [] for k in self.gradient_stats}
-
-    def log_accumulated_metrics(self, prefix):
-        for name, values in self.metric_accumulator.items():
-            if name.startswith(prefix):
-                self.log(f'{name}_epoch', sum(values) / len(values), on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
-        self.metric_accumulator = defaultdict(list)
 
     def log_gradient_statistics(self):
         for stage, norms in self.gradient_stats.items():
@@ -598,7 +571,6 @@ class ESTForStreamClassificationLM(L.LightningModule):
         self.log_accumulated_metrics('val')
 
     def forward(self, batch, **kwargs):
-        self.logger.info(f"Forward method input keys: {locals().keys()}")
         # Move batch to the correct device
         if isinstance(batch, dict):
             batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
@@ -615,6 +587,9 @@ class ESTForStreamClassificationLM(L.LightningModule):
             batch.pop('static_indices', None)
             batch.pop('static_measurement_indices', None)
 
+        # Extract labels from batch (if available)
+        labels = batch.pop('labels', None)
+
         outputs = self.model(
             dynamic_indices=batch.get("dynamic_indices"),
             dynamic_values=batch.get("dynamic_values"),
@@ -622,7 +597,7 @@ class ESTForStreamClassificationLM(L.LightningModule):
             static_indices=batch.get("static_indices"),
             static_measurement_indices=batch.get("static_measurement_indices"),
             time=batch.get("time"),
-            labels=batch.get("labels"),
+            labels=labels,
             **kwargs
         )
 
@@ -930,10 +905,10 @@ class CollateFunction:
         self.max_seq_len = max_seq_len
         self.use_static_features = use_static_features
         self.logger = logging.getLogger(__name__)
-        self.logger.info(f"CollateFunction initialized with use_static_features: {self.use_static_features}")
+        logger.info(f"CollateFunction initialized with use_static_features: {self.use_static_features}")
 
     def __call__(self, batch):
-        self.logger.info(f"CollateFunction use_static_features: {self.use_static_features}")
+        logger.info(f"CollateFunction use_static_features: {self.use_static_features}")
         try:
             # Filter out None items
             batch = [item for item in batch if item is not None]
@@ -955,7 +930,7 @@ class CollateFunction:
             if self.include_labels:
                 collated_batch['labels'] = torch.stack([item['labels'] for item in batch]).squeeze(1)
 
-            self.logger.info(f"Collated batch keys: {collated_batch.keys()}")
+            logger.info(f"Collated batch keys: {collated_batch.keys()}")
             return collated_batch
         except Exception as e:
             self.logger.error(f"Error in collate function: {str(e)}")
@@ -983,37 +958,6 @@ class CollateFunction:
             'dynamic_measurement_indices': torch.tensor([], dtype=torch.long),
             'labels': torch.tensor([], dtype=torch.float32),
         }
-
-    def safe_pad_sequence(self, sequences, max_val, dtype):
-        try:
-            sequences = [torch.tensor(s, dtype=dtype) if not isinstance(s, torch.Tensor) else s for s in sequences]
-            sequences = [torch.clamp(s, max=max_val) for s in sequences]
-            if all(s.numel() == 0 for s in sequences):
-                raise ValueError("All sequences are empty")
-            padded = torch.nn.utils.rnn.pad_sequence(sequences, batch_first=True)
-            return padded
-        except Exception as e:
-            self.logger.error(f"Error in safe_pad_sequence: {str(e)}")
-            raise
-
-    def safe_tensor_conversion(self, value, dtype):
-        if value is None:
-            return torch.tensor(0, dtype=dtype)
-        return torch.tensor(value, dtype=dtype)
-
-    def safe_float_conversion(self, value):
-        try:
-            return float(value) if value is not None else 0.0
-        except ValueError:
-            self.logger.warning(f"Could not convert to float: {value}, using 0.0")
-            return 0.0
-
-    def safe_int_conversion(self, value):
-        try:
-            return int(value) if value is not None else 0
-        except ValueError:
-            self.logger.warning(f"Could not convert to int: {value}, using 0")
-            return 0
 
 def worker_init_fn(worker_id):
     np.random.seed(worker_id)
@@ -1082,9 +1026,8 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_c
             oov_index=oov_index,
             pretrained_weights_fp=cfg.pretrained_weights_fp,
             do_debug_mode=cfg.do_debug_mode,
-            device=device,
             **model_params
-        ).to(device)
+        )
 
         if not cfg.use_static_features:
             # Remove static features from the batch
@@ -1139,19 +1082,19 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_c
             LearningRateMonitor(logging_interval="step"),
             ModelCheckpoint(
                 dirpath=cfg.save_dir / "checkpoints",
-                filename="{epoch}-{val_auc_epoch:.2f}",
-                monitor="val_auc_epoch", 
-                mode="max",
+                filename="{epoch}-{val_loss_epoch:.2f}",
+                monitor="val_loss_epoch", 
+                mode="min",
                 save_top_k=3,
                 save_weights_only=False,
                 save_last=True,
                 auto_insert_metric_name=False,
             ),
             EarlyStopping(
-                monitor='val_auc_epoch',
+                monitor='val_loss_epoch',
                 patience=cfg.optimization_config['patience'],
                 verbose=True,
-                mode='max',
+                mode='min',
                 check_finite=True
             )
         ]
