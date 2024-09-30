@@ -27,12 +27,65 @@ from .config import StructuredEventProcessingMode, StructuredTransformerConfig
 from .model_output import TransformerOutputWithPast
 from .structured_attention import StructuredAttention
 from ..data.vocabulary import VocabularyConfig
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 from typing import Union, Dict
 
+import wandb
+from pytorch_lightning.loggers import WandbLogger
+
 import logging
-logging.basicConfig(level=logging.DEBUG)
+
+def adjust_tensor_shape(tensor, target_shape, name):
+    if tensor is None:
+        return None
+    if tensor.shape != target_shape:
+        logger.warning(f"Adjusting {name} shape from {tensor.shape} to {target_shape}.")
+        if len(tensor.shape) < len(target_shape):
+            # Add dimensions if needed
+            tensor = tensor.view(*tensor.shape, *([1] * (len(target_shape) - len(tensor.shape))))
+        # Expand or slice as needed
+        tensor = tensor.expand(*target_shape)
+    return tensor
+
+class WandbLogger(logging.Logger):
+    def __init__(self, name, level=logging.NOTSET):
+        super().__init__(name, level)
+
+    def _log_to_wandb(self, level, msg, *args, **kwargs):
+        if wandb.run is not None:
+            formatted_msg = msg % args if args else msg
+            try:
+                wandb.log({f"log/{self.name}/{level}": formatted_msg})
+            except TypeError as e:
+                # If serialization fails, convert to string
+                wandb.log({f"log/{self.name}/{level}": str(formatted_msg)})
+
+    def debug(self, msg, *args, **kwargs):
+        super().debug(msg, *args, **kwargs)
+        self._log_to_wandb("DEBUG", msg, *args, **kwargs)
+
+    def info(self, msg, *args, **kwargs):
+        super().info(msg, *args, **kwargs)
+        self._log_to_wandb("INFO", msg, *args, **kwargs)
+
+    def warning(self, msg, *args, **kwargs):
+        super().warning(msg, *args, **kwargs)
+        self._log_to_wandb("WARNING", msg, *args, **kwargs)
+
+    def error(self, msg, *args, **kwargs):
+        super().error(msg, *args, **kwargs)
+        self._log_to_wandb("ERROR", msg, *args, **kwargs)
+
+    def critical(self, msg, *args, **kwargs):
+        super().critical(msg, *args, **kwargs)
+        self._log_to_wandb("CRITICAL", msg, *args, **kwargs)
+
+# Set up the custom logger
+logging.setLoggerClass(WandbLogger)
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 def expand_mask(mask: torch.BoolTensor, dtype: torch.dtype) -> torch.Tensor:
     """Expands attention_mask from `[bsz, seq_len]` to `[bsz, 1, 1, seq_len]` and converts to float.
@@ -79,8 +132,8 @@ def expand_mask(mask: torch.BoolTensor, dtype: torch.dtype) -> torch.Tensor:
     # positions we want to attend and the dtype's smallest value for masked positions.
     # Since we are adding it to the raw scores before the softmax, this is
     # effectively the same as removing these entirely.
-    attention_mask = attention_mask.to(dtype=dtype)  # fp16 compatibility
-    attention_mask = (1.0 - attention_mask) * torch.finfo(dtype).min
+    attention_mask = attention_mask.to(dtype=torch.float16)  # Change to float16
+    attention_mask = (1.0 - attention_mask) * torch.finfo(torch.float16).min
 
     return attention_mask
 
@@ -109,6 +162,7 @@ class InnerSelfAttention(nn.Module):
         config: StructuredTransformerConfig,
         attention_type: str,
         window_size: int,
+        layer_id: int,
     ):
         super().__init__()
         self.config = config  # Store the config as an attribute
@@ -116,6 +170,7 @@ class InnerSelfAttention(nn.Module):
         self.window_size = window_size
         self.causal = attention_type in ["local", "global"]  # Set causal based on attention type
         self.use_flash_attention = config.use_flash_attention
+        self.layer_id = layer_id
 
         max_seq_len = config.max_seq_len
         self.window_size = window_size
@@ -138,77 +193,70 @@ class InnerSelfAttention(nn.Module):
         self.embed_dim = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = config.head_dim
-        if self.head_dim * self.num_heads != self.embed_dim:
-            raise ValueError(
-                f"embed_dim must be divisible by num_heads (got `embed_dim`: {self.embed_dim} and "
-                f"`num_heads`: {self.num_heads})."
-            )
+        assert self.head_dim * self.num_heads == self.embed_dim, f"embed_dim must be divisible by num_heads (got `embed_dim`: {self.embed_dim} and `num_heads`: {self.num_heads})."
 
-        self.k_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
-        self.v_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
-        self.q_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
-        self.out_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
+        # Initialize linear layers with float32
+        self.k_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False).to(torch.float32)
+        self.v_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False).to(torch.float32)
+        self.q_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False).to(torch.float32)
+        self.out_proj = nn.Linear(self.num_heads * self.head_dim, self.embed_dim, bias=True).to(torch.float32)
 
     def _split_heads(self, tensor, num_heads, attn_head_size):
-        if tensor.dim() == 3:
-            batch_size, seq_length, _ = tensor.size()
-            return tensor.view(batch_size, seq_length, num_heads, attn_head_size).permute(0, 2, 1, 3)
-        elif tensor.dim() == 4:
-            return tensor
+        if tensor.dim() == 2:
+            batch_size, dim = tensor.size()
+            seq_length = 1
+        elif tensor.dim() == 3:
+            batch_size, seq_length, dim = tensor.size()
         else:
             raise ValueError(f"Unexpected tensor dimensions: {tensor.dim()}")
+        
+        tensor = tensor.view(batch_size, seq_length, num_heads, attn_head_size)
+        return tensor.permute(0, 2, 1, 3).contiguous()
 
     def _merge_heads(self, tensor, num_heads, attn_head_size):
         if tensor.dim() == 3:
-            # If the tensor is already in the correct shape, return it
-            return tensor
+            batch_size, seq_length, _ = tensor.size()
+            return tensor.view(batch_size, seq_length, num_heads * attn_head_size)
         elif tensor.dim() == 4:
-            batch_size, num_heads, seq_length, attn_head_size = tensor.size()
-            return tensor.permute(0, 2, 1, 3).contiguous().view(batch_size, seq_length, num_heads * attn_head_size)
+            batch_size, num_heads, seq_length, head_dim = tensor.size()
+            return tensor.transpose(1, 2).contiguous().view(batch_size, seq_length, num_heads * head_dim)
         else:
             raise ValueError(f"Unexpected tensor dimensions: {tensor.dim()}")
 
     def _attn(self, query, key, value, attention_mask=None, head_mask=None):
-        """Performs the attention operation.
-        Args:
-            query: The query tensor.
-            key: The key tensor.
-            value: The value tensor.
-            attention_mask: A mask to be applied on the attention weights.
-            head_mask: A mask to be applied on the attention heads.
-        Returns:
-            A tuple containing the output of the attention operation and the attention weights.
-        """
         logger.debug(f"Query shape: {query.shape}")
         logger.debug(f"Key shape: {key.shape}")
         logger.debug(f"Value shape: {value.shape}")
         if attention_mask is not None:
             logger.debug(f"Original attention mask shape: {attention_mask.shape}")
-
+        
         bsz, num_heads, seq_len, head_dim = query.shape
 
         if self.use_flash_attention and self.training:
             try:
-                # Reshape inputs for Flash Attention
+                # Reshape for Flash Attention
                 qkv = torch.stack([query, key, value], dim=2)
-                qkv = qkv.transpose(1, 2).contiguous()  # [bsz, seq_len, 3, num_heads, head_dim]
+                qkv = qkv.permute(0, 3, 2, 1, 4).contiguous()  # [bsz, seq_len, 3, num_heads, head_dim]
                 
-                # Call Flash Attention
+                logger.debug(f"QKV shape for Flash Attention: {qkv.shape}")
+                
                 attn_output = flash_attn_qkvpacked_func(
                     qkv,
                     dropout_p=self.attn_dropout.p if self.training else 0.0,
-                    softmax_scale=None,  # Let the function use default scale
+                    softmax_scale=None,
                     causal=self.causal
                 )
                 
-                # Reshape output
-                attn_output = attn_output.transpose(1, 2)  # [bsz, num_heads, seq_len, head_dim]
+                # Reshape back
+                attn_output = attn_output.permute(0, 2, 1, 3).contiguous()  # [bsz, num_heads, seq_len, head_dim]
+                logger.debug(f"attn_output shape after Flash Attention: {attn_output.shape}")
                 return attn_output, None  # Flash Attention doesn't return attention weights
-            except RuntimeError as e:
+            except Exception as e:
                 logger.warning(f"Flash Attention failed: {str(e)}. Falling back to standard attention.")
 
         # Standard attention implementation
         attn_weights = torch.matmul(query, key.transpose(-1, -2)) / math.sqrt(self.head_dim)
+        logger.debug(f"attn_weights shape after matmul: {attn_weights.shape}")
 
         if self.causal:
             causal_mask = torch.triu(torch.ones(seq_len, seq_len, dtype=torch.bool, device=query.device), diagonal=1)
@@ -218,55 +266,156 @@ class InnerSelfAttention(nn.Module):
         if attention_mask is not None:
             # Ensure attention_mask is on the same device as query
             attention_mask = attention_mask.to(query.device)
-
             # Reshape attention_mask to match the expected dimensions
             if attention_mask.dim() == 2:
                 attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
             elif attention_mask.dim() == 3:
                 attention_mask = attention_mask.unsqueeze(1)
-
+            
             # Adjust the sequence length dimension of the attention mask
             if attention_mask.size(-1) != seq_len:
                 if attention_mask.size(-1) < seq_len:
                     attention_mask = F.pad(attention_mask, (0, seq_len - attention_mask.size(-1)), value=float('-inf'))
                 else:
                     attention_mask = attention_mask[..., :seq_len]
-
+            
             # Expand attention_mask to match attn_weights shape
             attention_mask = attention_mask.expand(bsz, num_heads, seq_len, seq_len)
             
-            # Apply attention mask
             attn_weights = attn_weights + attention_mask
 
+        # Clip extreme values to avoid overflow in softmax
+        attn_weights = torch.clamp(attn_weights, min=-1e4, max=1e4)
         attn_weights = nn.functional.softmax(attn_weights, dim=-1)
+        logger.debug(f"attn_weights shape after softmax: {attn_weights.shape}")
+        
         attn_weights = self.attn_dropout(attn_weights)
 
         if head_mask is not None:
             attn_weights = attn_weights * head_mask
 
+        logger.debug(f"Final attn_weights shape: {attn_weights.shape}, value shape: {value.shape}")
         attn_output = torch.matmul(attn_weights, value)
+        logger.debug(f"attn_output shape: {attn_output.shape}")
 
-        logger.debug(f"Attention output shape: {attn_output.shape}")
+        # Check for NaN values
+        if torch.isnan(attn_output).any():
+            logger.warning("NaN values detected in attention output. Replacing with zeros.")
+            attn_output = torch.where(torch.isnan(attn_output), torch.zeros_like(attn_output), attn_output)
+
         return attn_output, attn_weights
 
+    def log_attention_weights(self, attn_weights, layer_idx):
+        if wandb.run is not None:
+            fig, ax = plt.subplots(figsize=(10, 10))
+            sns.heatmap(attn_weights[0].mean(dim=0).cpu().detach().numpy(), ax=ax)
+            plt.title(f"Attention weights for layer {layer_idx}")
+            wandb.log({f"attention_weights/layer_{layer_idx}": wandb.Image(fig)})
+            plt.close(fig)
+
+    def _adjust_attention_mask(self, attention_mask, bsz, num_heads, seq_len):
+        # Ensure correct input shape
+        logger.debug(f"Input attention mask shape: {attention_mask.shape}")
+
+        if attention_mask is None:
+            # If no attention mask is provided, create a default one
+            attention_mask = torch.ones((bsz, seq_len), device=self.device)
+
+        if attention_mask.dim() == 2:  # Assume [bsz, seq_len]
+            attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+        elif attention_mask.dim() == 3:  # Assume [bsz, 1, seq_len]
+            attention_mask = attention_mask.unsqueeze(1)
+        elif attention_mask.dim() == 4:  # Assume [bsz, num_heads, seq_len, seq_len]
+            pass
+        else:
+            raise ValueError(f"Unexpected attention mask shape: {attention_mask.shape}")
+
+        # Ensure the batch size is consistent
+        if attention_mask.size(0) != bsz:
+            logger.warning(f"Adjusting attention mask batch size from {attention_mask.size(0)} to {bsz}.")
+            if attention_mask.size(0) < bsz:
+                # Repeat the tensor to match the target batch size
+                repeat_factor = (bsz + attention_mask.size(0) - 1) // attention_mask.size(0)
+                attention_mask = attention_mask.repeat(repeat_factor, 1, 1, 1)
+            attention_mask = attention_mask[:bsz]
+
+        # Adjust sequence length if necessary
+        if attention_mask.size(-1) != seq_len:
+            logger.warning(f"Adjusting attention mask sequence length from {attention_mask.size(-1)} to {seq_len}.")
+            if attention_mask.size(-1) < seq_len:
+                attention_mask = F.pad(attention_mask, (0, seq_len - attention_mask.size(-1)), value=0)
+            else:
+                attention_mask = attention_mask[..., :seq_len]
+
+        # Ensure the mask has the correct number of heads
+        if attention_mask.size(1) != num_heads:
+            logger.warning(f"Adjusting attention mask number of heads from {attention_mask.size(1)} to {num_heads}.")
+            attention_mask = attention_mask.expand(-1, num_heads, -1, -1)
+
+        # Convert boolean mask to float mask
+        attention_mask = (1.0 - attention_mask.to(torch.float32)) * torch.finfo(torch.float32).min
+
+        return attention_mask
+    
     def forward(self, hidden_states, attention_mask=None, layer_past=None, head_mask=None, use_cache=False, output_attentions=False, static_kv_first: bool = False):
+        if hidden_states.dim() == 2:
+            hidden_states = hidden_states.unsqueeze(1)  # Add sequence dimension
+        
+        bsz, seq_len, _ = hidden_states.shape
+        logger.debug(f"Input hidden_states shape: {hidden_states.shape}")
+        
         query = self.q_proj(hidden_states)
         key = self.k_proj(hidden_states)
         value = self.v_proj(hidden_states)
+        
+        logger.debug(f"Query shape before split_heads: {query.shape}")
+        logger.debug(f"Key shape before split_heads: {key.shape}")
+        logger.debug(f"Value shape before split_heads: {value.shape}")
 
         query = self._split_heads(query, self.num_heads, self.head_dim)
         key = self._split_heads(key, self.num_heads, self.head_dim)
         value = self._split_heads(value, self.num_heads, self.head_dim)
 
+        logger.debug(f"Query shape after split_heads: {query.shape}")
+        logger.debug(f"Key shape after split_heads: {key.shape}")
+        logger.debug(f"Value shape after split_heads: {value.shape}")
+
+        if attention_mask is not None:
+            attention_mask = self._adjust_attention_mask(attention_mask, bsz, self.num_heads, seq_len)
+
         if self.use_flash_attention and self.training:
-            # Use Flash Attention implementation
-            qkv = torch.stack([query, key, value], dim=2)
-            attn_output = flash_attn_qkvpacked_func(qkv, causal=self.causal)
+            try:
+                # Reshape for Flash Attention
+                qkv = torch.stack([query, key, value], dim=2)
+                qkv = qkv.permute(0, 3, 2, 1, 4).contiguous()  # [bsz, seq_len, 3, num_heads, head_dim]
+                
+                logger.debug(f"QKV shape for Flash Attention: {qkv.shape}")
+                
+                attn_output = flash_attn_qkvpacked_func(
+                    qkv,
+                    dropout_p=self.attn_dropout.p if self.training else 0.0,
+                    softmax_scale=None,
+                    causal=self.causal
+                )
+                
+                # Reshape back
+                attn_output = attn_output.permute(0, 2, 1, 3).contiguous()  # [bsz, num_heads, seq_len, head_dim]
+                logger.debug(f"attn_output shape after Flash Attention: {attn_output.shape}")
+                attn_weights = None
+            except Exception as e:
+                logger.warning(f"Flash Attention failed: {str(e)}. Falling back to standard attention.")
+                attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask)
         else:
             # Standard attention implementation
             attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask)
 
+        logger.debug(f"attn_output shape after attention: {attn_output.shape}")
+
+        # Merge heads
         attn_output = self._merge_heads(attn_output, self.num_heads, self.head_dim)
+        logger.debug(f"attn_output shape after merge_heads: {attn_output.shape}")
+
+        # Project back to model dim
         attn_output = self.out_proj(attn_output)
         attn_output = self.resid_dropout(attn_output)
 
@@ -277,7 +426,7 @@ class InnerSelfAttention(nn.Module):
             outputs["present"] = torch.stack((key, value))
 
         return attn_output, outputs
-        
+
 class CustomLayerNorm(nn.Module):
     def __init__(self, normalized_shape, eps=1e-5):
         super().__init__()
@@ -289,73 +438,60 @@ class CustomLayerNorm(nn.Module):
         self.bias = nn.Parameter(torch.zeros(normalized_shape))
 
     def forward(self, x):
-        try:
-            logger.debug(f"CustomLayerNorm input shape: {x.shape}")
-            logger.debug(f"CustomLayerNorm input dtype: {x.dtype}")
-            logger.debug(f"CustomLayerNorm input device: {x.device}")
-            logger.debug(f"CustomLayerNorm normalized_shape: {self.normalized_shape}")
+        logger.debug(f"CustomLayerNorm input shape: {x.shape}")
+        logger.debug(f"CustomLayerNorm input dtype: {x.dtype}")
+        logger.debug(f"CustomLayerNorm input device: {x.device}")
+        logger.debug(f"CustomLayerNorm normalized_shape: {self.normalized_shape}")
 
-            original_shape = x.shape
-            original_dtype = x.dtype
+        original_shape = x.shape
+        original_dtype = x.dtype
 
-            if x.dim() == 4:
-                # For 4D input, reshape to 3D
-                batch_size, seq_len, dep_graph_len, hidden_size = x.shape
-                x = x.contiguous().view(-1, hidden_size)
-            elif x.dim() == 3:
-                # For 3D input, reshape to 2D
-                batch_size, seq_len, hidden_size = x.shape
-                x = x.contiguous().view(-1, hidden_size)
-            elif x.dim() != 2:
-                raise ValueError(f"Expected 2D, 3D or 4D input, got {x.dim()}D")
+        if x.dim() == 4:
+            batch_size, seq_len, dep_graph_len, hidden_size = x.shape
+            x = x.contiguous().view(-1, hidden_size)
+        elif x.dim() == 3:
+            batch_size, seq_len, hidden_size = x.shape
+            x = x.contiguous().view(-1, hidden_size)
+        elif x.dim() == 2:
+            pass
+        else:
+            raise ValueError(f"Expected 2D, 3D or 4D input, got {x.dim()}D")
 
-            # Check for NaN or Inf values
-            if torch.isnan(x).any():
-                nan_indices = torch.nonzero(torch.isnan(x))
-                logger.error(f"NaN values found at indices: {nan_indices}")
-                raise ValueError("Input tensor contains NaN values")
-            if torch.isinf(x).any():
-                inf_indices = torch.nonzero(torch.isinf(x))
-                logger.error(f"Inf values found at indices: {inf_indices}")
-                raise ValueError("Input tensor contains Inf values")
+        # Ensure computations are done in float32 for stability
+        x = x.float()
 
-            # Ensure the last dimension matches the normalized shape
-            if x.size(-1) != self.normalized_shape[-1]:
-                raise ValueError(f"Last dimension of input ({x.size(-1)}) doesn't match normalized_shape ({self.normalized_shape[-1]})")
+        # Compute mean and variance with better numerical stability
+        mean = x.mean(dim=-1, keepdim=True)
+        var = x.var(dim=-1, unbiased=False, keepdim=True)
 
-            # Compute mean and variance
-            mean = x.mean(dim=-1, keepdim=True)
-            var = x.var(dim=-1, unbiased=False, keepdim=True)
+        # Add a small epsilon to avoid division by zero
+        std = (var + self.eps).sqrt()
+        
+        # Normalize
+        x = (x - mean) / std
 
-            logger.debug(f"Mean shape: {mean.shape}, Var shape: {var.shape}")
-            logger.debug(f"Mean min: {mean.min().item()}, max: {mean.max().item()}")
-            logger.debug(f"Var min: {var.min().item()}, max: {var.max().item()}")
+        # Check for NaN or Inf values after normalization
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            logger.warning("NaN or Inf values detected after normalization. Clipping values.")
+            x = torch.clamp(x, min=-10, max=10)
 
-            # Normalize
-            x = (x - mean) / torch.sqrt(var + self.eps)
+        # Apply weight and bias
+        if self.weight.dim() == 1:
+            x = x * self.weight + self.bias
+        else:
+            x = x * self.weight.unsqueeze(0) + self.bias.unsqueeze(0)
 
-            # Apply weight and bias
-            if self.weight.dim() == 1:
-                x = x * self.weight + self.bias
-            else:
-                x = x * self.weight.unsqueeze(0) + self.bias.unsqueeze(0)
+        # Convert back to original dtype
+        x = x.to(original_dtype)
 
-            # Reshape back to original shape
-            x = x.view(original_shape)
+        return x
 
-            # Ensure output dtype matches input dtype
-            x = x.to(original_dtype)
-
-            logger.debug(f"CustomLayerNorm output shape: {x.shape}")
-            logger.debug(f"CustomLayerNorm output min: {x.min().item()}, max: {x.max().item()}")
-
-            return x
-        except Exception as e:
-            logger.exception(f"Error in CustomLayerNorm: {str(e)}")
-            raise
+    def _check_gradients(self, grad, name):
+        if torch.isnan(grad).any() or torch.isinf(grad).any():
+            logger.warning(f"NaN or Inf gradients detected in CustomLayerNorm {name}")
 
 class InnerAttention(nn.Module):
-    def __init__(self, config: StructuredTransformerConfig, layer_id: int = 0, is_seq: bool = True):
+    def __init__(self, config: StructuredTransformerConfig, layer_id: int, is_seq: bool):
         super().__init__()
         self.layer_id = layer_id
         self.is_seq = is_seq
@@ -368,22 +504,17 @@ class InnerAttention(nn.Module):
 
         self.layer_norm = CustomLayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
         self.attention = InnerSelfAttention(
-            config, attention_type=self.attention_type, window_size=self.window_size
+            config, attention_type=self.attention_type, window_size=self.window_size, layer_id=self.layer_id
         )
+        self.seq_window_size = config.seq_window_size
 
-    def forward(
-        self,
-        hidden_states,
-        attention_mask=None,
-        layer_past=None,
-        head_mask=None,
-        use_cache=False,
-        output_attentions=False,
-        static_kv_first: bool = False,
-    ):
+
+    def forward(self, hidden_states, attention_mask=None, layer_past=None, head_mask=None, use_cache=False, output_attentions=False, static_kv_first: bool = False):
+        # Ensure hidden_states is 3D
+        if hidden_states.dim() == 2:
+            hidden_states = hidden_states.unsqueeze(1)
+
         logger.debug(f"InnerAttention input hidden_states shape: {hidden_states.shape}")
-        logger.debug(f"InnerAttention input hidden_states device: {hidden_states.device}")
-        logger.debug(f"InnerAttention layer_norm weight device: {self.layer_norm.weight.device}")
 
         # Ensure hidden_states is on the correct device
         hidden_states = hidden_states.to(self.layer_norm.weight.device)
@@ -392,73 +523,34 @@ class InnerAttention(nn.Module):
         normalized_hidden_states = self.layer_norm(hidden_states)
 
         logger.debug(f"InnerAttention normalized_hidden_states shape: {normalized_hidden_states.shape}")
-        logger.debug(f"InnerAttention normalized_hidden_states device: {normalized_hidden_states.device}")
 
-        # Adjust attention_mask if necessary
-        if attention_mask is not None and attention_mask.shape[1] != normalized_hidden_states.shape[1]:
-            logger.warning(f"Attention mask shape mismatch: {attention_mask.shape} vs {normalized_hidden_states.shape}")
-            attention_mask = F.pad(attention_mask, (0, normalized_hidden_states.shape[1] - attention_mask.shape[1]))
-
-        try:
-            attn_output, outputs = self.attention(
-                normalized_hidden_states,
-                attention_mask=attention_mask,
-                layer_past=layer_past,
-                head_mask=head_mask,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                static_kv_first=static_kv_first,
+        # Use the _adjust_attention_mask method from InnerSelfAttention
+        if attention_mask is not None:
+            attention_mask = self.attention._adjust_attention_mask(
+                attention_mask, 
+                normalized_hidden_states.shape[0], 
+                self.attention.num_heads, 
+                normalized_hidden_states.shape[1]
             )
-        except Exception as e:
-            logger.error(f"Error during attention computation: {str(e)}")
-            logger.error(f"normalized_hidden_states shape: {normalized_hidden_states.shape}")
-            logger.error(f"attention_mask shape: {attention_mask.shape if attention_mask is not None else None}")
-            raise
+
+        attn_output, outputs = self.attention(
+            normalized_hidden_states,
+            attention_mask=attention_mask,
+            layer_past=layer_past,
+            head_mask=head_mask,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            static_kv_first=static_kv_first,
+        )
 
         logger.debug(f"InnerAttention attn_output shape: {attn_output.shape}")
-        logger.debug(f"InnerAttention attn_output device: {attn_output.device}")
 
         return attn_output, outputs
 
     def _set_static_graph(self):
         if hasattr(self.attention, '_set_static_graph'):
             self.attention._set_static_graph()
-
-class InnerMLP(nn.Module):
-    """Applies a multilayer perceptron (MLP) to the `hidden_states`.
-
-    Args:
-        config: Configuration parameters for the structured transformer.
-    """
-
-    def __init__(self, config: StructuredTransformerConfig):
-        super().__init__()
-        embed_dim = config.hidden_size
-        inner_dim = config.intermediate_size if config.intermediate_size is not None else 4 * embed_dim
-
-        self.c_fc = nn.Linear(embed_dim, inner_dim)
-        self.c_proj = nn.Linear(inner_dim, embed_dim)
-        self.act = ACT2FN[config.activation_function]
-        self.dropout = nn.Dropout(float(config.resid_dropout))
-
-    def forward(self, hidden_states):
-        """Conducts forward pass for the MLP.
-
-        Args:
-            hidden_states: Input tensor.
-
-        Returns:
-            Modified hidden states after applying MLP.
-        """
-        hidden_states = self.c_fc(hidden_states)
-        hidden_states = self.act(hidden_states)
-        hidden_states = self.c_proj(hidden_states)
-        hidden_states = self.dropout(hidden_states)
-        return hidden_states
-
-    def _set_static_graph(self):
-        pass  # No submodules to set static graph for
-        
+            
 class InnerBlock(nn.Module):
     def __init__(self, config: StructuredTransformerConfig, layer_id: int, is_seq: bool, device=None):
         super().__init__()
@@ -466,58 +558,100 @@ class InnerBlock(nn.Module):
         self.layer_norm1 = CustomLayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
         self.layer_norm2 = CustomLayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
         self.mlp = InnerMLP(config)
+        self.seq_window_size = config.seq_window_size
 
         if device is not None:
             self.to(device)
 
     def forward(self, hidden_states, attention_mask=None, layer_past=None, head_mask=None, use_cache=False, output_attentions=False, static_kv_first: bool = False):
-        try:
-            logger.debug(f"InnerBlock input hidden_states shape: {hidden_states.shape}")
-            logger.debug(f"InnerBlock input hidden_states dtype: {hidden_states.dtype}")
-            logger.debug(f"InnerBlock input hidden_states device: {hidden_states.device}")
+        logger.debug(f"InnerBlock input hidden_states shape: {hidden_states.shape}")
+        
+        residual = hidden_states
+        hidden_states = self.layer_norm1(hidden_states)
+        
+        logger.debug(f"InnerBlock hidden_states shape after layer_norm1: {hidden_states.shape}")
 
-            residual = hidden_states
-            hidden_states = self.layer_norm1(hidden_states)
-            logger.debug(f"After layer_norm1 shape: {hidden_states.shape}")
-            
-            attn_outputs = self.attn(
-                hidden_states,
-                attention_mask=attention_mask,
-                layer_past=layer_past,
-                head_mask=head_mask,
-                use_cache=use_cache,
-                output_attentions=output_attentions,
-                static_kv_first=static_kv_first,
-            )
-            attn_output, outputs = attn_outputs
-            logger.debug(f"After attention shape: {attn_output.shape}")
-            
-            hidden_states = attn_output + residual
+        # Adjust sequence length if necessary
+        seq_window_size = self.seq_window_size
+        if hidden_states.size(1) != seq_window_size:
+            logger.warning(f"Adjusting sequence length from {hidden_states.size(1)} to {seq_window_size}.")
+            if hidden_states.size(1) < seq_window_size:
+                pad_length = seq_window_size - hidden_states.size(1)
+                hidden_states = F.pad(hidden_states, (0, 0, 0, pad_length))
+                if attention_mask is not None:
+                    attention_mask = F.pad(attention_mask, (0, pad_length), value=float('-inf'))
+            else:
+                hidden_states = hidden_states[:, :seq_window_size, :]
+                if attention_mask is not None:
+                    attention_mask = attention_mask[:, :, :, :seq_window_size]
 
-            residual = hidden_states
-            hidden_states = self.layer_norm2(hidden_states)
-            logger.debug(f"After layer_norm2 shape: {hidden_states.shape}")
-            
-            feed_forward_hidden_states = self.mlp(hidden_states)
-            logger.debug(f"After MLP shape: {feed_forward_hidden_states.shape}")
-            
-            hidden_states = residual + feed_forward_hidden_states
-            return_dict = {"hidden_states": hidden_states}
-            if use_cache:
-                return_dict["present"] = outputs.get("present")
-            if output_attentions:
-                return_dict["attn_weights"] = outputs.get("attn_weights")
-            
-            logger.debug(f"InnerBlock output hidden_states shape: {hidden_states.shape}")
-            return hidden_states, outputs
-        except Exception as e:
-            logger.exception(f"Error in InnerBlock forward pass: {str(e)}")
-            raise
+        attn_output, attn_outputs = self.attn(
+            hidden_states,
+            attention_mask=attention_mask,
+            layer_past=layer_past,
+            head_mask=head_mask,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            static_kv_first=static_kv_first,
+        )
+
+        # Ensure attn_output has the same batch size and sequence length as residual
+        if attn_output.shape[:2] != residual.shape[:2]:
+            logger.warning(f"Adjusting attn_output shape from {attn_output.shape} to {residual.shape}")
+            attn_output = attn_output[:residual.size(0), :residual.size(1), :]
+
+        hidden_states = attn_output + residual
+        residual = hidden_states
+        hidden_states = self.layer_norm2(hidden_states)
+        feed_forward_hidden_states = self.mlp(hidden_states)
+
+        # Ensure feed_forward_hidden_states has the same shape as residual
+        if feed_forward_hidden_states.shape != residual.shape:
+            logger.warning(f"Reshaping feed_forward_hidden_states from {feed_forward_hidden_states.shape} to {residual.shape}")
+            feed_forward_hidden_states = feed_forward_hidden_states.view(residual.shape)
+
+        hidden_states = residual + feed_forward_hidden_states
+
+        outputs = {
+            "present": attn_outputs.get("present"),
+            "attn_weights": attn_outputs.get("attn_weights"),
+        }
+
+        logger.debug(f"InnerBlock output hidden_states shape: {hidden_states.shape}")
+        return hidden_states, outputs
 
     def _set_static_graph(self):
         self.attn._set_static_graph()
         if hasattr(self.mlp, '_set_static_graph'):
             self.mlp._set_static_graph()
+            
+class InnerMLP(nn.Module):
+    def __init__(self, config: StructuredTransformerConfig):
+        super().__init__()
+        embed_dim = config.hidden_size
+        self.c_fc = nn.Linear(embed_dim, config.intermediate_size)
+        self.c_proj = nn.Linear(config.intermediate_size, embed_dim)
+        self.act = ACT2FN[config.activation_function]
+        self.dropout = nn.Dropout(float(config.resid_dropout))
+
+    def forward(self, hidden_states):
+        original_shape = hidden_states.shape
+        if hidden_states.dim() == 3:
+            batch_size, seq_len, hidden_size = hidden_states.shape
+            hidden_states = hidden_states.reshape(-1, hidden_size)
+        
+        hidden_states = self.c_fc(hidden_states)
+        hidden_states = self.act(hidden_states)
+        hidden_states = self.c_proj(hidden_states)
+        hidden_states = self.dropout(hidden_states)
+        
+        if len(original_shape) == 3:
+            hidden_states = hidden_states.view(original_shape)
+        
+        return hidden_states
+
+    def _set_static_graph(self):
+        pass  # No submodules to set static graph for
 
 class StructuredTransformerBlock(nn.Module):
     """A block for structured attention with both sequential and dependency graph modules.
@@ -758,57 +892,49 @@ class ConditionallyIndependentPointProcessInputLayer(nn.Module):
         self.dynamic_values_norm = nn.BatchNorm1d(1)
         self.static_embedding = nn.Embedding(config.vocab_size, config.hidden_size)
         self.time_embedding = nn.Linear(1, config.hidden_size)
+        
+        # Adjust the input size of the feature_combiner
+        self.feature_combiner = nn.Linear(config.hidden_size * 3, config.hidden_size)
 
-    def forward(self, batch: Union[dict, torch.Tensor]) -> torch.Tensor:
+    def forward(self, input_features: Dict[str, torch.Tensor]) -> torch.Tensor:
         logger.debug("Entering ConditionallyIndependentPointProcessInputLayer.forward")
-        if isinstance(batch, dict):
-            logger.debug(f"Batch keys: {batch.keys()}")
-            for key, value in batch.items():
-                if isinstance(value, torch.Tensor):
-                    logger.debug(f"{key} shape: {value.shape}")
-            
-            dynamic_indices = batch.get('dynamic_indices')
-            dynamic_values = batch.get('dynamic_values')
-            dynamic_measurement_indices = batch.get('dynamic_measurement_indices')
-            static_indices = batch.get('static_indices')
-            static_measurement_indices = batch.get('static_measurement_indices')
-            time = batch.get('time')
-        elif isinstance(batch, torch.Tensor):
-            dynamic_indices = batch
-            dynamic_values = None
-            static_indices = None
-            static_measurement_indices = None
-            time = None
-        else:
-            raise TypeError("Input 'batch' should be a dictionary or a Tensor.")
 
-        logger.debug(f"dynamic_indices shape: {dynamic_indices.shape if dynamic_indices is not None else None}")
-        logger.debug(f"dynamic_values shape: {dynamic_values.shape if dynamic_values is not None else None}")
-        logger.debug(f"dynamic_measurement_indices shape: {dynamic_measurement_indices.shape if dynamic_measurement_indices is not None else None}")
-        logger.debug(f"static_indices shape: {static_indices.shape if static_indices is not None else None}")
-        logger.debug(f"static_measurement_indices shape: {static_measurement_indices.shape if static_measurement_indices is not None else None}")
-        logger.debug(f"time shape: {time.shape if time is not None else None}")
+        # Log shapes of input features
+        for key, value in input_features.items():
+            if value is not None:
+                logger.debug(f"{key} shape: {value.shape}")
+            else:
+                logger.debug(f"{key}: None")
+        
+        dynamic_indices = input_features.get('dynamic_indices')
+        dynamic_values = input_features.get('dynamic_values')
+        dynamic_measurement_indices = input_features.get('dynamic_measurement_indices')
+        static_indices = input_features.get('static_indices')
+        static_measurement_indices = input_features.get('static_measurement_indices')
+        time = input_features.get('time')
 
-        data_embed: torch.Tensor = self.data_embedding_layer({
+        # Process dynamic indices and measurement indices
+        data_embed = self.data_embedding_layer({
             'dynamic_indices': dynamic_indices,
             'dynamic_values': dynamic_values,
             'dynamic_measurement_indices': dynamic_measurement_indices
         })
 
-        logger.debug(f"data_embed shape after data_embedding_layer: {data_embed.shape}")
-            
-        # Ensure data_embed is 3D: [batch_size, seq_len, hidden_size]
-        if len(data_embed.shape) == 2:
-            batch_size, total_elements = data_embed.shape
-            hidden_size = self.config.hidden_size
-            seq_len = total_elements // hidden_size
-            data_embed = data_embed.view(batch_size, seq_len, hidden_size)
+        logger.debug(f"data_embed shape: {data_embed.shape}")
 
-        max_seq_len = data_embed.shape[1]
+        # Handle different possible shapes of data_embed
+        if len(data_embed.shape) == 3:
+            batch_size, seq_len, hidden_size = data_embed.shape
+        elif len(data_embed.shape) == 2:
+            batch_size, hidden_size = data_embed.shape
+            seq_len = 1
+            data_embed = data_embed.unsqueeze(1)
+        else:
+            raise ValueError(f"Unexpected shape for data_embed: {data_embed.shape}")
 
         # Process dynamic values
         if dynamic_values is not None:
-            dynamic_values = dynamic_values[:, :max_seq_len]
+            dynamic_values = dynamic_values[:, :seq_len]  # Ensure same sequence length
             mask = ~torch.isnan(dynamic_values)
             valid_values = dynamic_values[mask]
 
@@ -817,11 +943,9 @@ class ConditionallyIndependentPointProcessInputLayer(nn.Module):
                 valid_values_embed = self.dynamic_values_encoder(valid_values_normalized.unsqueeze(-1))
                 valid_values_embed = valid_values_embed.to(dtype=data_embed.dtype)
 
-                batch_size, seq_len = dynamic_values.shape
-                hidden_size = self.config.hidden_size
-
-                reshaped_valid_values_embed = torch.zeros(batch_size, seq_len, hidden_size, device=valid_values_embed.device, dtype=valid_values_embed.dtype)
-                reshaped_valid_values_embed[mask] = valid_values_embed.squeeze(1)
+                # Reshape valid_values_embed to match data_embed shape
+                reshaped_valid_values_embed = torch.zeros_like(data_embed)
+                reshaped_valid_values_embed[mask.unsqueeze(-1).expand_as(reshaped_valid_values_embed)] = valid_values_embed.view(-1)
 
                 data_embed = torch.where(mask.unsqueeze(-1), reshaped_valid_values_embed, data_embed)
 
@@ -829,25 +953,46 @@ class ConditionallyIndependentPointProcessInputLayer(nn.Module):
         if static_indices is not None:
             static_embed = self.static_embedding(static_indices)
             if self.use_addition_for_static:
-                data_embed += static_embed.mean(dim=1).unsqueeze(1)
+                static_embed = static_embed.mean(dim=1).unsqueeze(1).expand(-1, seq_len, -1)
             else:
-                static_embed = static_embed.unsqueeze(1).expand(-1, max_seq_len, -1)
-                data_embed = torch.cat([data_embed, static_embed], dim=-1)
+                static_embed = static_embed.unsqueeze(1).expand(-1, seq_len, -1)
+        else:
+            static_embed = torch.zeros_like(data_embed)
 
         # Process time
         if time is not None:
-            time = time[:, :max_seq_len]
+            time = time[:, :seq_len]  # Ensure same sequence length
             time_embed = self.time_embedding(time.unsqueeze(-1))
-            data_embed = data_embed + time_embed
+        else:
+            time_embed = torch.zeros_like(data_embed)
 
-        # Ensure final data_embed has the correct shape
-        if data_embed.size(-1) != self.config.hidden_size:
-            logger.warning(f"Mismatch in embedding dimension: {data_embed.size(-1)} vs {self.config.hidden_size}")
-            data_embed = data_embed[..., :self.config.hidden_size]
+        # Combine all features
+        combined_features = torch.cat([data_embed, static_embed, time_embed], dim=-1)
 
-        logger.debug(f"Final data_embed shape: {data_embed.shape}")
-        logger.debug("Exiting ConditionallyIndependentPointProcessInputLayer.forward")
-        return self.embedding_dropout(data_embed)
+        logger.debug(f"combined_features shape: {combined_features.shape}")
+
+        # Pass through the feature combiner
+        combined_embed = self.feature_combiner(combined_features)
+
+        logger.debug(f"Dynamic indices shape: {dynamic_indices.shape}")
+        logger.debug(f"Dynamic values shape: {dynamic_values.shape if dynamic_values is not None else None}")
+        logger.debug(f"Dynamic measurement indices shape: {dynamic_measurement_indices.shape if dynamic_measurement_indices is not None else None}")
+        logger.debug(f"Static indices shape: {static_indices.shape if static_indices is not None else None}")
+        logger.debug(f"Static measurement indices shape: {static_measurement_indices.shape if static_measurement_indices is not None else None}")
+        logger.debug(f"Time shape: {time.shape if time is not None else None}")
+        logger.debug(f"Combined features shape: {combined_features.shape}")
+        logger.debug(f"Combined embed shape: {combined_embed.shape}")
+
+        # Ensure the sequence length matches seq_window_size
+        seq_window_size = self.config.seq_window_size
+        if combined_embed.shape[1] < seq_window_size:
+            pad_length = seq_window_size - combined_embed.shape[1]
+            combined_embed = F.pad(combined_embed, (0, 0, 0, pad_length), mode='constant', value=0)
+        elif combined_embed.shape[1] > seq_window_size:
+            combined_embed = combined_embed[:, :seq_window_size, :]
+
+        logger.debug(f"Final combined_embed shape: {combined_embed.shape}")
+        return self.embedding_dropout(combined_embed)
 
 class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTrainedModel):
     def __init__(self, config: StructuredTransformerConfig, vocabulary_config: VocabularyConfig, oov_index: int, save_dir: str = "./model_outputs"):
@@ -880,6 +1025,12 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
         # Initialize weights and apply final processing
         self.post_init()
 
+        self.forward_step = 0
+        self.fp16 = torch.cuda.is_available()  # Use fp16 if CUDA is available
+
+        self.use_grad_value_clipping = config.optimization_config.get('use_grad_value_clipping', True)
+        self.clip_grad_value = config.optimization_config.get('clip_grad_value', 1.0)
+
     def forward(
         self,
         dynamic_indices: Union[torch.Tensor, Dict[str, torch.Tensor]],
@@ -897,14 +1048,15 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
         output_hidden_states: bool | None = None,
         return_dict: bool | None = None,
     ) -> tuple[torch.Tensor] | TransformerOutputWithPast:
-
-        logger.debug("Entering ConditionallyIndependentPointProcessTransformer.forward")
+        self.forward_step += 1
+        logger.debug(f"Forward pass step: {self.forward_step}")
         logger.debug(f"Input shapes: dynamic_indices: {dynamic_indices.shape if isinstance(dynamic_indices, torch.Tensor) else type(dynamic_indices)}, "
                      f"dynamic_values: {dynamic_values.shape if dynamic_values is not None else None}, "
-                    f"dynamic_measurement_indices: {dynamic_measurement_indices.shape if dynamic_measurement_indices is not None else None}, "
+                     f"dynamic_measurement_indices: {dynamic_measurement_indices.shape if dynamic_measurement_indices is not None else None}, "
                      f"static_indices: {static_indices.shape if static_indices is not None else None}, "
                      f"static_measurement_indices: {static_measurement_indices.shape if static_measurement_indices is not None else None}, "
                      f"time: {time.shape if time is not None else None}")
+        
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         use_cache = use_cache if use_cache is not None else self.config.use_cache
@@ -913,16 +1065,23 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
         if past is None:
             past = tuple([None] * len(self.h))
 
-        if input_embeds is None:
-            logger.debug("Generating input embeddings")
-            if isinstance(dynamic_indices, dict):
-                logger.debug(f"dynamic_indices keys: {dynamic_indices.keys()}")
-                dynamic_indices = dynamic_indices.get('dynamic_indices')
-            
-            if dynamic_indices is None:
-                logger.error("dynamic_indices is None")
-                raise ValueError("dynamic_indices cannot be None")
+        if isinstance(dynamic_indices, dict):
+            dynamic_indices = dynamic_indices.get('dynamic_indices')
+        
+        if dynamic_indices is None:
+            raise ValueError("dynamic_indices cannot be None")
 
+        # Get the local batch size for this GPU
+        local_batch_size = dynamic_indices.size(0)
+
+        # Adjust batch sizes for all input tensors
+        dynamic_values = self._adjust_tensor_shape(dynamic_values, local_batch_size, "dynamic_values")
+        dynamic_measurement_indices = self._adjust_tensor_shape(dynamic_measurement_indices, local_batch_size, "dynamic_measurement_indices")
+        static_indices = self._adjust_tensor_shape(static_indices, local_batch_size, "static_indices")
+        static_measurement_indices = self._adjust_tensor_shape(static_measurement_indices, local_batch_size, "static_measurement_indices")
+        time = self._adjust_tensor_shape(time, local_batch_size, "time")
+
+        if input_embeds is None:
             input_embeds = self.input_layer({
                 'dynamic_indices': dynamic_indices,
                 'dynamic_values': dynamic_values,
@@ -931,25 +1090,25 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
                 'static_measurement_indices': static_measurement_indices,
                 'time': time
             })
-        else:
-            logger.debug("Using provided input embeddings")
-
-        if input_embeds is None:
-            logger.error("input_embeds is None after processing")
-            raise ValueError("Failed to generate input embeddings")
-
+        
         hidden_states = input_embeds
         logger.debug(f"hidden_states shape after input layer: {hidden_states.shape}")
 
-        original_shape = hidden_states.shape
+        # Ensure hidden_states is 3D
+        if hidden_states.dim() == 2:
+            hidden_states = hidden_states.unsqueeze(1)
+            logger.debug(f"Expanded hidden_states shape: {hidden_states.shape}")
 
         if seq_attention_mask is None:
-            if isinstance(dynamic_indices, dict):
-                dynamic_indices_tensor = dynamic_indices['dynamic_indices']
-            else:
-                dynamic_indices_tensor = dynamic_indices
-            seq_attention_mask = torch.ones(dynamic_indices_tensor.shape[:2], dtype=torch.bool, device=dynamic_indices_tensor.device)
+            seq_attention_mask = torch.ones(hidden_states.size(0), hidden_states.size(1), device=hidden_states.device)
+        
+        # Expand and adjust the mask to match expected dimensions
         seq_attention_mask = expand_mask(seq_attention_mask, input_embeds.dtype)
+
+        # Truncate the sequence length to seq_window_size
+        seq_window_size = self.config.seq_window_size
+        hidden_states = hidden_states[:, :seq_window_size, :]
+        seq_attention_mask = seq_attention_mask[:, :, :, :seq_window_size]
 
         head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
 
@@ -957,9 +1116,21 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
         all_self_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
 
+        if self.fp16:
+            hidden_states = hidden_states.half()  # Convert to fp16
+
         for i, (block, layer_past) in enumerate(zip(self.h, past)):
+            logger.debug(f"Before block {i}: hidden_states shape: {hidden_states.shape}")
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
+
+            # Adjust attention mask for each layer
+            layer_attention_mask = self.h[i].attn.attention._adjust_attention_mask(
+                seq_attention_mask, 
+                hidden_states.size(0), 
+                self.config.num_attention_heads, 
+                hidden_states.size(1)
+            )
 
             if self.gradient_checkpointing and self.training:
                 def create_custom_forward(module):
@@ -970,25 +1141,54 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
                 outputs = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(block),
                     hidden_states,
-                    seq_attention_mask,
+                    layer_attention_mask,
                     layer_past,
                     head_mask[i],
                     use_cache,
                     output_attentions,
                     use_reentrant=False
                 )
+                hidden_states = outputs[0]
+                extra_return_info = outputs[1] if len(outputs) > 1 else {}
             else:
                 outputs = block(
                     hidden_states,
-                    attention_mask=seq_attention_mask,
+                    attention_mask=layer_attention_mask,
                     layer_past=layer_past,
                     head_mask=head_mask[i],
                     use_cache=use_cache,
                     output_attentions=output_attentions,
                 )
 
-            hidden_states, extra_return_info = outputs
+                hidden_states, extra_return_info = outputs
 
+                if output_attentions:
+                    all_self_attentions = all_self_attentions + (extra_return_info.get("attn_weights"),)
+                    if wandb.run is not None:
+                        attn_weights = extra_return_info.get("attn_weights")
+                        if attn_weights is not None:
+                            block.attn.attention.log_attention_weights(attn_weights, i)
+
+                # Apply gradient clipping if enabled
+                if self.training and self.use_grad_value_clipping:
+                    # Check if any parameters have gradients
+                    params_with_grad = [p for p in self.parameters() if p.grad is not None]
+                    
+                    if params_with_grad:
+                        try:
+                            torch.nn.utils.clip_grad_value_(params_with_grad, self.clip_grad_value)
+                        except RuntimeError as e:
+                            logger.warning(f"Error during gradient clipping: {str(e)}")
+                            logger.info("Skipping gradient clipping for this step.")
+                    else:
+                        logger.warning("No gradients found. Skipping gradient clipping.")
+                    
+                # Ensure hidden_states has the correct batch size
+                if hidden_states.size(0) != local_batch_size:
+                    logger.warning(f"Adjusting hidden_states batch size from {hidden_states.size(0)} to {local_batch_size}")
+                    hidden_states = hidden_states[:local_batch_size]
+
+            logger.debug(f"After block {i}: hidden_states shape: {hidden_states.shape}")
             if use_cache is True:
                 presents = presents + (extra_return_info.get("present"),)
 
@@ -997,18 +1197,25 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
 
         hidden_states = self.ln_f(hidden_states)
         if hasattr(self, 'bn_f'):
-            if hidden_states.dim() == 4:
-                # For 4D input, apply batch norm to the last two dimensions
-                hidden_states = hidden_states.permute(0, 3, 1, 2)
-                hidden_states = self.bn_f(hidden_states.reshape(hidden_states.size(0), -1, hidden_states.size(-1)))
-                hidden_states = hidden_states.view(*hidden_states.shape[:2], -1, hidden_states.size(-1)).permute(0, 2, 3, 1)
-            else:
+            logger.debug(f"Applying batch normalization. hidden_states shape: {hidden_states.shape}")
+            if hidden_states.dim() == 3:
                 hidden_states = self.bn_f(hidden_states.transpose(1, 2)).transpose(1, 2)
+            elif hidden_states.dim() == 2:
+                hidden_states = self.bn_f(hidden_states.unsqueeze(-1)).squeeze(-1)
+            else:
+                logger.warning(f"Unexpected hidden_states dimensions: {hidden_states.dim()}. Skipping batch normalization.")
+            logger.debug(f"hidden_states shape after batch norm: {hidden_states.shape}")
+
+        # Ensure hidden_states is 3D before returning
+        if hidden_states.dim() == 2:
+            hidden_states = hidden_states.unsqueeze(1)
+            logger.debug(f"Expanded hidden_states shape before return: {hidden_states.shape}")
 
         if not return_dict:
             return tuple(v for v in [hidden_states, presents, all_hidden_states, all_self_attentions] if v is not None)
 
-        logger.debug("Exiting ConditionallyIndependentPointProcessTransformer.forward")
+        logger.debug(f"Input embeds shape: {input_embeds.shape}")
+        logger.debug(f"Hidden states shape after each layer: {hidden_states.shape}")
         return TransformerOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=presents,
@@ -1016,6 +1223,18 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
             attentions=all_self_attentions
         )
 
+    def _adjust_tensor_shape(self, tensor, target_batch_size, name):
+        if tensor is None:
+            return None
+        if tensor.size(0) != target_batch_size:
+            logger.warning(f"Adjusting {name} batch size from {tensor.size(0)} to {target_batch_size}.")
+            if tensor.size(0) < target_batch_size:
+                # Repeat the tensor to match the target batch size
+                repeat_factor = (target_batch_size + tensor.size(0) - 1) // tensor.size(0)
+                tensor = tensor.repeat(repeat_factor, *([1] * (tensor.dim() - 1)))
+            return tensor[:target_batch_size]
+        return tensor
+    
 class NestedAttentionPointProcessInputLayer(torch.nn.Module):
     """Processes input batch and produces input dependency graph element embeddings.
 

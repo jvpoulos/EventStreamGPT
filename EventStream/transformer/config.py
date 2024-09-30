@@ -254,6 +254,7 @@ class OptimizationConfig(JSONableMixin):
     use_grad_value_clipping: bool = True
     clip_grad_value: float = 1.0
     lr_num_warmup_steps: int = 100
+    max_grad_norm: float = 1.0
 
     num_dataloader_workers: int = 0
 
@@ -867,6 +868,11 @@ class StructuredTransformerConfig(PretrainedConfig):
 
         assert not kwargs.get("is_encoder_decoder", False), "Can't be used in encoder/decoder mode!"
         kwargs["is_encoder_decoder"] = False
+
+        self.optimization_config = {
+            'use_grad_value_clipping': True,
+            'clip_grad_value': 1.0,
+        }
 
         super().__init__(**kwargs)
 

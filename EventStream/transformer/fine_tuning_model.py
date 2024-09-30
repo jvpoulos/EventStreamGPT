@@ -24,9 +24,11 @@ from .utils import safe_masked_max, safe_weighted_avg
 
 from ..data.vocabulary import VocabularyConfig
 
+import wandb
 import logging
+from pytorch_lightning.loggers import WandbLogger
 
-# Configure the logger
+# Set up the standard logger
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
@@ -79,7 +81,23 @@ class ESTForStreamClassification(LightningModule):
         # Initialize metric accumulator
         self.metric_accumulator = defaultdict(list)
 
-    def forward(self, dynamic_indices, dynamic_values=None, dynamic_measurement_indices=None, static_indices=None, static_measurement_indices=None, time=None, labels=None):
+    def forward(self, batch):
+        # Extract inputs from the batch
+        dynamic_indices = batch['dynamic_indices']
+        dynamic_values = batch.get('dynamic_values')
+        dynamic_measurement_indices = batch.get('dynamic_measurement_indices')
+        static_indices = batch.get('static_indices')
+        static_measurement_indices = batch.get('static_measurement_indices')
+        time = batch.get('time')
+        labels = batch.get('labels')
+        seq_attention_mask = batch.get('attention_mask')
+
+        # Create seq_attention_mask if needed
+        if seq_attention_mask is None:
+            seq_attention_mask = torch.ones_like(dynamic_indices, dtype=torch.bool)
+
+        # Get the batch size from dynamic_indices
+        batch_size = dynamic_indices.size(0)
 
         # Encode the input
         encoded = self.encoder(
@@ -88,9 +106,10 @@ class ESTForStreamClassification(LightningModule):
             dynamic_measurement_indices=dynamic_measurement_indices,
             static_indices=static_indices,
             static_measurement_indices=static_measurement_indices,
-            time=time
+            time=time,
+            seq_attention_mask=seq_attention_mask
         )
-
+        
         event_encoded = encoded.last_hidden_state
 
         # Handle 4D input
@@ -105,21 +124,41 @@ class ESTForStreamClassification(LightningModule):
         else:
             raise ValueError(f"Unknown pooling method: {self.config.task_specific_params['pooling_method']}")
 
+        # Ensure pooled_dynamic has the correct batch size
+        if pooled_dynamic.size(0) != batch_size:
+            logger.warning(f"Adjusting pooled_dynamic size from {pooled_dynamic.size(0)} to {batch_size}")
+            pooled_dynamic = pooled_dynamic[:batch_size]
+
         # Process static indices only if use_static_features is True
         if self.config.use_static_features and static_indices is not None:
             static_embed = self.static_indices_embedding(static_indices).mean(dim=1)
+            # Ensure static_embed has the correct batch size
+            if static_embed.size(0) != batch_size:
+                logger.warning(f"Adjusting static_embed size from {static_embed.size(0)} to {batch_size}")
+                static_embed = static_embed[:batch_size]
             combined_embed = self.static_weight * static_embed + self.dynamic_weight * pooled_dynamic
         else:
             combined_embed = pooled_dynamic
-        
+
         # Process through intermediate layers
         intermediate = self.intermediate(combined_embed)
         logits = self.logit_layer(intermediate).squeeze(-1)
+
+        # Ensure logits have the correct batch size
+        if logits.size(0) != batch_size:
+            logger.warning(f"Adjusting logits size from {logits.size(0)} to {batch_size}")
+            logits = logits[:batch_size]
+
         probs = torch.sigmoid(logits)
 
         # Calculate metrics if labels are provided
         loss, accuracy, auc, auprc, f1 = None, None, None, None, None
         if labels is not None:
+            # Ensure labels have the correct batch size
+            if labels.size(0) != batch_size:
+                logger.warning(f"Adjusting labels size from {labels.size(0)} to {batch_size}")
+                labels = labels[:batch_size]
+
             loss = self.criteria(logits, labels)
             loss = loss.mean()
             with torch.no_grad():
@@ -130,7 +169,7 @@ class ESTForStreamClassification(LightningModule):
                 auprc = self.auprc.compute()
                 f1 = self.f1_score.compute()
                 accuracy = ((probs > 0.5) == labels).float().mean()
-        
+
         return StreamClassificationModelOutput(
             loss=loss,
             preds=probs,

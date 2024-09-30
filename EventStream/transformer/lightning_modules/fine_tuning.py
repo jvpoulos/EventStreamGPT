@@ -3,7 +3,9 @@ from dataclasses import is_dataclass, asdict
 import json
 import datetime
 import os
+import time
 import torch.distributed as dist
+from torch.distributed.elastic.multiprocessing.errors import record
 import random
 import numpy as np
 import matplotlib.pyplot as plt
@@ -22,6 +24,9 @@ import omegaconf
 import torch.nn.functional as F
 from omegaconf import DictConfig
 import torch
+import pytorch_lightning as pl
+from pytorch_lightning.strategies import DDPStrategy
+from datetime import timedelta
 from pytorch_lightning import LightningModule
 import torchmetrics
 from lightning.pytorch.callbacks import Callback, LearningRateMonitor, ModelCheckpoint
@@ -55,12 +60,8 @@ from ..utils import str_summary
 
 from ...data.vocabulary import VocabularyConfig
 from ...data.types import PytorchBatch
-from pytorch_lightning.loggers import WandbLogger
 
-import time
-from torch.utils.data import DataLoader
-
-import logging
+from torch.utils.data import DataLoader, DistributedSampler
 
 import numpy as np
 from torch.cuda.amp import autocast, GradScaler
@@ -71,9 +72,32 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import confusion_matrix, roc_curve, auc
 
-# Configure the logger
+import logging
+from pytorch_lightning.loggers import WandbLogger
+from contextlib import contextmanager
+import signal
+
+# Set up the standard logger
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
+
+class NCCLErrorHandler(Callback):
+    def on_exception(self, trainer, pl_module, exception):
+        if isinstance(exception, RuntimeError) and "NCCL" in str(exception):
+            logger.error(f"NCCL error detected: {str(exception)}")
+            logger.info("Attempting to recover...")
+            trainer.strategy.barrier()
+            return True
+        return False
+
+class WandbLoggerHandler(logging.Handler):
+    def __init__(self, wandb_logger):
+        super().__init__()
+        self.wandb_logger = wandb_logger
+
+    def emit(self, record):
+        msg = self.format(record)
+        self.wandb_logger.experiment.log({f"log/{record.levelname}": msg})
 
 class ESTForStreamClassificationLM(L.LightningModule):
     def __init__(
@@ -125,8 +149,6 @@ class ESTForStreamClassificationLM(L.LightningModule):
         self.lr_scheduler_type = self.optimization_config.lr_scheduler_type
         self.end_lr = self.optimization_config.end_lr
         self.end_lr_frac_of_init_lr = self.optimization_config.end_lr_frac_of_init_lr
-        self.use_grad_value_clipping = self.optimization_config.use_grad_value_clipping
-        self.clip_grad_value = self.optimization_config.clip_grad_value
         self.max_grad_norm = self.config.max_grad_norm
         
         self.grad_norm_before = None
@@ -168,6 +190,9 @@ class ESTForStreamClassificationLM(L.LightningModule):
             if not param.requires_grad:
                 print(f"Parameter {name} does not require gradients")
         
+        # Move the model to the correct device
+        self.model = self.model.to(self.device)
+
         # Ensure all parameters require gradients
         for param in self.model.parameters():
             param.requires_grad = True
@@ -183,59 +208,109 @@ class ESTForStreamClassificationLM(L.LightningModule):
         # Build metrics
         self.build_metrics()
         
-        # Initialize gradient stats
-        self.gradient_stats = {
-            'before_norm': [],
-            'after_norm': [],
-            'after_clip': []
-        }
-        
         # Initialize metric accumulator
         self.metric_accumulator = defaultdict(list)
 
+        self.custom_logger = logging.getLogger(self.__class__.__name__)
+        self.custom_logger.setLevel(logging.INFO)
+
+        # Initialize rank
+        if dist.is_initialized():
+            self.rank = dist.get_rank()
+        else:
+            self.rank = 0
+
+        # Initialize Wandb only for the main process
+        if self.rank == 0:
+            if wandb.run is None:
+                wandb.init(project=cfg.wandb_logger_kwargs.get("project", "default_project"),
+                           name=cfg.wandb_logger_kwargs.get("name", "default_run"),
+                           config=cfg.to_dict())
+            else:
+                self.custom_logger.info("Using existing wandb run")
+
+    def setup(self, stage=None):
+        # This method is called by PyTorch Lightning before training/testing
+        if stage == 'fit' or stage is None:
+            self.train_dataset.set_epoch(0)  # Reset the dataset for each epoch
+            self.val_dataset.set_epoch(0)
+
+    def on_train_end(self):
+        self.switch_to_inference_mode()
+
+    def on_train_start(self):
+        if self.config.use_gradient_checkpointing:
+            self.model._set_static_graph()
+        self.switch_to_training_mode()
+
     def on_validation_start(self):
         self.model.eval()
-        for module in self.model.modules():
-            if isinstance(module, InnerSelfAttention):
-                module.inference_mode = True
+        self.switch_to_inference_mode()
 
     def on_validation_end(self):
-        for module in self.model.modules():
-            if isinstance(module, InnerSelfAttention):
-                module.inference_mode = False
+        self.switch_to_training_mode()
 
     def on_test_start(self):
         self.model.eval()
-        for module in self.model.modules():
-            if isinstance(module, InnerSelfAttention):
-                module.inference_mode = True
+        self.switch_to_inference_mode()
 
     def on_test_end(self):
+        self.switch_to_training_mode()
+
+    def switch_to_inference_mode(self):
         for module in self.model.modules():
             if isinstance(module, InnerSelfAttention):
+                module.use_flash_attention = False
+                module.inference_mode = True
+
+    def switch_to_training_mode(self):
+        for module in self.model.modules():
+            if isinstance(module, InnerSelfAttention):
+                module.use_flash_attention = self.config.use_flash_attention
                 module.inference_mode = False
-        
+
+    def setup(self, stage=None):
+        if stage == 'fit' or stage is None:
+            world_size = self.trainer.num_devices if self.trainer.num_devices is not None else 1
+            if world_size > 1:
+                self.train_sampler = DistributedSampler(self.train_dataset, shuffle=True)
+                self.val_sampler = DistributedSampler(self.val_dataset, shuffle=False)
+            else:
+                self.train_sampler = None
+                self.val_sampler = None
+
     def train_dataloader(self):
+        collate_fn = CollateFunction(
+            vocab_size=self.config.vocab_size,
+            oov_index=self.oov_index,
+            include_labels=True,
+            static_size=8,
+            max_seq_len=self.config.max_seq_len,
+            use_static_features=self.cfg.use_static_features
+        )
         return DataLoader(
             self.train_dataset,
             batch_size=self.optimization_config.batch_size,
-            shuffle=True,
+            sampler=self.train_sampler,
+            shuffle=self.train_sampler is None,  # Only shuffle if we're not using a sampler
             num_workers=self.optimization_config.num_dataloader_workers,
             pin_memory=True,
-            collate_fn=self.custom_collate_fn,
-            drop_last=True
+            collate_fn=collate_fn
         )
 
     def val_dataloader(self):
-            return DataLoader(
-                self.val_dataset,
-                batch_size=self.optimization_config.validation_batch_size,
-                shuffle=False,
-                num_workers=self.optimization_config.num_dataloader_workers,
-                pin_memory=True,
-                collate_fn=self.custom_collate_fn,
-                drop_last=True  # Add this line
-            )
+        return DataLoader(
+            self.val_dataset,
+            batch_size=self.optimization_config.validation_batch_size,
+            sampler=self.val_sampler,
+            shuffle=False,  # We don't shuffle the validation data
+            num_workers=self.optimization_config.num_dataloader_workers,
+            pin_memory=True
+        )
+
+    def on_train_epoch_start(self):
+        if isinstance(self.trainer.train_dataloader.sampler, DistributedSampler):
+            self.trainer.train_dataloader.sampler.set_epoch(self.current_epoch)
 
     def custom_collate_fn(self, batch):
         # Filter out None items
@@ -292,10 +367,6 @@ class ESTForStreamClassificationLM(L.LightningModule):
 
     def configure_sharded_model(self):
         self.model._set_static_graph()
-
-    def on_train_start(self):
-        if self.config.use_gradient_checkpointing:
-            self.model._set_static_graph()
 
     @property
     def is_gradient_checkpointing(self):
@@ -389,6 +460,10 @@ class ESTForStreamClassificationLM(L.LightningModule):
         # Log all metrics at once
         self.log_dict(metrics, on_step=(prefix == 'train'), on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
 
+        # For validation, we only want to log the loss on_epoch
+        if prefix == 'val':
+            self.log(f'{prefix}_loss', metrics[f'{prefix}_loss'], on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+
     def plot_visualizations(self, preds, labels, epoch, split):
         # Ensure preds and labels are on CPU and in numpy format
         preds_np = preds.cpu().numpy()
@@ -433,16 +508,35 @@ class ESTForStreamClassificationLM(L.LightningModule):
             f"{split}_roc_curve": roc_curve_plot
         })
 
+    def log_debug(self, message):
+        """Log debug messages to both the standard logger and WandB."""
+        logging.getLogger(__name__).debug(message)
+        if wandb.run is not None:
+            wandb.log({"debug": message})
+
     def training_step(self, batch, batch_idx):
-        if batch is None:
-            return None
+        # Ensure all tensors in the batch are on the correct device
+        batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+
+        # Create attention mask
+        seq_lens = batch['seq_len']
+        max_seq_len = batch['dynamic_indices'].size(1)
+        attention_mask = torch.arange(max_seq_len, device=self.device)[None, :] < seq_lens[:, None]
+        
+        # Add attention mask to the batch
+        batch['attention_mask'] = attention_mask
+
+        # Log shapes for debugging
+        for k, v in batch.items():
+            if isinstance(v, torch.Tensor):
+                self.log_debug(f"Training batch {k} shape: {v.shape}")
 
         # Forward pass
-        outputs = self(batch)
+        outputs = self.model(batch)  # Pass the entire batch to the model
         loss = outputs.loss
 
         if torch.isnan(loss) or torch.isinf(loss):
-            logger.warning(f"NaN or Inf loss detected in training step {batch_idx}")
+            self.log_debug(f"NaN or Inf loss detected in training step {batch_idx}")
             loss = torch.where(torch.isnan(loss) | torch.isinf(loss), torch.full_like(loss, 1e-8), loss)
 
         # Log metrics
@@ -451,49 +545,64 @@ class ESTForStreamClassificationLM(L.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        if batch is None:
-            logger.warning("Received None batch in validation_step")
-            return None
+        # Ensure all tensors in the batch are on the correct device
+        batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+        
+        # Create attention mask
+        seq_lens = batch['seq_len']
+        max_seq_len = batch['dynamic_indices'].size(1)
+        attention_mask = torch.arange(max_seq_len, device=self.device)[None, :] < seq_lens[:, None]
+        
+        # Add attention mask to the batch
+        batch['attention_mask'] = attention_mask
+
+        # Log shapes for debugging
+        for k, v in batch.items():
+            if isinstance(v, torch.Tensor):
+                self.log_debug(f"Validation batch {k} shape: {v.shape}")
 
         # Forward pass
-        outputs = self(batch)
+        outputs = self.model(batch)  # Pass the entire batch to the model
         
         if torch.isnan(outputs.loss) or torch.isinf(outputs.loss):
-            logger.warning(f"NaN or Inf loss detected in validation step {batch_idx}")
+            self.log_debug(f"NaN or Inf loss detected in validation step {batch_idx}")
         
         # Store predictions and labels for visualizations later
         self.val_predictions.append(outputs.preds.detach().cpu())
-        self.val_labels.append(batch['labels'].detach().cpu())  # Access labels from batch
+        self.val_labels.append(batch['labels'].detach().cpu())
 
         # Log metrics
         self.log_metrics('val', outputs)
         return outputs.loss
 
     def test_step(self, batch, batch_idx):
-        if batch is None:
-            logger.warning("Received None batch in test_step")
-            return None
+        # Ensure all tensors in the batch are on the correct device
+        batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+        
+        # Create attention mask
+        seq_lens = batch['seq_len']
+        max_seq_len = batch['dynamic_indices'].size(1)
+        attention_mask = torch.arange(max_seq_len, device=self.device)[None, :] < seq_lens[:, None]
+        
+        # Add attention mask to the batch
+        batch['attention_mask'] = attention_mask
+
+        # Log shapes for debugging
+        for k, v in batch.items():
+            if isinstance(v, torch.Tensor):
+                self.log_debug(f"Test batch {k} shape: {v.shape}")
 
         # Forward pass
-        outputs = self(batch)
+        outputs = self.model(batch)  # Pass the entire batch to the model
 
         # Store predictions and labels
         self.test_predictions.append(outputs.preds.detach().cpu())
-        self.test_labels.append(batch['labels'].detach().cpu())  # Access labels from batch
+        self.test_labels.append(batch['labels'].detach().cpu())
 
         # Log metrics
         self.log_metrics('test', outputs)
 
         return outputs.loss
-
-    def log_gradients(self, stage):
-        total_norm = 0
-        for p in self.parameters():
-            if p.grad is not None:
-                param_norm = p.grad.data.norm(2)
-                total_norm += param_norm.item() ** 2
-        total_norm = total_norm ** 0.5
-        self.gradient_stats[stage].append(total_norm)
 
     def log_accumulated_metrics(self, prefix):
         """
@@ -511,43 +620,69 @@ class ESTForStreamClassificationLM(L.LightningModule):
         # Reset the metric accumulator for the next epoch
         self.metric_accumulator = defaultdict(list)
 
+    def calculate_feature_importance(self, num_samples=100):
+        """
+        Calculate feature importance using permutation importance.
+        
+        Args:
+            num_samples (int): Number of samples to use for importance calculation.
+        """
+        # Sample a subset of the validation data
+        val_loader = self.val_dataloader()
+        samples = []
+        for i, batch in enumerate(val_loader):
+            if i >= num_samples:
+                break
+            samples.append(batch)
+
+        # Combine samples into a single batch
+        combined_batch = {
+            key: torch.cat([sample[key] for sample in samples], dim=0)
+            for key in samples[0].keys()
+        }
+
+        # Calculate baseline performance
+        with torch.no_grad():
+            baseline_output = self(combined_batch)
+        baseline_loss = baseline_output.loss.item()
+
+        feature_importance = {}
+        for feature in combined_batch.keys():
+            if feature != 'labels':
+                # Create a copy of the batch with the current feature permuted
+                permuted_batch = combined_batch.copy()
+                permuted_batch[feature] = permuted_batch[feature][torch.randperm(permuted_batch[feature].size(0))]
+                
+                # Calculate performance with permuted feature
+                with torch.no_grad():
+                    permuted_output = self(permuted_batch)
+                permuted_loss = permuted_output.loss.item()
+                
+                # Calculate importance as the difference in performance
+                importance = permuted_loss - baseline_loss
+                feature_importance[feature] = importance
+
+        # Normalize importance scores
+        total_importance = sum(abs(score) for score in feature_importance.values())
+        normalized_importance = {k: abs(v) / total_importance for k, v in feature_importance.items()}
+
+        # Log feature importance
+        wandb.log({"feature_importance": normalized_importance})
+
+        return normalized_importance
+
+    def log_to_wandb(self, *args, **kwargs):
+        # Only log to wandb from the main process
+        if self.rank == 0:
+            wandb.log(*args, **kwargs)
+
     def on_train_epoch_end(self):
         # Log accumulated metrics for the training phase
         self.log_accumulated_metrics('train')
 
-        # Log gradient statistics (if needed)
-        self.log_gradient_statistics()
-        
-        # Optionally log gradient instability
-        self.log_gradient_instability()
-        
-        # Reset gradient stats for the next epoch
-        self.gradient_stats = {k: [] for k in self.gradient_stats}
-
-    def log_gradient_statistics(self):
-        for stage, norms in self.gradient_stats.items():
-            if norms:
-                mean_norm = sum(norms) / len(norms)
-                max_norm = max(norms)
-                min_norm = min(norms)
-                self.log(f'grad_norm_{stage}_mean', mean_norm, on_epoch=True, logger=True, sync_dist=True)
-                self.log(f'grad_norm_{stage}_max', max_norm, on_epoch=True, logger=True, sync_dist=True)
-                self.log(f'grad_norm_{stage}_min', min_norm, on_epoch=True, logger=True, sync_dist=True)
-
-    def log_gradient_instability(self):
-        # Sort gradient changes and get top outliers
-        sorted_changes = sorted(self.gradient_norm_changes, key=lambda x: x[0], reverse=True)
-        top_outliers = sorted_changes[:self.max_outliers_to_log]
-
-        # Log batch indices of top outliers
-        for i, (change, batch_idx) in enumerate(top_outliers):
-            self.logger.experiment.log({f"gradient_instability/top_{i+1}": {
-                "change": change,
-                "batch_idx": batch_idx
-            }})
-
-        # Reset for next epoch
-        self.gradient_norm_changes = []
+        # Ensure all processes are synchronized before proceeding
+        if dist.is_initialized():
+            dist.barrier()
 
     def on_validation_epoch_end(self):
         # Concatenate all predictions and labels
@@ -576,7 +711,7 @@ class ESTForStreamClassificationLM(L.LightningModule):
             batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
             for key, value in batch.items():
                 if isinstance(value, torch.Tensor) and torch.isnan(value).any():
-                    logger.warning(f"NaNs detected in batch['{key}']")
+                    self.logger.warning(f"NaNs detected in batch['{key}']")
         else:
             raise TypeError("Input 'batch' should be a dictionary.")
 
@@ -587,24 +722,32 @@ class ESTForStreamClassificationLM(L.LightningModule):
             batch.pop('static_indices', None)
             batch.pop('static_measurement_indices', None)
 
-        # Extract labels from batch (if available)
-        labels = batch.pop('labels', None)
+        # Create attention mask from sequence lengths
+        seq_lens = batch['seq_len']
+        max_seq_len = seq_lens.max().item()
+        seq_mask = torch.arange(max_seq_len, device=self.device)[None, :] < seq_lens[:, None]
 
-        outputs = self.model(
-            dynamic_indices=batch.get("dynamic_indices"),
-            dynamic_values=batch.get("dynamic_values"),
-            dynamic_measurement_indices=batch.get("dynamic_measurement_indices"),
-            static_indices=batch.get("static_indices"),
-            static_measurement_indices=batch.get("static_measurement_indices"),
-            time=batch.get("time"),
-            labels=labels,
-            **kwargs
-        )
+        # Add attention mask to the batch
+        batch['seq_attention_mask'] = seq_mask
+
+        # Add labels to the batch if available
+        if 'labels' in batch:
+            batch['labels'] = batch['labels']
+
+        # Merge kwargs into batch
+        batch.update(kwargs)
+
+        # Forward pass through the model
+        outputs = self.model(batch)
+
+        # Only watch the model from the main process
+        if self.rank == 0:
+            wandb.watch(self.model, log="all", log_freq=100)
 
         if hasattr(outputs, 'loss') and (torch.isnan(outputs.loss).any() or torch.isinf(outputs.loss).any()):
-            logger.warning("NaN or Inf detected in model outputs")
-            logger.info(f"Inputs: {batch}")
-            logger.info(f"Outputs: {outputs}")
+            self.custom_logger.warning("NaN or Inf detected in model outputs")
+            self.custom_logger.info(f"Inputs: {batch}")
+            self.custom_logger.info(f"Outputs: {outputs}")
 
         return outputs
 
@@ -724,7 +867,7 @@ class FinetuneConfig:
         default_factory=lambda: {
             "name": "${task_df_name}_finetuning",
             "project": None,
-            "log_model": True,
+            "log_model": False,
         }
     )
 
@@ -905,69 +1048,108 @@ class CollateFunction:
         self.max_seq_len = max_seq_len
         self.use_static_features = use_static_features
         self.logger = logging.getLogger(__name__)
-        logger.info(f"CollateFunction initialized with use_static_features: {self.use_static_features}")
+        self.logger.info(f"CollateFunction initialized with use_static_features: {self.use_static_features}")
 
     def __call__(self, batch):
-        logger.info(f"CollateFunction use_static_features: {self.use_static_features}")
+        self.logger.info(f"CollateFunction use_static_features: {self.use_static_features}")
         try:
             # Filter out None items
             batch = [item for item in batch if item is not None]
             if len(batch) == 0:
                 return None
 
+            # Find the maximum sequence length in this batch
+            max_seq_len = min(max(len(item['dynamic_indices']) for item in batch), self.max_seq_len or float('inf'))
+
             # Pad sequences
             collated_batch = {
-                'dynamic_indices': torch.stack([self.pad_sequence(item['dynamic_indices'], self.max_seq_len) for item in batch]),
-                'dynamic_values': torch.stack([self.pad_sequence(item['dynamic_values'], self.max_seq_len, pad_value=0.0) for item in batch]),
-                'dynamic_measurement_indices': torch.stack([self.pad_sequence(item['dynamic_measurement_indices'], self.max_seq_len) for item in batch]),
-                'time': torch.stack([self.pad_sequence(item['time'], self.max_seq_len, pad_value=0.0) for item in batch]),
+                'dynamic_indices': self.pad_and_stack([item['dynamic_indices'] for item in batch], max_seq_len),
+                'dynamic_values': self.pad_and_stack([item['dynamic_values'] for item in batch], max_seq_len, pad_value=0.0),
+                'dynamic_measurement_indices': self.pad_and_stack([item['dynamic_measurement_indices'] for item in batch], max_seq_len),
+                'time': self.pad_and_stack([item['time'] for item in batch], max_seq_len, pad_value=0.0),
+                'seq_len': torch.tensor([len(item['dynamic_indices']) for item in batch], dtype=torch.long),
             }
 
             if self.use_static_features:
-                collated_batch['static_indices'] = torch.stack([self.pad_sequence(item['static_indices'], self.static_size) for item in batch])
-                collated_batch['static_measurement_indices'] = torch.stack([self.pad_sequence(item['static_measurement_indices'], self.static_size) for item in batch])
+                collated_batch['static_indices'] = self.pad_and_stack([item['static_indices'] for item in batch], self.static_size)
+                collated_batch['static_measurement_indices'] = self.pad_and_stack([item['static_measurement_indices'] for item in batch], self.static_size)
 
             if self.include_labels:
                 collated_batch['labels'] = torch.stack([item['labels'] for item in batch]).squeeze(1)
 
-            logger.info(f"Collated batch keys: {collated_batch.keys()}")
+            self.logger.info(f"Collated batch keys: {collated_batch.keys()}")
+            self.logger.info(f"Collated batch sizes: {[(k, v.shape) for k, v in collated_batch.items()]}")
+
             return collated_batch
         except Exception as e:
             self.logger.error(f"Error in collate function: {str(e)}")
             self.logger.error(f"Batch size: {len(batch)}")
             for i, item in enumerate(batch):
                 self.logger.error(f"Item {i} keys: {item.keys()}")
+                for k, v in item.items():
+                    self.logger.error(f"Item {i} {k} shape: {v.shape if isinstance(v, torch.Tensor) else 'N/A'}")
             raise
 
-    def pad_sequence(self, sequence, length, pad_value=0):
-        if len(sequence) >= length:
-            return sequence[:length]
-        return F.pad(sequence, (0, length - len(sequence)), value=pad_value)
+    def pad_and_stack(self, sequences, max_length, pad_value=0):
+        # Convert to list of tensors if not already
+        sequences = [torch.as_tensor(seq) for seq in sequences]
+        
+        # Get lengths of each sequence
+        lengths = [len(seq) for seq in sequences]
+        
+        # Create output tensor
+        out_dims = (len(sequences), max_length) + sequences[0].shape[1:]
+        out_tensor = sequences[0].new_full(out_dims, pad_value)
+        
+        # Copy data from sequences into output tensor
+        for i, seq in enumerate(sequences):
+            length = lengths[i]
+            if length > max_length:
+                out_tensor[i] = seq[:max_length]
+            else:
+                out_tensor[i, :length] = seq
+        
+        return out_tensor
 
-    def is_valid_item(self, item):
-        required_keys = ['dynamic_indices', 'dynamic_values', 'static_indices', 'static_measurement_indices', 'dynamic_measurement_indices', 'labels']
-        return all(k in item for k in required_keys) and all(torch.is_tensor(item[k]) for k in required_keys)
-
-    def get_empty_batch(self):
-        return {
-            'dynamic_indices': torch.tensor([], dtype=torch.long),
-            'dynamic_values': torch.tensor([], dtype=torch.float32),
-            'dynamic_values_mask': torch.tensor([], dtype=torch.bool),
-            'static_indices': torch.tensor([], dtype=torch.long),
-            'static_measurement_indices': torch.tensor([], dtype=torch.long),
-            'dynamic_measurement_indices': torch.tensor([], dtype=torch.long),
-            'labels': torch.tensor([], dtype=torch.float32),
-        }
-
-def worker_init_fn(worker_id):
-    np.random.seed(worker_id)
-    random.seed(worker_id)
+def setup_distributed():
+    if dist.is_initialized():
+        logger.info("Process group already initialized.")
+        return dist.get_world_size(), dist.get_rank()
+    
+    if 'WORLD_SIZE' in os.environ:
+        world_size = int(os.environ['WORLD_SIZE'])
+        rank = int(os.environ['RANK'])
+        dist.init_process_group(backend='nccl', init_method='env://')
+    else:
+        world_size = 1
+        rank = 0
+    return world_size, rank
 
 @task_wrapper
 def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_config: VocabularyConfig, oov_index: int, wandb_logger: WandbLogger | None = None):
-
-    logging.basicConfig(level=logging.DEBUG)
+    # Set up the standard logger
     logger = logging.getLogger(__name__)
+    logger.setLevel(logging.DEBUG)
+
+    start_time = time.time()
+    logger.info(f"Train function started at {start_time}")
+
+    # Initialize rank
+    if dist.is_initialized():
+        rank = dist.get_rank()
+    else:
+        rank = 0
+
+    # Initialize Wandb only for the main process
+    if rank == 0:
+        if wandb.run is None:
+            wandb.init(project=cfg.wandb_logger_kwargs.get("project", "default_project"),
+                       name=cfg.wandb_logger_kwargs.get("name", "default_run"),
+                       config=cfg.to_dict())
+        else:
+            logger.info("Using existing wandb run")
+
+    logger.info(f"Entering train function")
 
     logger.info(f"Train dataset length: {len(train_pyd)}")
     logger.info(f"Tuning dataset length: {len(tuning_pyd)}")
@@ -976,177 +1158,243 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_c
     logger.info(f"FinetuneConfig use_static_features: {cfg.use_static_features}")
     logger.info(f"Config use_static_features: {cfg.config.use_static_features}")
 
-    try:
-        # Update data config
-        cfg.update_data_config()
+    # Set up distributed environment
+    world_size, rank = setup_distributed()
+    logger.info(f"Distributed setup complete. Rank: {rank}, World Size: {world_size} after {time.time() - start_time:.2f} seconds")
+
+    # Update data config
+    cfg.update_data_config()
+    logger.info(f"Data config updated after {time.time() - start_time:.2f} seconds")
+    
+    # Load the vocabulary_config from the correct file
+    vocabulary_config_path = "/home/jvp/diabetes_pred/data/labs/vocabulary_config.json" if cfg.use_labs else "/home/jvp/diabetes_pred/data/vocabulary_config.json"
+    with open(vocabulary_config_path, "r") as f:
+        vocabulary_config_dict = json.load(f)
+    vocabulary_config = VocabularyConfig.from_dict(vocabulary_config_dict)
+    logger.info(f"Vocabulary config loaded after {time.time() - start_time:.2f} seconds")
+
+    # Calculate OOV index
+    dynamic_indices_vocab_size = vocabulary_config.vocab_sizes_by_measurement.get("dynamic_indices", 0)
+    oov_index = cfg.config.vocab_size  # Set oov_index to vocab_size
+    logger.info(f"Calculated OOV index: {oov_index} after {time.time() - start_time:.2f} seconds")
+    
+    # Log the data directories
+    logger.info(f"Using data directory: {cfg.data_config.save_dir}")
+    logger.info(f"Using DL reps directory: {cfg.data_config.dl_reps_dir}")
+    
+    # Use the existing wandb_logger if provided, otherwise create a new one
+    if wandb_logger is None:
+        wandb_kwargs = cfg.wandb_logger_kwargs.copy()
+        project = wandb_kwargs.pop('project', 'default_project')
+        name = wandb_kwargs.pop('name', 'default_run')
         
-        # Load the vocabulary_config from the correct file
-        vocabulary_config_path = "/home/jvp/diabetes_pred/data/labs/vocabulary_config.json" if cfg.use_labs else "/home/jvp/diabetes_pred/data/vocabulary_config.json"
-        with open(vocabulary_config_path, "r") as f:
-            vocabulary_config_dict = json.load(f)
-        vocabulary_config = VocabularyConfig.from_dict(vocabulary_config_dict)
-
-        # Calculate OOV index
-        dynamic_indices_vocab_size = vocabulary_config.vocab_sizes_by_measurement.get("dynamic_indices", 0)
-        oov_index = cfg.config.vocab_size  # Set oov_index to vocab_size
-
-        logger.info(f"Calculated OOV index: {oov_index}")
+        # Remove unsupported parameters
+        wandb_kwargs.pop('team', None)
+        wandb_kwargs.pop('do_log_graph', None)
         
-        # Log the data directories
-        logger.info(f"Using data directory: {cfg.data_config.save_dir}")
-        logger.info(f"Using DL reps directory: {cfg.data_config.dl_reps_dir}")
-        
-        # Always create a new WandbLogger
-        wandb_logger = WandbLogger(project=cfg.wandb_logger_kwargs.get('project', 'default_project'),
-                                   name=cfg.wandb_logger_kwargs.get('name', 'default_run'),
-                                   config=cfg.to_dict())
-
-        L.seed_everything(cfg.seed)
-
-        config = cfg.config
-        data_config = cfg.data_config
-        optimization_config = cfg.optimization_config
-
-        if not hasattr(config, 'problem_type') or config.problem_type is None:
-            config.problem_type = "single_label_classification"
-
-        model_params = dict()
-        if cfg.pretrained_weights_fp is not None:
-            model_params["pretrained_weights_fp"] = cfg.pretrained_weights_fp
-
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        logger.info(f"Using device: {device}")
-        
-        logger.info("Initializing model")
-        LM = ESTForStreamClassificationLM(
-            config,
-            optimization_config,
-            cfg,
-            vocabulary_config=vocabulary_config,
-            oov_index=oov_index,
-            pretrained_weights_fp=cfg.pretrained_weights_fp,
-            do_debug_mode=cfg.do_debug_mode,
-            **model_params
+        wandb_logger = WandbLogger(
+            project=project,
+            name=name,
+            save_dir=cfg.save_dir,
+            **wandb_kwargs
         )
 
-        if not cfg.use_static_features:
-            # Remove static features from the batch
-            for dataset in [train_pyd, tuning_pyd, held_out_pyd]:
-                dataset.static_indices = None
-                dataset.static_measurement_indices = None
+    # Log to both standard logger and WandbLogger
+    logger.info("Starting training process")
+    if wandb.run is not None:
+        wandb.log({"info": "Starting training process"})
 
-        # Set the datasets
-        LM.train_dataset = train_pyd
-        LM.val_dataset = tuning_pyd
+    wandb_handler = WandbLoggerHandler(wandb_logger)
+    logger.addHandler(wandb_handler)
 
-        logger.info(f"Train dataset length: {len(train_pyd)}")
-        logger.info("Creating data loaders")
-        logger.info(f"cfg.use_static_features: {cfg.use_static_features}")
-        collate_fn = CollateFunction(
-            vocab_size=config.vocab_size,
-            oov_index=oov_index,
-            include_labels=True,
-            static_size=8,
-            max_seq_len=cfg.config.max_seq_len,
-            use_static_features=cfg.use_static_features
+    L.seed_everything(cfg.seed)
+
+    config = cfg.config
+    data_config = cfg.data_config
+    optimization_config = cfg.optimization_config
+
+    if not hasattr(config, 'problem_type') or config.problem_type is None:
+        config.problem_type = "single_label_classification"
+
+    model_params = dict()
+    if cfg.pretrained_weights_fp is not None:
+        model_params["pretrained_weights_fp"] = cfg.pretrained_weights_fp
+
+    # Initialize model
+    device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Using device: {device}")
+    
+    logger.info("Initializing model")
+    LM = ESTForStreamClassificationLM(
+        config,
+        optimization_config,
+        cfg,
+        vocabulary_config=vocabulary_config,
+        oov_index=oov_index,
+        pretrained_weights_fp=cfg.pretrained_weights_fp,
+        do_debug_mode=cfg.do_debug_mode,
+        **model_params
+    ).to(device)
+    logger.info(f"Model initialized after {time.time() - start_time:.2f} seconds")
+
+    # Move the model to the correct device (this should be redundant if done in __init__, but let's be sure)
+    model = LM.to(device)
+
+    # Log model parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    logger.info(f"Total parameters: {total_params}")
+    logger.info(f"Model memory usage: {sum(p.numel() * p.element_size() for p in model.parameters()) / 1024**2:.2f} MB")
+
+    # Check if all parameters are on the correct device
+    on_cpu = any(p.device.type == "cpu" for p in LM.parameters())
+    if on_cpu:
+        logger.warning("Some parameters are still on CPU. Moving all to CUDA...")
+        LM = LM.cuda()
+    
+    if not cfg.use_static_features:
+        # Remove static features from the batch
+        for dataset in [train_pyd, tuning_pyd, held_out_pyd]:
+            dataset.static_indices = None
+            dataset.static_measurement_indices = None
+
+    # Set the datasets
+    LM.train_dataset = train_pyd
+    LM.val_dataset = tuning_pyd
+
+    logger.info(f"Train dataset length: {len(train_pyd)}")
+    logger.info("Creating data loaders")
+    logger.info(f"cfg.use_static_features: {cfg.use_static_features}")
+    collate_fn = CollateFunction(
+        vocab_size=config.vocab_size,
+        oov_index=oov_index,
+        include_labels=True,
+        static_size=8,
+        max_seq_len=cfg.config.max_seq_len,
+        use_static_features=cfg.use_static_features
+    )
+
+    callbacks = [
+        LearningRateMonitor(logging_interval="step"),
+        ModelCheckpoint(
+            dirpath=cfg.save_dir / "checkpoints",
+            filename="{epoch}-{val_loss_epoch:.2f}",
+            monitor="val_loss_epoch", 
+            mode="min",
+            save_top_k=3,
+            save_weights_only=False,
+            save_last=True,
+            auto_insert_metric_name=False,
+        ),
+        EarlyStopping(
+            monitor='val_loss_epoch',
+            patience=cfg.optimization_config['patience'],
+            verbose=True,
+            mode='min',
+            check_finite=True
         )
+    ]
 
-        train_dataloader = DataLoader(
-            train_pyd,
-            batch_size=optimization_config['batch_size'],
-            collate_fn=collate_fn,
-            shuffle=True,
-            num_workers=optimization_config['num_dataloader_workers'],
-            pin_memory=True
-        )
+    # Add the callbacks
+    callbacks.append(NCCLErrorHandler())
 
-        tuning_dataloader = DataLoader(
-            tuning_pyd,
-            batch_size=optimization_config['validation_batch_size'],
-            collate_fn=collate_fn,
-            shuffle=False,
-            num_workers=optimization_config['num_dataloader_workers'],
-            pin_memory=True
-        )
+    logger.info("Setting up trainer")
+    
+    # Create a GradScaler for mixed precision training
+    scaler = GradScaler()
 
-        held_out_dataloader = DataLoader(
-            held_out_pyd,
-            batch_size=optimization_config['validation_batch_size'],
-            collate_fn=collate_fn,
-            shuffle=False,
-            num_workers=optimization_config['num_dataloader_workers'],
-            pin_memory=True
-        )
+    # Update trainer configuration
+    cfg.trainer_config["precision"] = "16-mixed"
 
-        callbacks = [
-            LearningRateMonitor(logging_interval="step"),
-            ModelCheckpoint(
-                dirpath=cfg.save_dir / "checkpoints",
-                filename="{epoch}-{val_loss_epoch:.2f}",
-                monitor="val_loss_epoch", 
-                mode="min",
-                save_top_k=3,
-                save_weights_only=False,
-                save_last=True,
-                auto_insert_metric_name=False,
-            ),
-            EarlyStopping(
-                monitor='val_loss_epoch',
-                patience=cfg.optimization_config['patience'],
-                verbose=True,
-                mode='min',
-                check_finite=True
-            )
-        ]
+    logger.info("Setting up distributed environment")
 
-        class NCCLErrorHandler(Callback):
-            def on_exception(self, trainer, pl_module, exception):
-                if isinstance(exception, RuntimeError) and "NCCL" in str(exception):
-                    print("NCCL error detected. Attempting to recover...")
-                    trainer.strategy.barrier()
-                    return True
-                return False
+    logger.info("Creating trainer")
+    trainer = L.Trainer(
+        **cfg.trainer_config,
+        callbacks=callbacks,
+        logger=wandb_logger,
+        max_epochs=optimization_config.get('max_epochs', 100),  # Ensure this is correctly passed
+        gradient_clip_val=config.max_grad_norm,
+        gradient_clip_algorithm="norm",
+        enable_progress_bar=True,
+        deterministic=False,
+        devices=torch.cuda.device_count(),  # Use all available GPUs
+        accelerator="gpu",
+        strategy="ddp_find_unused_parameters_true",
+    )
+    logger.info(f"Trainer created after {time.time() - start_time:.2f} seconds")
 
-        # Add the callbacks
-        callbacks.append(NCCLErrorHandler())
+    # Before wrapping with DistributedDataParallel
+    param_sum = sum(p.sum() for p in LM.parameters())
+    logger.info(f"Sum of parameters before DDP: {param_sum}")
+    dist.barrier()
+    logger.info("All processes passed barrier after trainer creation")
 
-        logger.info("Setting up trainer")
-        
-        # Create a GradScaler for mixed precision training
-        scaler = GradScaler()
+    logger.info(f"NCCL is available: {torch.distributed.is_nccl_available()}")
+    logger.info(f"Gloo is available: {torch.distributed.is_gloo_available()}")
 
-        # Update trainer configuration
-        cfg.trainer_config["precision"] = "16-mixed"
+    model = LM
 
-        logger.info("Creating trainer")
-        trainer = L.Trainer(
-            **cfg.trainer_config,
-            callbacks=callbacks,
-            logger=wandb_logger,
-            max_epochs=optimization_config.get('max_epochs', 100),
-            gradient_clip_val=config.max_grad_norm,
-            gradient_clip_algorithm="norm",
-            enable_progress_bar=True,
-            deterministic=False,
-        )
-        logger.info("Trainer created")
+    # Create distributed samplers for the dataloaders
+    train_sampler = torch.utils.data.distributed.DistributedSampler(train_pyd, shuffle=True, drop_last=True)
+    val_sampler = torch.utils.data.distributed.DistributedSampler(tuning_pyd, shuffle=False, drop_last=True)
+    test_sampler = torch.utils.data.distributed.DistributedSampler(held_out_pyd, shuffle=False, drop_last=True)
 
-        logger.info("Starting training")
-        trainer.fit(model=LM, train_dataloaders=train_dataloader, val_dataloaders=tuning_dataloader)
+    # Create the dataloaders
+    logger.info(f"Process {rank}/{world_size} creating dataloaders")
+    train_dataloader = DataLoader(
+        train_pyd,
+        batch_size=optimization_config['batch_size'],
+        sampler=train_sampler,
+        num_workers=optimization_config['num_dataloader_workers'],
+        pin_memory=True,
+        collate_fn=collate_fn,
+        drop_last=True
+    )
+    logger.info(f"Train dataloader created after {time.time() - start_time:.2f} seconds")
 
-        logger.info("Training completed. Evaluating on validation and test sets.")
-        
-        tuning_metrics = trainer.validate(model=LM, dataloaders=tuning_dataloader, ckpt_path="last") if len(tuning_pyd) > 0 else None
-        held_out_metrics = trainer.test(model=LM, dataloaders=held_out_dataloader, ckpt_path="last") if len(held_out_pyd) > 0 else None
+    tuning_dataloader = DataLoader(
+        tuning_pyd,
+        batch_size=optimization_config['validation_batch_size'],
+        sampler=val_sampler,
+        num_workers=optimization_config['num_dataloader_workers'],
+        pin_memory=True,
+        collate_fn=collate_fn,
+        drop_last=True
+    )
 
-        logger.info("Evaluation completed.")
+    held_out_dataloader = DataLoader(
+        held_out_pyd,
+        batch_size=optimization_config['validation_batch_size'],
+        sampler=test_sampler,
+        num_workers=optimization_config['num_dataloader_workers'],
+        pin_memory=True,
+        collate_fn=collate_fn,
+        drop_last=True
+    )
+    logger.info(f"All dataloaders created after {time.time() - start_time:.2f} seconds")
 
-        return None, tuning_metrics, held_out_metrics
+    # Start training
+    logger.info(f"Process {rank}/{world_size} about to start training")
+    torch.cuda.synchronize()
+    trainer.fit(model=LM, train_dataloaders=train_dataloader, val_dataloaders=tuning_dataloader)
+    torch.cuda.synchronize()
+    logger.info(f"Process {rank}/{world_size} completed training after {time.time() - start_time:.2f} seconds")
 
-    except Exception as e:
-        logger.exception(f"An error occurred during training: {str(e)}")
-        return None, None, None
-    finally:
-        pass
+    # Evaluation
+    logger.info("Training completed. Evaluating on validation and test sets.")
+    tuning_metrics = trainer.validate(model=model, dataloaders=tuning_dataloader, ckpt_path="best") if len(tuning_pyd) > 0 else None
+    held_out_metrics = trainer.test(model=model, dataloaders=held_out_dataloader, ckpt_path="best") if len(held_out_pyd) > 0 else None
+
+    logger.info(f"Evaluation completed after {time.time() - start_time:.2f} seconds")
+
+    # Ensure all processes are synchronized before ending
+    if dist.is_initialized():
+        dist.barrier()
+
+    # Only finish the Wandb run from the main process
+    if rank == 0 and wandb.run is not None:
+        wandb.finish()
+
+    return None, tuning_metrics, held_out_metrics
 
 __all__ = ['FinetuneConfig', 'train']
