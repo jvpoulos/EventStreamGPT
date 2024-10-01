@@ -646,7 +646,7 @@ class ESTForStreamClassificationLM(L.LightningModule):
         # Reset the metric accumulator for the next epoch
         self.metric_accumulator = defaultdict(list)
 
-    def calculate_feature_importance(self, num_samples=200):
+    def calculate_feature_importance(self, num_samples=500):
         val_loader = self.val_dataloader()
         samples = []
         for i, batch in enumerate(val_loader):
@@ -776,7 +776,7 @@ class ESTForStreamClassificationLM(L.LightningModule):
 
         # Only watch the model from the main process
         if self.trainer.is_global_zero:
-            wandb.watch(self.model, log="all", log_freq=100)
+            wandb.watch(self.model, log="all", log_freq=500)
 
         if hasattr(outputs, 'loss') and (torch.isnan(outputs.loss).any() or torch.isinf(outputs.loss).any()):
             self.custom_logger.warning("NaN or Inf detected in model outputs")
@@ -1320,16 +1320,16 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_c
         LearningRateMonitor(logging_interval="step"),
         ModelCheckpoint(
             dirpath=cfg.save_dir / "checkpoints",
-            filename="{epoch}-{val_loss_epoch:.2f}",
-            monitor="val_loss_epoch", 
-            mode="min",
+            filename="{epoch}-{val_auc_epoch:.2f}",
+            monitor="val_auc_epoch", 
+            mode="max",
             save_top_k=3,
             save_weights_only=False,
             save_last=True,
             auto_insert_metric_name=False,
         ),
         EarlyStopping(
-            monitor='val_loss_epoch',
+            monitor='val_auc_epoch',
             patience=cfg.optimization_config['patience'],
             verbose=True,
             mode='min',

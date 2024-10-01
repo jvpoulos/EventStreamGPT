@@ -308,30 +308,15 @@ class InnerSelfAttention(nn.Module):
         return attn_output, attn_weights
 
     def _adjust_attention_mask(self, attention_mask, bsz, num_heads, seq_len):
-        # Ensure correct input shape
         logger.debug(f"Input attention mask shape: {attention_mask.shape}")
 
         if attention_mask is None:
-            # If no attention mask is provided, create a default one
-            attention_mask = torch.ones((bsz, seq_len), device=self.device)
+            return None
 
-        if attention_mask.dim() == 2:  # Assume [bsz, seq_len]
+        if attention_mask.dim() == 2:  # [bsz, seq_len]
             attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
-        elif attention_mask.dim() == 3:  # Assume [bsz, 1, seq_len]
+        elif attention_mask.dim() == 3:  # [bsz, 1, seq_len]
             attention_mask = attention_mask.unsqueeze(1)
-        elif attention_mask.dim() == 4:  # Assume [bsz, num_heads, seq_len, seq_len]
-            pass
-        else:
-            raise ValueError(f"Unexpected attention mask shape: {attention_mask.shape}")
-
-        # Ensure the batch size is consistent
-        if attention_mask.size(0) != bsz:
-            logger.warning(f"Adjusting attention mask batch size from {attention_mask.size(0)} to {bsz}.")
-            if attention_mask.size(0) < bsz:
-                # Repeat the tensor to match the target batch size
-                repeat_factor = (bsz + attention_mask.size(0) - 1) // attention_mask.size(0)
-                attention_mask = attention_mask.repeat(repeat_factor, 1, 1, 1)
-            attention_mask = attention_mask[:bsz]
 
         # Adjust sequence length if necessary
         if attention_mask.size(-1) != seq_len:
@@ -341,14 +326,14 @@ class InnerSelfAttention(nn.Module):
             else:
                 attention_mask = attention_mask[..., :seq_len]
 
-        # Ensure the mask has the correct number of heads
+        # Expand for multiple heads without using repeat
         if attention_mask.size(1) != num_heads:
-            logger.warning(f"Adjusting attention mask number of heads from {attention_mask.size(1)} to {num_heads}.")
             attention_mask = attention_mask.expand(-1, num_heads, -1, -1)
 
         # Convert boolean mask to float mask
         attention_mask = (1.0 - attention_mask.to(torch.float32)) * torch.finfo(torch.float32).min
 
+        logger.debug(f"Adjusted attention mask shape: {attention_mask.shape}")
         return attention_mask
     
     def forward(self, hidden_states, attention_mask=None, layer_past=None, head_mask=None, use_cache=False, output_attentions=False, static_kv_first: bool = False):
@@ -363,18 +348,10 @@ class InnerSelfAttention(nn.Module):
         query = self.q_proj(hidden_states)
         key = self.k_proj(hidden_states)
         value = self.v_proj(hidden_states)
-        
-        logger.debug(f"Query shape before split_heads: {query.shape}")
-        logger.debug(f"Key shape before split_heads: {key.shape}")
-        logger.debug(f"Value shape before split_heads: {value.shape}")
 
         query = self._split_heads(query, self.num_heads, self.head_dim)
         key = self._split_heads(key, self.num_heads, self.head_dim)
         value = self._split_heads(value, self.num_heads, self.head_dim)
-
-        logger.debug(f"Query shape after split_heads: {query.shape}")
-        logger.debug(f"Key shape after split_heads: {key.shape}")
-        logger.debug(f"Value shape after split_heads: {value.shape}")
 
         if attention_mask is not None:
             attention_mask = self._adjust_attention_mask(attention_mask, bsz, self.num_heads, seq_len)
@@ -387,32 +364,76 @@ class InnerSelfAttention(nn.Module):
                 
                 logger.debug(f"QKV shape for Flash Attention: {qkv.shape}")
                 
-                attn_output = flash_attn_qkvpacked_func(
+                class FlashAttentionFunction(torch.autograd.Function):
+                    @staticmethod
+                    def forward(ctx, qkv, dropout_p, softmax_scale, causal):
+                        output = flash_attn_qkvpacked_func(
+                            qkv,
+                            dropout_p=dropout_p,
+                            softmax_scale=softmax_scale,
+                            causal=causal
+                        )
+                        ctx.save_for_backward(qkv)
+                        ctx.dropout_p = dropout_p
+                        ctx.softmax_scale = softmax_scale
+                        ctx.causal = causal
+                        return output
+
+                    @staticmethod
+                    def backward(ctx, grad_output):
+                        qkv, = ctx.saved_tensors
+                        try:
+                            # Use the custom backward function if available
+                            if hasattr(flash_attn_qkvpacked_func, 'backward'):
+                                grad_qkv, = flash_attn_qkvpacked_func.backward(
+                                    grad_output,
+                                    qkv,
+                                    dropout_p=ctx.dropout_p,
+                                    softmax_scale=ctx.softmax_scale,
+                                    causal=ctx.causal
+                                )
+                            else:
+                                # Fallback to autograd if backward is not available
+                                grad_qkv = torch.autograd.grad(
+                                    flash_attn_qkvpacked_func(
+                                        qkv,
+                                        dropout_p=ctx.dropout_p,
+                                        softmax_scale=ctx.softmax_scale,
+                                        causal=ctx.causal
+                                    ),
+                                    qkv,
+                                    grad_outputs=grad_output
+                                )[0]
+                        except RuntimeError as e:
+                            logger.warning(f"Flash Attention backward pass failed: {str(e)}. Falling back to standard attention.")
+                            return None, None, None, None
+                        return grad_qkv, None, None, None
+
+                attn_output = FlashAttentionFunction.apply(
                     qkv,
-                    dropout_p=self.attn_dropout.p if self.training else 0.0,
-                    softmax_scale=None,
-                    causal=self.causal
+                    self.attn_dropout.p if self.training else 0.0,
+                    None,
+                    self.causal
                 )
                 
                 # Reshape back
                 attn_output = attn_output.permute(0, 2, 1, 3).contiguous()  # [bsz, num_heads, seq_len, head_dim]
                 logger.debug(f"attn_output shape after Flash Attention: {attn_output.shape}")
-                attn_weights = None
+                attn_weights = None  # Flash Attention doesn't return attention weights
             except Exception as e:
                 logger.warning(f"Flash Attention failed: {str(e)}. Falling back to standard attention.")
                 attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask)
         else:
-            # Standard attention implementation
             attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask)
 
-        logger.debug(f"attn_output shape after attention: {attn_output.shape}")
-
-        # Merge heads
         attn_output = self._merge_heads(attn_output, self.num_heads, self.head_dim)
-        logger.debug(f"attn_output shape after merge_heads: {attn_output.shape}")
-
-        # Project back to model dim
         attn_output = self.out_proj(attn_output)
+
+        # Ensure attn_output has the same shape as the input
+        if attn_output.shape != hidden_states.shape:
+            logger.warning(f"Reshaping attn_output from {attn_output.shape} to {hidden_states.shape}")
+            attn_output = attn_output.view(*hidden_states.shape)
+
         attn_output = self.resid_dropout(attn_output)
 
         outputs = {"attn_output": attn_output}
@@ -442,21 +463,11 @@ class CustomLayerNorm(nn.Module):
         original_shape = x.shape
         original_dtype = x.dtype
 
-        if x.dim() == 4:
-            batch_size, seq_len, dep_graph_len, hidden_size = x.shape
-            x = x.contiguous().view(-1, hidden_size)
-        elif x.dim() == 3:
-            batch_size, seq_len, hidden_size = x.shape
-            x = x.contiguous().view(-1, hidden_size)
-        elif x.dim() == 2:
-            pass
-        else:
-            raise ValueError(f"Expected 2D, 3D or 4D input, got {x.dim()}D")
-
         # Ensure computations are done in float32 for stability
         x = x.float()
 
         # Compute mean and variance with better numerical stability
+        # Compute along the last dimension
         mean = x.mean(dim=-1, keepdim=True)
         var = x.var(dim=-1, unbiased=False, keepdim=True)
 
@@ -480,6 +491,7 @@ class CustomLayerNorm(nn.Module):
         # Convert back to original dtype
         x = x.to(original_dtype)
 
+        logger.debug(f"CustomLayerNorm output shape: {x.shape}")
         return x
 
     def _check_gradients(self, grad, name):
@@ -504,7 +516,6 @@ class InnerAttention(nn.Module):
         )
         self.seq_window_size = config.seq_window_size
 
-
     def forward(self, hidden_states, attention_mask=None, layer_past=None, head_mask=None, use_cache=False, output_attentions=False, static_kv_first: bool = False):
         # Ensure hidden_states is 3D
         if hidden_states.dim() == 2:
@@ -528,6 +539,18 @@ class InnerAttention(nn.Module):
                 self.attention.num_heads, 
                 normalized_hidden_states.shape[1]
             )
+
+        # Ensure the sequence length matches seq_window_size
+        seq_window_size = self.seq_window_size
+        if normalized_hidden_states.shape[1] > seq_window_size:
+            normalized_hidden_states = normalized_hidden_states[:, :seq_window_size, :]
+            if attention_mask is not None:
+                attention_mask = attention_mask[:, :, :, :seq_window_size]
+        elif normalized_hidden_states.shape[1] < seq_window_size:
+            pad_length = seq_window_size - normalized_hidden_states.shape[1]
+            normalized_hidden_states = F.pad(normalized_hidden_states, (0, 0, 0, pad_length), mode='constant', value=0)
+            if attention_mask is not None:
+                attention_mask = F.pad(attention_mask, (0, pad_length), value=float('-inf'))
 
         attn_output, outputs = self.attention(
             normalized_hidden_states,
@@ -562,24 +585,40 @@ class InnerBlock(nn.Module):
     def forward(self, hidden_states, attention_mask=None, layer_past=None, head_mask=None, use_cache=False, output_attentions=False, static_kv_first: bool = False):
         logger.debug(f"InnerBlock input hidden_states shape: {hidden_states.shape}")
         
+        # Ensure hidden_states is 3D
+        if hidden_states.dim() == 2:
+            logger.warning(f"Received 2D hidden_states, reshaping to 3D. Shape before: {hidden_states.shape}")
+            hidden_states = hidden_states.unsqueeze(1)  # Add sequence dimension
+            logger.warning(f"Shape after reshape: {hidden_states.shape}")
+        elif hidden_states.dim() != 3:
+            raise ValueError(f"Expected 2D or 3D hidden_states, got {hidden_states.dim()}D")
+        
         residual = hidden_states
         hidden_states = self.layer_norm1(hidden_states)
         
         logger.debug(f"InnerBlock hidden_states shape after layer_norm1: {hidden_states.shape}")
 
+        # Ensure hidden_states is still 3D after layer_norm1
+        if hidden_states.dim() == 2:
+            logger.warning(f"hidden_states became 2D after layer_norm1. Reshaping to 3D. Shape before: {hidden_states.shape}")
+            hidden_states = hidden_states.unsqueeze(1)  # Add sequence dimension
+            logger.warning(f"Shape after reshape: {hidden_states.shape}")
+
         # Adjust sequence length if necessary
         seq_window_size = self.seq_window_size
-        if hidden_states.size(1) != seq_window_size:
-            logger.warning(f"Adjusting sequence length from {hidden_states.size(1)} to {seq_window_size}.")
-            if hidden_states.size(1) < seq_window_size:
-                pad_length = seq_window_size - hidden_states.size(1)
-                hidden_states = F.pad(hidden_states, (0, 0, 0, pad_length))
-                if attention_mask is not None:
-                    attention_mask = F.pad(attention_mask, (0, pad_length), value=float('-inf'))
-            else:
-                hidden_states = hidden_states[:, :seq_window_size, :]
-                if attention_mask is not None:
-                    attention_mask = attention_mask[:, :, :, :seq_window_size]
+        current_seq_len = hidden_states.size(1)
+        
+        if current_seq_len > seq_window_size:
+            logger.warning(f"Truncating sequence length from {current_seq_len} to {seq_window_size}.")
+            hidden_states = hidden_states[:, :seq_window_size, :]
+            if attention_mask is not None:
+                attention_mask = attention_mask[:, :, :, :seq_window_size]
+        elif current_seq_len < seq_window_size:
+            logger.warning(f"Padding sequence length from {current_seq_len} to {seq_window_size}.")
+            pad_length = seq_window_size - current_seq_len
+            hidden_states = F.pad(hidden_states, (0, 0, 0, pad_length))
+            if attention_mask is not None:
+                attention_mask = F.pad(attention_mask, (0, pad_length), value=float('-inf'))
 
         attn_output, attn_outputs = self.attn(
             hidden_states,
@@ -591,12 +630,18 @@ class InnerBlock(nn.Module):
             static_kv_first=static_kv_first,
         )
 
-        # Ensure attn_output has the same batch size and sequence length as residual
-        if attn_output.shape[:2] != residual.shape[:2]:
-            logger.warning(f"Adjusting attn_output shape from {attn_output.shape} to {residual.shape}")
-            attn_output = attn_output[:residual.size(0), :residual.size(1), :]
+        # Ensure attn_output has the same shape as residual
+        if attn_output.shape != residual.shape:
+            logger.warning(f"Reshaping attn_output from {attn_output.shape} to {residual.shape}")
+            try:
+                attn_output = attn_output.view(*residual.shape)
+            except RuntimeError:
+                logger.error(f"Failed to reshape attn_output. Input size: {attn_output.numel()}, output shape: {residual.shape}")
+                # Fallback: Repeat or truncate to match the required shape
+                attn_output = attn_output.view(-1).repeat(residual.numel() // attn_output.numel() + 1)[:residual.numel()].view(*residual.shape)
 
         hidden_states = attn_output + residual
+        
         residual = hidden_states
         hidden_states = self.layer_norm2(hidden_states)
         feed_forward_hidden_states = self.mlp(hidden_states)
@@ -1128,7 +1173,7 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
         if input_embeds is not None:
             input_embeds = input_embeds.to(self.dtype)
         
-        hidden_states = input_embeds
+        hidden_states = input_embeds if input_embeds is not None else self.input_layer(...)
         
         # Ensure consistent dtype for hidden_states
         hidden_states = hidden_states.to(self.dtype)
@@ -1137,8 +1182,13 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
 
         # Ensure hidden_states is 3D
         if hidden_states.dim() == 2:
+            logger.warning(f"hidden_states is 2D with shape {hidden_states.shape}. Unsqueezing to 3D.")
             hidden_states = hidden_states.unsqueeze(1)
-            logger.debug(f"Expanded hidden_states shape: {hidden_states.shape}")
+        elif hidden_states.dim() != 3:
+            raise ValueError(f"Expected hidden_states to be 2D or 3D, but got {hidden_states.dim()}D with shape {hidden_states.shape}")
+        
+        logger.debug(f"hidden_states shape before entering transformer blocks: {hidden_states.shape}")
+
 
         if seq_attention_mask is None:
             seq_attention_mask = torch.ones(hidden_states.size(0), hidden_states.size(1), device=hidden_states.device)
@@ -1148,8 +1198,11 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
 
         # Truncate the sequence length to seq_window_size
         seq_window_size = self.config.seq_window_size
-        hidden_states = hidden_states[:, :seq_window_size, :]
-        seq_attention_mask = seq_attention_mask[:, :, :, :seq_window_size]
+        if hidden_states.size(1) > seq_window_size:
+            logger.warning(f"Truncating sequence length from {hidden_states.size(1)} to {seq_window_size}")
+            hidden_states = hidden_states[:, :seq_window_size, :]
+            if seq_attention_mask is not None:
+                seq_attention_mask = seq_attention_mask[:, :, :, :seq_window_size]
 
         head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
 
@@ -1202,6 +1255,13 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
                 )
 
                 hidden_states, extra_return_info = outputs
+                logger.debug(f"After block {i}: hidden_states shape: {hidden_states.shape}")
+
+                # Ensure hidden_states has the correct shape
+                if hidden_states.shape != (local_batch_size, self.config.seq_window_size, self.config.hidden_size):
+                    logger.warning(f"Reshaping hidden_states from {hidden_states.shape} to ({local_batch_size}, {self.config.seq_window_size}, {self.config.hidden_size})")
+                    hidden_states = hidden_states.view(local_batch_size, self.config.seq_window_size, self.config.hidden_size)
+                logger.debug(f"After block {i}: hidden_states shape: {hidden_states.shape}")
 
                 # Apply gradient clipping if enabled
                 if self.training and self.use_grad_value_clipping:
