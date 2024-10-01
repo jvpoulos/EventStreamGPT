@@ -542,9 +542,11 @@ class StructuredTransformerConfig(PretrainedConfig):
         use_gradient_checkpointing: bool = False,
         use_addition_for_static: bool = True,
         device=None,
+        dtype: str = "float32",
         **kwargs,
     ):
         self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.dtype = dtype
         self.problem_type = problem_type
         self.do_use_sinusoidal = do_use_sinusoidal  # Initialize the attribute here
         # Resetting default values to appropriate types

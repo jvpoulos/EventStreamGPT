@@ -24,9 +24,7 @@ from .utils import safe_masked_max, safe_weighted_avg
 
 from ..data.vocabulary import VocabularyConfig
 
-import wandb
 import logging
-from pytorch_lightning.loggers import WandbLogger
 
 # Set up the standard logger
 logger = logging.getLogger(__name__)
@@ -81,7 +79,11 @@ class ESTForStreamClassification(LightningModule):
         # Initialize metric accumulator
         self.metric_accumulator = defaultdict(list)
 
-    def forward(self, batch):
+    # Add a method to change the dtype
+    def set_dtype(self, dtype):
+        self.to(dtype)
+                
+    def forward(self, batch, output_attentions=False):
         # Extract inputs from the batch
         dynamic_indices = batch['dynamic_indices']
         dynamic_values = batch.get('dynamic_values')
@@ -91,6 +93,37 @@ class ESTForStreamClassification(LightningModule):
         time = batch.get('time')
         labels = batch.get('labels')
         seq_attention_mask = batch.get('attention_mask')
+
+        # Convert indices to long tensors
+        dynamic_indices = dynamic_indices.long()
+        if dynamic_measurement_indices is not None:
+            dynamic_measurement_indices = dynamic_measurement_indices.long()
+        if static_indices is not None:
+            static_indices = static_indices.long()  # Convert to long
+        if static_measurement_indices is not None:
+            static_measurement_indices = static_measurement_indices.long()
+
+        # Log shapes and dtypes
+        logger.debug(f"dynamic_indices shape: {dynamic_indices.shape}, dtype: {dynamic_indices.dtype}")
+        logger.debug(f"dynamic_values shape: {dynamic_values.shape if dynamic_values is not None else None}, dtype: {dynamic_values.dtype if dynamic_values is not None else None}")
+        logger.debug(f"dynamic_measurement_indices shape: {dynamic_measurement_indices.shape if dynamic_measurement_indices is not None else None}, dtype: {dynamic_measurement_indices.dtype if dynamic_measurement_indices is not None else None}")
+        logger.debug(f"static_indices shape: {static_indices.shape if static_indices is not None else None}, dtype: {static_indices.dtype if static_indices is not None else None}")
+        logger.debug(f"static_measurement_indices shape: {static_measurement_indices.shape if static_measurement_indices is not None else None}, dtype: {static_measurement_indices.dtype if static_measurement_indices is not None else None}")
+        logger.debug(f"time shape: {time.shape if time is not None else None}, dtype: {time.dtype if time is not None else None}")
+
+        # Update dtype conversion:
+        dtype = self.encoder.dtype  # Use the encoder's dtype
+        dynamic_indices = dynamic_indices.to(dtype)
+        if dynamic_values is not None:
+            dynamic_values = dynamic_values.to(dtype)
+        if dynamic_measurement_indices is not None:
+            dynamic_measurement_indices = dynamic_measurement_indices.to(dtype)
+        if static_indices is not None:
+            static_indices = static_indices.to(dtype)
+        if static_measurement_indices is not None:
+            static_measurement_indices = static_measurement_indices.to(dtype)
+        if time is not None:
+            time = time.to(dtype)
 
         # Create seq_attention_mask if needed
         if seq_attention_mask is None:
@@ -107,7 +140,8 @@ class ESTForStreamClassification(LightningModule):
             static_indices=static_indices,
             static_measurement_indices=static_measurement_indices,
             time=time,
-            seq_attention_mask=seq_attention_mask
+            seq_attention_mask=seq_attention_mask,
+            output_attentions=output_attentions
         )
         
         event_encoded = encoded.last_hidden_state
@@ -131,11 +165,7 @@ class ESTForStreamClassification(LightningModule):
 
         # Process static indices only if use_static_features is True
         if self.config.use_static_features and static_indices is not None:
-            static_embed = self.static_indices_embedding(static_indices).mean(dim=1)
-            # Ensure static_embed has the correct batch size
-            if static_embed.size(0) != batch_size:
-                logger.warning(f"Adjusting static_embed size from {static_embed.size(0)} to {batch_size}")
-                static_embed = static_embed[:batch_size]
+            static_embed = self.static_indices_embedding(static_indices.long()).mean(dim=1)  # Convert to long here
             combined_embed = self.static_weight * static_embed + self.dynamic_weight * pooled_dynamic
         else:
             combined_embed = pooled_dynamic
@@ -177,7 +207,8 @@ class ESTForStreamClassification(LightningModule):
             accuracy=accuracy,
             auc=auc,
             auprc=auprc,
-            f1=f1
+            f1=f1,
+            attentions=encoded.attentions if output_attentions else None
         )
 
     def on_epoch_start(self):

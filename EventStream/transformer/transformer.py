@@ -162,7 +162,7 @@ class InnerSelfAttention(nn.Module):
         config: StructuredTransformerConfig,
         attention_type: str,
         window_size: int,
-        layer_id: int,
+        layer_id: int
     ):
         super().__init__()
         self.config = config  # Store the config as an attribute
@@ -195,11 +195,12 @@ class InnerSelfAttention(nn.Module):
         self.head_dim = config.head_dim
         assert self.head_dim * self.num_heads == self.embed_dim, f"embed_dim must be divisible by num_heads (got `embed_dim`: {self.embed_dim} and `num_heads`: {self.num_heads})."
 
-        # Initialize linear layers with float32
-        self.k_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False).to(torch.float32)
-        self.v_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False).to(torch.float32)
-        self.q_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False).to(torch.float32)
-        self.out_proj = nn.Linear(self.num_heads * self.head_dim, self.embed_dim, bias=True).to(torch.float32)
+        # Initialize linear layers with the same dtype as the config
+        self.dtype = getattr(torch, config.dtype) if hasattr(config, 'dtype') else torch.float32
+        self.q_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False).to(self.dtype)
+        self.k_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False).to(self.dtype)
+        self.v_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False).to(self.dtype)
+        self.out_proj = nn.Linear(self.num_heads * self.head_dim, self.embed_dim, bias=True).to(self.dtype)
 
     def _split_heads(self, tensor, num_heads, attn_head_size):
         if tensor.dim() == 2:
@@ -255,6 +256,7 @@ class InnerSelfAttention(nn.Module):
                 logger.warning(f"Flash Attention failed: {str(e)}. Falling back to standard attention.")
 
         # Standard attention implementation
+        query = query.to(key.dtype)
         attn_weights = torch.matmul(query, key.transpose(-1, -2)) / math.sqrt(self.head_dim)
         logger.debug(f"attn_weights shape after matmul: {attn_weights.shape}")
 
@@ -304,14 +306,6 @@ class InnerSelfAttention(nn.Module):
             attn_output = torch.where(torch.isnan(attn_output), torch.zeros_like(attn_output), attn_output)
 
         return attn_output, attn_weights
-
-    def log_attention_weights(self, attn_weights, layer_idx):
-        if wandb.run is not None:
-            fig, ax = plt.subplots(figsize=(10, 10))
-            sns.heatmap(attn_weights[0].mean(dim=0).cpu().detach().numpy(), ax=ax)
-            plt.title(f"Attention weights for layer {layer_idx}")
-            wandb.log({f"attention_weights/layer_{layer_idx}": wandb.Image(fig)})
-            plt.close(fig)
 
     def _adjust_attention_mask(self, attention_mask, bsz, num_heads, seq_len):
         # Ensure correct input shape
@@ -364,6 +358,8 @@ class InnerSelfAttention(nn.Module):
         bsz, seq_len, _ = hidden_states.shape
         logger.debug(f"Input hidden_states shape: {hidden_states.shape}")
         
+        # Ensure consistent dtype for query, key, and value
+        hidden_states = hidden_states.to(self.dtype)
         query = self.q_proj(hidden_states)
         key = self.k_proj(hidden_states)
         value = self.v_proj(hidden_states)
@@ -913,6 +909,19 @@ class ConditionallyIndependentPointProcessInputLayer(nn.Module):
         static_measurement_indices = input_features.get('static_measurement_indices')
         time = input_features.get('time')
 
+        # Convert indices to LongTensor
+        if dynamic_indices is not None:
+            dynamic_indices = dynamic_indices.long()
+        if dynamic_measurement_indices is not None:
+            dynamic_measurement_indices = dynamic_measurement_indices.long()
+        if static_indices is not None:
+            static_indices = static_indices.long()
+        if static_measurement_indices is not None:
+            static_measurement_indices = static_measurement_indices.long()
+
+        logger.debug(f"After conversion - dynamic_indices dtype: {dynamic_indices.dtype if dynamic_indices is not None else None}")
+        logger.debug(f"After conversion - dynamic_measurement_indices dtype: {dynamic_measurement_indices.dtype if dynamic_measurement_indices is not None else None}")
+
         # Process dynamic indices and measurement indices
         data_embed = self.data_embedding_layer({
             'dynamic_indices': dynamic_indices,
@@ -1031,6 +1040,17 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
         self.use_grad_value_clipping = config.optimization_config.get('use_grad_value_clipping', True)
         self.clip_grad_value = config.optimization_config.get('clip_grad_value', 1.0)
 
+        # Instead of setting self.dtype, use a property
+        self._dtype = torch.float32
+
+    @property
+    def dtype(self):
+        return self._dtype
+
+    @dtype.setter
+    def dtype(self, value):
+        self._dtype = value
+     
     def forward(
         self,
         dynamic_indices: Union[torch.Tensor, Dict[str, torch.Tensor]],
@@ -1050,12 +1070,13 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
     ) -> tuple[torch.Tensor] | TransformerOutputWithPast:
         self.forward_step += 1
         logger.debug(f"Forward pass step: {self.forward_step}")
-        logger.debug(f"Input shapes: dynamic_indices: {dynamic_indices.shape if isinstance(dynamic_indices, torch.Tensor) else type(dynamic_indices)}, "
-                     f"dynamic_values: {dynamic_values.shape if dynamic_values is not None else None}, "
-                     f"dynamic_measurement_indices: {dynamic_measurement_indices.shape if dynamic_measurement_indices is not None else None}, "
-                     f"static_indices: {static_indices.shape if static_indices is not None else None}, "
-                     f"static_measurement_indices: {static_measurement_indices.shape if static_measurement_indices is not None else None}, "
-                     f"time: {time.shape if time is not None else None}")
+        # Log input shapes and dtypes
+        logger.debug(f"dynamic_indices shape: {dynamic_indices.shape if isinstance(dynamic_indices, torch.Tensor) else type(dynamic_indices)}, dtype: {dynamic_indices.dtype if isinstance(dynamic_indices, torch.Tensor) else None}")
+        logger.debug(f"dynamic_values shape: {dynamic_values.shape if dynamic_values is not None else None}, dtype: {dynamic_values.dtype if dynamic_values is not None else None}")
+        logger.debug(f"dynamic_measurement_indices shape: {dynamic_measurement_indices.shape if dynamic_measurement_indices is not None else None}, dtype: {dynamic_measurement_indices.dtype if dynamic_measurement_indices is not None else None}")
+        logger.debug(f"static_indices shape: {static_indices.shape if static_indices is not None else None}, dtype: {static_indices.dtype if static_indices is not None else None}")
+        logger.debug(f"static_measurement_indices shape: {static_measurement_indices.shape if static_measurement_indices is not None else None}, dtype: {static_measurement_indices.dtype if static_measurement_indices is not None else None}")
+        logger.debug(f"time shape: {time.shape if time is not None else None}, dtype: {time.dtype if time is not None else None}")
         
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -1082,6 +1103,19 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
         time = self._adjust_tensor_shape(time, local_batch_size, "time")
 
         if input_embeds is None:
+            # Convert indices to LongTensor
+            if isinstance(dynamic_indices, torch.Tensor):
+                dynamic_indices = dynamic_indices.long()
+            if dynamic_measurement_indices is not None:
+                dynamic_measurement_indices = dynamic_measurement_indices.long()
+            if static_indices is not None:
+                static_indices = static_indices.long()
+            if static_measurement_indices is not None:
+                static_measurement_indices = static_measurement_indices.long()
+
+            logger.debug(f"Before input_layer - dynamic_indices dtype: {dynamic_indices.dtype if isinstance(dynamic_indices, torch.Tensor) else None}")
+            logger.debug(f"Before input_layer - dynamic_measurement_indices dtype: {dynamic_measurement_indices.dtype if dynamic_measurement_indices is not None else None}")
+
             input_embeds = self.input_layer({
                 'dynamic_indices': dynamic_indices,
                 'dynamic_values': dynamic_values,
@@ -1090,8 +1124,15 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
                 'static_measurement_indices': static_measurement_indices,
                 'time': time
             })
+            
+        if input_embeds is not None:
+            input_embeds = input_embeds.to(self.dtype)
         
         hidden_states = input_embeds
+        
+        # Ensure consistent dtype for hidden_states
+        hidden_states = hidden_states.to(self.dtype)
+        
         logger.debug(f"hidden_states shape after input layer: {hidden_states.shape}")
 
         # Ensure hidden_states is 3D
@@ -1162,13 +1203,6 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
 
                 hidden_states, extra_return_info = outputs
 
-                if output_attentions:
-                    all_self_attentions = all_self_attentions + (extra_return_info.get("attn_weights"),)
-                    if wandb.run is not None:
-                        attn_weights = extra_return_info.get("attn_weights")
-                        if attn_weights is not None:
-                            block.attn.attention.log_attention_weights(attn_weights, i)
-
                 # Apply gradient clipping if enabled
                 if self.training and self.use_grad_value_clipping:
                     # Check if any parameters have gradients
@@ -1220,7 +1254,7 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
             last_hidden_state=hidden_states,
             past_key_values=presents,
             hidden_states=all_hidden_states,
-            attentions=all_self_attentions
+            attentions=all_self_attentions if output_attentions else None
         )
 
     def _adjust_tensor_shape(self, tensor, target_batch_size, name):

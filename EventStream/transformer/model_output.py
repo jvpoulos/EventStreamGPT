@@ -1226,6 +1226,7 @@ class StreamClassificationModelOutput(ModelOutput):
     auprc: torch.FloatTensor = None
     f1: torch.FloatTensor = None
     debug_info: dict = None
+    attentions: list[torch.Tensor] | None = None
 
 
 class GenerativeOutputLayerBase(torch.nn.Module):

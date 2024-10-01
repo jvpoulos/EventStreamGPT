@@ -214,20 +214,10 @@ class ESTForStreamClassificationLM(L.LightningModule):
         self.custom_logger = logging.getLogger(self.__class__.__name__)
         self.custom_logger.setLevel(logging.INFO)
 
-        # Initialize rank
-        if dist.is_initialized():
-            self.rank = dist.get_rank()
-        else:
-            self.rank = 0
-
-        # Initialize Wandb only for the main process
-        if self.rank == 0:
-            if wandb.run is None:
-                wandb.init(project=cfg.wandb_logger_kwargs.get("project", "default_project"),
-                           name=cfg.wandb_logger_kwargs.get("name", "default_run"),
-                           config=cfg.to_dict())
-            else:
-                self.custom_logger.info("Using existing wandb run")
+    def set_dtype(self, dtype):
+        self.to(dtype)
+        if hasattr(self, 'model'):
+            self.model.to(dtype)
 
     def setup(self, stage=None):
         # This method is called by PyTorch Lightning before training/testing
@@ -299,13 +289,22 @@ class ESTForStreamClassificationLM(L.LightningModule):
         )
 
     def val_dataloader(self):
+        collate_fn = CollateFunction(
+            vocab_size=self.config.vocab_size,
+            oov_index=self.oov_index,
+            include_labels=True,
+            static_size=8,
+            max_seq_len=self.config.max_seq_len,
+            use_static_features=self.cfg.use_static_features
+        )
         return DataLoader(
             self.val_dataset,
             batch_size=self.optimization_config.validation_batch_size,
             sampler=self.val_sampler,
             shuffle=False,  # We don't shuffle the validation data
             num_workers=self.optimization_config.num_dataloader_workers,
-            pin_memory=True
+            pin_memory=True,
+            collate_fn=collate_fn
         )
 
     def on_train_epoch_start(self):
@@ -508,6 +507,28 @@ class ESTForStreamClassificationLM(L.LightningModule):
             f"{split}_roc_curve": roc_curve_plot
         })
 
+    def log_attention_weights(self, attentions, batch_idx):
+        if self.trainer.is_global_zero and wandb.run is not None:
+            for layer, attn in enumerate(attentions):
+                # Ensure attn is detached and moved to CPU
+                attn_cpu = attn.detach().cpu()
+                
+                # Check if attention weights are all zeros
+                if torch.all(attn_cpu == 0):
+                    logger.warning(f"All zero attention weights detected for layer {layer}, batch {batch_idx}")
+                    continue
+                
+                # Calculate average attention weights
+                attn_avg = attn_cpu.mean(dim=0).mean(dim=0).numpy()
+                
+                fig, ax = plt.subplots(figsize=(10, 10))
+                sns.heatmap(attn_avg, ax=ax, cmap='viridis', vmin=0, vmax=1)
+                plt.title(f"Average Attention Weights for Layer {layer} (Batch {batch_idx})")
+                plt.ylabel('Query position')
+                plt.xlabel('Key position')
+                wandb.log({f"attention_weights/layer_{layer}_batch_{batch_idx}": wandb.Image(fig)})
+                plt.close(fig)
+
     def log_debug(self, message):
         """Log debug messages to both the standard logger and WandB."""
         logging.getLogger(__name__).debug(message)
@@ -532,7 +553,7 @@ class ESTForStreamClassificationLM(L.LightningModule):
                 self.log_debug(f"Training batch {k} shape: {v.shape}")
 
         # Forward pass
-        outputs = self.model(batch)  # Pass the entire batch to the model
+        outputs = self.model(batch, output_attentions=True)  # Pass the entire batch to the model
         loss = outputs.loss
 
         if torch.isnan(loss) or torch.isinf(loss):
@@ -562,7 +583,7 @@ class ESTForStreamClassificationLM(L.LightningModule):
                 self.log_debug(f"Validation batch {k} shape: {v.shape}")
 
         # Forward pass
-        outputs = self.model(batch)  # Pass the entire batch to the model
+        outputs = self.model(batch, output_attentions=True)  # Pass the entire batch to the model
         
         if torch.isnan(outputs.loss) or torch.isinf(outputs.loss):
             self.log_debug(f"NaN or Inf loss detected in validation step {batch_idx}")
@@ -573,6 +594,11 @@ class ESTForStreamClassificationLM(L.LightningModule):
 
         # Log metrics
         self.log_metrics('val', outputs)
+
+        # Log attention weights if available
+        if outputs.attentions is not None:
+            self.log_attention_weights(outputs.attentions, batch_idx)
+
         return outputs.loss
 
     def test_step(self, batch, batch_idx):
@@ -620,14 +646,7 @@ class ESTForStreamClassificationLM(L.LightningModule):
         # Reset the metric accumulator for the next epoch
         self.metric_accumulator = defaultdict(list)
 
-    def calculate_feature_importance(self, num_samples=100):
-        """
-        Calculate feature importance using permutation importance.
-        
-        Args:
-            num_samples (int): Number of samples to use for importance calculation.
-        """
-        # Sample a subset of the validation data
+    def calculate_feature_importance(self, num_samples=200):
         val_loader = self.val_dataloader()
         samples = []
         for i, batch in enumerate(val_loader):
@@ -635,46 +654,53 @@ class ESTForStreamClassificationLM(L.LightningModule):
                 break
             samples.append(batch)
 
-        # Combine samples into a single batch
+        # Combine samples
         combined_batch = {
             key: torch.cat([sample[key] for sample in samples], dim=0)
             for key in samples[0].keys()
         }
 
-        # Calculate baseline performance
+        # Adjust sequence lengths if necessary
+        max_seq_len = self.config.max_seq_len
+        for key in ['dynamic_indices', 'dynamic_values', 'dynamic_measurement_indices', 'time']:
+            if combined_batch[key].size(1) > max_seq_len:
+                combined_batch[key] = combined_batch[key][:, :max_seq_len]
+        
+        combined_batch['seq_len'] = torch.clamp(combined_batch['seq_len'], max=max_seq_len)
+
         with torch.no_grad():
             baseline_output = self(combined_batch)
         baseline_loss = baseline_output.loss.item()
 
         feature_importance = {}
         for feature in combined_batch.keys():
-            if feature != 'labels':
-                # Create a copy of the batch with the current feature permuted
+            if feature not in ['labels', 'seq_len']:
                 permuted_batch = combined_batch.copy()
                 permuted_batch[feature] = permuted_batch[feature][torch.randperm(permuted_batch[feature].size(0))]
                 
-                # Calculate performance with permuted feature
+                # Ensure the permuted feature is of the correct dtype
+                if isinstance(permuted_batch[feature], torch.Tensor) and permuted_batch[feature].dtype.is_floating_point:
+                    permuted_batch[feature] = permuted_batch[feature].to(self.dtype)
+                
                 with torch.no_grad():
                     permuted_output = self(permuted_batch)
                 permuted_loss = permuted_output.loss.item()
                 
-                # Calculate importance as the difference in performance
                 importance = permuted_loss - baseline_loss
                 feature_importance[feature] = importance
 
-        # Normalize importance scores
         total_importance = sum(abs(score) for score in feature_importance.values())
         normalized_importance = {k: abs(v) / total_importance for k, v in feature_importance.items()}
 
-        # Log feature importance
-        wandb.log({"feature_importance": normalized_importance})
+        if self.trainer.is_global_zero and wandb.run is not None:
+            wandb.log({"feature_importance": wandb.plot.bar(
+                wandb.Table(data=[[k, v] for k, v in normalized_importance.items()], columns=["feature", "importance"]),
+                "feature",
+                "importance",
+                title="Feature Importance"
+            )})
 
         return normalized_importance
-
-    def log_to_wandb(self, *args, **kwargs):
-        # Only log to wandb from the main process
-        if self.rank == 0:
-            wandb.log(*args, **kwargs)
 
     def on_train_epoch_end(self):
         # Log accumulated metrics for the training phase
@@ -705,7 +731,15 @@ class ESTForStreamClassificationLM(L.LightningModule):
         self.val_labels = []
         self.log_accumulated_metrics('val')
 
+        # Calculate and log feature importance at the end of each epoch
+        self.calculate_feature_importance()
+
     def forward(self, batch, **kwargs):
+        # Convert all float tensors in the batch to the specified dtype
+        for key, value in batch.items():
+            if isinstance(value, torch.Tensor) and value.dtype.is_floating_point:
+                batch[key] = value.to(self.dtype)
+
         # Move batch to the correct device
         if isinstance(batch, dict):
             batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
@@ -741,7 +775,7 @@ class ESTForStreamClassificationLM(L.LightningModule):
         outputs = self.model(batch)
 
         # Only watch the model from the main process
-        if self.rank == 0:
+        if self.trainer.is_global_zero:
             wandb.watch(self.model, log="all", log_freq=100)
 
         if hasattr(outputs, 'loss') and (torch.isnan(outputs.loss).any() or torch.isinf(outputs.loss).any()):
@@ -1040,7 +1074,7 @@ class FinetuneConfig:
             self.wandb_logger_kwargs["project"] = reloaded_pretrain_config.wandb_logger_kwargs.project
 
 class CollateFunction:
-    def __init__(self, vocab_size, oov_index, include_labels=True, static_size=8, max_seq_len=None, use_static_features=True):
+    def __init__(self, vocab_size, oov_index, include_labels=True, static_size=8, max_seq_len=None, use_static_features=True, model_dtype=torch.float32):
         self.vocab_size = vocab_size
         self.oov_index = oov_index
         self.include_labels = include_labels
@@ -1049,6 +1083,8 @@ class CollateFunction:
         self.use_static_features = use_static_features
         self.logger = logging.getLogger(__name__)
         self.logger.info(f"CollateFunction initialized with use_static_features: {self.use_static_features}")
+
+        self.dtype = model_dtype
 
     def __call__(self, batch):
         self.logger.info(f"CollateFunction use_static_features: {self.use_static_features}")
@@ -1080,6 +1116,11 @@ class CollateFunction:
             self.logger.info(f"Collated batch keys: {collated_batch.keys()}")
             self.logger.info(f"Collated batch sizes: {[(k, v.shape) for k, v in collated_batch.items()]}")
 
+            # Convert all float tensors to the specified dtype
+            for key, value in collated_batch.items():
+                if isinstance(value, torch.Tensor) and value.dtype.is_floating_point:
+                    collated_batch[key] = value.to(self.dtype)
+
             return collated_batch
         except Exception as e:
             self.logger.error(f"Error in collate function: {str(e)}")
@@ -1103,11 +1144,12 @@ class CollateFunction:
         
         # Copy data from sequences into output tensor
         for i, seq in enumerate(sequences):
-            length = lengths[i]
-            if length > max_length:
-                out_tensor[i] = seq[:max_length]
-            else:
-                out_tensor[i, :length] = seq
+            length = min(lengths[i], max_length)
+            out_tensor[i, :length] = seq[:length]
+        
+        # Convert the output tensor to the specified dtype if it's a floating point tensor
+        if out_tensor.dtype.is_floating_point:
+            out_tensor = out_tensor.to(self.dtype)
         
         return out_tensor
 
@@ -1125,6 +1167,17 @@ def setup_distributed():
         rank = 0
     return world_size, rank
 
+def initialize_wandb(cfg, rank):
+    if rank == 0:
+        if wandb.run is None:
+            wandb.init(project=cfg.wandb_logger_kwargs.get("project", "default_project"),
+                       name=cfg.wandb_logger_kwargs.get("name", "default_run"),
+                       config=cfg.to_dict())
+            logger.info("Initialized new wandb run")
+        else:
+            logger.info("Using existing wandb run")
+    return wandb.run is not None
+
 @task_wrapper
 def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_config: VocabularyConfig, oov_index: int, wandb_logger: WandbLogger | None = None):
     # Set up the standard logger
@@ -1141,13 +1194,7 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_c
         rank = 0
 
     # Initialize Wandb only for the main process
-    if rank == 0:
-        if wandb.run is None:
-            wandb.init(project=cfg.wandb_logger_kwargs.get("project", "default_project"),
-                       name=cfg.wandb_logger_kwargs.get("name", "default_run"),
-                       config=cfg.to_dict())
-        else:
-            logger.info("Using existing wandb run")
+    wandb_initialized = initialize_wandb(cfg, rank)
 
     logger.info(f"Entering train function")
 
@@ -1237,13 +1284,8 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_c
     ).to(device)
     logger.info(f"Model initialized after {time.time() - start_time:.2f} seconds")
 
-    # Move the model to the correct device (this should be redundant if done in __init__, but let's be sure)
-    model = LM.to(device)
-
-    # Log model parameters
-    total_params = sum(p.numel() for p in model.parameters())
-    logger.info(f"Total parameters: {total_params}")
-    logger.info(f"Model memory usage: {sum(p.numel() * p.element_size() for p in model.parameters()) / 1024**2:.2f} MB")
+    # Set dtype for the entire model
+    LM.set_dtype(torch.float32)
 
     # Check if all parameters are on the correct device
     on_cpu = any(p.device.type == "cpu" for p in LM.parameters())
@@ -1270,7 +1312,8 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_c
         include_labels=True,
         static_size=8,
         max_seq_len=cfg.config.max_seq_len,
-        use_static_features=cfg.use_static_features
+        use_static_features=cfg.use_static_features,
+        model_dtype=LM.dtype
     )
 
     callbacks = [
@@ -1334,6 +1377,11 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_c
 
     model = LM
 
+    # Log model parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    logger.info(f"Total parameters: {total_params}")
+    logger.info(f"Model memory usage: {sum(p.numel() * p.element_size() for p in model.parameters()) / 1024**2:.2f} MB")
+    
     # Create distributed samplers for the dataloaders
     train_sampler = torch.utils.data.distributed.DistributedSampler(train_pyd, shuffle=True, drop_last=True)
     val_sampler = torch.utils.data.distributed.DistributedSampler(tuning_pyd, shuffle=False, drop_last=True)
