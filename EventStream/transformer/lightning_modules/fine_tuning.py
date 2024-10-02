@@ -509,25 +509,61 @@ class ESTForStreamClassificationLM(L.LightningModule):
 
     def log_attention_weights(self, attentions, batch_idx):
         if self.trainer.is_global_zero and wandb.run is not None:
+            num_layers = len(attentions)
+            num_heads = attentions[0].size(1)
+            
+            # Find the minimum sequence length across all layers
+            min_seq_len = min(attn.size(-1) for attn in attentions)
+            
+            # Initialize a tensor to store average attention weights across batches
+            avg_attn_weights = torch.zeros((num_layers, num_heads, min_seq_len, min_seq_len))
+            
             for layer, attn in enumerate(attentions):
                 # Ensure attn is detached and moved to CPU
                 attn_cpu = attn.detach().cpu()
+                
+                # Resize if necessary
+                if attn_cpu.size(-1) != min_seq_len:
+                    attn_cpu = F.interpolate(attn_cpu.view(-1, 1, attn_cpu.size(-2), attn_cpu.size(-1)), 
+                                             size=(min_seq_len, min_seq_len), 
+                                             mode='bilinear', align_corners=False).squeeze(1)
+                    attn_cpu = attn_cpu.view(attn.size(0), attn.size(1), min_seq_len, min_seq_len)
                 
                 # Check if attention weights are all zeros
                 if torch.all(attn_cpu == 0):
                     logger.warning(f"All zero attention weights detected for layer {layer}, batch {batch_idx}")
                     continue
                 
-                # Calculate average attention weights
-                attn_avg = attn_cpu.mean(dim=0).mean(dim=0).numpy()
+                # Average attention weights across batches
+                avg_attn_weights[layer] += attn_cpu.mean(dim=0)
+            
+            # Normalize by the number of batches
+            avg_attn_weights /= (batch_idx + 1)
+            
+            # Plot average attention weights for each layer and head
+            for layer in range(num_layers):
+                fig, axes = plt.subplots(1, num_heads, figsize=(20, 4))
+                fig.suptitle(f"Average Attention Weights for Layer {layer}")
                 
-                fig, ax = plt.subplots(figsize=(10, 10))
-                sns.heatmap(attn_avg, ax=ax, cmap='viridis', vmin=0, vmax=1)
-                plt.title(f"Average Attention Weights for Layer {layer} (Batch {batch_idx})")
-                plt.ylabel('Query position')
-                plt.xlabel('Key position')
-                wandb.log({f"attention_weights/layer_{layer}_batch_{batch_idx}": wandb.Image(fig)})
+                for head in range(num_heads):
+                    sns.heatmap(avg_attn_weights[layer, head].numpy(), ax=axes[head], cmap='viridis', vmin=0, vmax=1)
+                    axes[head].set_title(f"Head {head}")
+                    axes[head].set_ylabel('Query position')
+                    axes[head].set_xlabel('Key position')
+                
+                plt.tight_layout()
+                wandb.log({f"attention_weights/layer_{layer}": wandb.Image(fig)})
                 plt.close(fig)
+            
+            # Plot overall average attention weights across all layers and heads
+            overall_avg_attn = avg_attn_weights.mean(dim=(0, 1)).numpy()
+            fig, ax = plt.subplots(figsize=(10, 8))
+            sns.heatmap(overall_avg_attn, ax=ax, cmap='viridis', vmin=0, vmax=1)
+            ax.set_title("Overall Average Attention Weights")
+            ax.set_ylabel('Query position')
+            ax.set_xlabel('Key position')
+            wandb.log({"attention_weights/overall_average": wandb.Image(fig)})
+            plt.close(fig)
 
     def log_debug(self, message):
         """Log debug messages to both the standard logger and WandB."""
@@ -547,6 +583,11 @@ class ESTForStreamClassificationLM(L.LightningModule):
         # Add attention mask to the batch
         batch['attention_mask'] = attention_mask
 
+        # Ensure all tensors have the correct sequence length
+        for key in ['dynamic_indices', 'dynamic_values', 'dynamic_measurement_indices', 'time']:
+            if batch[key].size(1) > max_seq_len:
+                batch[key] = batch[key][:, :max_seq_len]
+            
         # Log shapes for debugging
         for k, v in batch.items():
             if isinstance(v, torch.Tensor):
@@ -619,7 +660,7 @@ class ESTForStreamClassificationLM(L.LightningModule):
                 self.log_debug(f"Test batch {k} shape: {v.shape}")
 
         # Forward pass
-        outputs = self.model(batch)  # Pass the entire batch to the model
+        outputs = self.model(batch, output_attentions=True)  # Pass the entire batch to the model
 
         # Store predictions and labels
         self.test_predictions.append(outputs.preds.detach().cpu())
@@ -1074,7 +1115,7 @@ class FinetuneConfig:
             self.wandb_logger_kwargs["project"] = reloaded_pretrain_config.wandb_logger_kwargs.project
 
 class CollateFunction:
-    def __init__(self, vocab_size, oov_index, include_labels=True, static_size=8, max_seq_len=None, use_static_features=True, model_dtype=torch.float32):
+    def __init__(self, vocab_size, oov_index, include_labels=True, static_size=8, max_seq_len=168, use_static_features=True, model_dtype=torch.float32):
         self.vocab_size = vocab_size
         self.oov_index = oov_index
         self.include_labels = include_labels
@@ -1083,6 +1124,7 @@ class CollateFunction:
         self.use_static_features = use_static_features
         self.logger = logging.getLogger(__name__)
         self.logger.info(f"CollateFunction initialized with use_static_features: {self.use_static_features}")
+        self.logger.info(f"CollateFunction initialized with max_seq_len: {self.max_seq_len}")
 
         self.dtype = model_dtype
 
@@ -1094,8 +1136,8 @@ class CollateFunction:
             if len(batch) == 0:
                 return None
 
-            # Find the maximum sequence length in this batch
-            max_seq_len = min(max(len(item['dynamic_indices']) for item in batch), self.max_seq_len or float('inf'))
+            # Use the fixed max_seq_len
+            max_seq_len = self.max_seq_len
 
             # Pad sequences
             collated_batch = {
@@ -1103,7 +1145,7 @@ class CollateFunction:
                 'dynamic_values': self.pad_and_stack([item['dynamic_values'] for item in batch], max_seq_len, pad_value=0.0),
                 'dynamic_measurement_indices': self.pad_and_stack([item['dynamic_measurement_indices'] for item in batch], max_seq_len),
                 'time': self.pad_and_stack([item['time'] for item in batch], max_seq_len, pad_value=0.0),
-                'seq_len': torch.tensor([len(item['dynamic_indices']) for item in batch], dtype=torch.long),
+                'seq_len': torch.tensor([min(len(item['dynamic_indices']), max_seq_len) for item in batch], dtype=torch.long),
             }
 
             if self.use_static_features:
@@ -1135,8 +1177,8 @@ class CollateFunction:
         # Convert to list of tensors if not already
         sequences = [torch.as_tensor(seq) for seq in sequences]
         
-        # Get lengths of each sequence
-        lengths = [len(seq) for seq in sequences]
+        # Truncate or pad sequences to max_length
+        sequences = [seq[:max_length] if len(seq) > max_length else seq for seq in sequences]
         
         # Create output tensor
         out_dims = (len(sequences), max_length) + sequences[0].shape[1:]
@@ -1144,8 +1186,7 @@ class CollateFunction:
         
         # Copy data from sequences into output tensor
         for i, seq in enumerate(sequences):
-            length = min(lengths[i], max_length)
-            out_tensor[i, :length] = seq[:length]
+            out_tensor[i, :len(seq)] = seq
         
         # Convert the output tensor to the specified dtype if it's a floating point tensor
         if out_tensor.dtype.is_floating_point:

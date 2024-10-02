@@ -383,7 +383,6 @@ class InnerSelfAttention(nn.Module):
                     def backward(ctx, grad_output):
                         qkv, = ctx.saved_tensors
                         try:
-                            # Use the custom backward function if available
                             if hasattr(flash_attn_qkvpacked_func, 'backward'):
                                 grad_qkv, = flash_attn_qkvpacked_func.backward(
                                     grad_output,
@@ -402,9 +401,14 @@ class InnerSelfAttention(nn.Module):
                                         causal=ctx.causal
                                     ),
                                     qkv,
-                                    grad_outputs=grad_output
+                                    grad_outputs=grad_output,
+                                    allow_unused=True
                                 )[0]
-                        except RuntimeError as e:
+                            
+                            if grad_qkv is None:
+                                raise RuntimeError("Gradient computation failed")
+                            
+                        except Exception as e:
                             logger.warning(f"Flash Attention backward pass failed: {str(e)}. Falling back to standard attention.")
                             return None, None, None, None
                         return grad_qkv, None, None, None
@@ -1022,11 +1026,11 @@ class ConditionallyIndependentPointProcessInputLayer(nn.Module):
 
         # Combine all features
         combined_features = torch.cat([data_embed, static_embed, time_embed], dim=-1)
-
-        logger.debug(f"combined_features shape: {combined_features.shape}")
+        logger.debug(f"Combined features shape: {combined_features.shape}")
 
         # Pass through the feature combiner
         combined_embed = self.feature_combiner(combined_features)
+        logger.debug(f"Combined embed shape after feature combiner: {combined_embed.shape}")
 
         logger.debug(f"Dynamic indices shape: {dynamic_indices.shape}")
         logger.debug(f"Dynamic values shape: {dynamic_values.shape if dynamic_values is not None else None}")
@@ -1042,8 +1046,10 @@ class ConditionallyIndependentPointProcessInputLayer(nn.Module):
         if combined_embed.shape[1] < seq_window_size:
             pad_length = seq_window_size - combined_embed.shape[1]
             combined_embed = F.pad(combined_embed, (0, 0, 0, pad_length), mode='constant', value=0)
+            logger.debug(f"Padded combined_embed shape: {combined_embed.shape}")
         elif combined_embed.shape[1] > seq_window_size:
             combined_embed = combined_embed[:, :seq_window_size, :]
+            logger.debug(f"Truncated combined_embed shape: {combined_embed.shape}")
 
         logger.debug(f"Final combined_embed shape: {combined_embed.shape}")
         return self.embedding_dropout(combined_embed)
@@ -1245,16 +1251,38 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
                 hidden_states = outputs[0]
                 extra_return_info = outputs[1] if len(outputs) > 1 else {}
             else:
-                outputs = block(
-                    hidden_states,
-                    attention_mask=layer_attention_mask,
-                    layer_past=layer_past,
-                    head_mask=head_mask[i],
-                    use_cache=use_cache,
-                    output_attentions=output_attentions,
-                )
+                try:
+                    outputs = block(
+                        hidden_states,
+                        attention_mask=layer_attention_mask,
+                        layer_past=layer_past,
+                        head_mask=head_mask[i],
+                        use_cache=use_cache,
+                        output_attentions=output_attentions,
+                    )
 
-                hidden_states, extra_return_info = outputs
+                    hidden_states, extra_return_info = outputs
+                    logger.debug(f"After block {i}: hidden_states shape: {hidden_states.shape}")
+
+                    # Ensure hidden_states has the correct shape
+                    if hidden_states.shape != (local_batch_size, self.config.seq_window_size, self.config.hidden_size):
+                        logger.warning(f"Reshaping hidden_states from {hidden_states.shape} to ({local_batch_size}, {self.config.seq_window_size}, {self.config.hidden_size})")
+                        hidden_states = hidden_states.view(local_batch_size, self.config.seq_window_size, self.config.hidden_size)
+
+                except Exception as e:
+                    logger.error(f"Error in block {i}: {str(e)}")
+                    logger.warning("Falling back to standard attention for this block.")
+                    # Fallback to standard attention
+                    self.h[i].attn.attention.use_flash_attention = False
+                    outputs = block(
+                        hidden_states,
+                        attention_mask=layer_attention_mask,
+                        layer_past=layer_past,
+                        head_mask=head_mask[i],
+                        use_cache=use_cache,
+                        output_attentions=output_attentions,
+                    )
+                    hidden_states, extra_return_info = outputs
                 logger.debug(f"After block {i}: hidden_states shape: {hidden_states.shape}")
 
                 # Ensure hidden_states has the correct shape
