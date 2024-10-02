@@ -587,7 +587,7 @@ class ESTForStreamClassificationLM(L.LightningModule):
         for key in ['dynamic_indices', 'dynamic_values', 'dynamic_measurement_indices', 'time']:
             if batch[key].size(1) > max_seq_len:
                 batch[key] = batch[key][:, :max_seq_len]
-            
+
         # Log shapes for debugging
         for k, v in batch.items():
             if isinstance(v, torch.Tensor):
@@ -601,6 +601,12 @@ class ESTForStreamClassificationLM(L.LightningModule):
             self.log_debug(f"NaN or Inf loss detected in training step {batch_idx}")
             loss = torch.where(torch.isnan(loss) | torch.isinf(loss), torch.full_like(loss, 1e-8), loss)
 
+        # Log non-None gradients
+        if self.trainer.is_global_zero and batch_idx % 500 == 0:
+            for name, param in self.named_parameters():
+                if param.grad is not None:
+                    wandb.log({f"gradients/{name}": wandb.Histogram(param.grad.cpu().numpy())}, step=self.global_step)
+                    
         # Log metrics
         self.log_metrics('train', outputs)
         
@@ -687,7 +693,7 @@ class ESTForStreamClassificationLM(L.LightningModule):
         # Reset the metric accumulator for the next epoch
         self.metric_accumulator = defaultdict(list)
 
-    def calculate_feature_importance(self, num_samples=500):
+    def calculate_feature_importance(self, num_samples=1000):
         val_loader = self.val_dataloader()
         samples = []
         for i, batch in enumerate(val_loader):
@@ -816,8 +822,8 @@ class ESTForStreamClassificationLM(L.LightningModule):
         outputs = self.model(batch)
 
         # Only watch the model from the main process
-        if self.trainer.is_global_zero:
-            wandb.watch(self.model, log="all", log_freq=500)
+        if self.trainer.is_global_zero and self.global_step == 0:
+            wandb.watch(self.model, log="gradients", log_freq=500)
 
         if hasattr(outputs, 'loss') and (torch.isnan(outputs.loss).any() or torch.isinf(outputs.loss).any()):
             self.custom_logger.warning("NaN or Inf detected in model outputs")
@@ -1219,6 +1225,13 @@ def initialize_wandb(cfg, rank):
             logger.info("Using existing wandb run")
     return wandb.run is not None
 
+def check_grad_requirements(model):
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            logger.warning(f"Parameter {name} does not require gradients")
+        else:
+            logger.debug(f"Parameter {name} requires gradients")
+
 @task_wrapper
 def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_config: VocabularyConfig, oov_index: int, wandb_logger: WandbLogger | None = None):
     # Set up the standard logger
@@ -1373,7 +1386,7 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_c
             monitor='val_auc_epoch',
             patience=cfg.optimization_config['patience'],
             verbose=True,
-            mode='min',
+            mode='max',
             check_finite=True
         )
     ]
@@ -1416,12 +1429,10 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_c
     logger.info(f"NCCL is available: {torch.distributed.is_nccl_available()}")
     logger.info(f"Gloo is available: {torch.distributed.is_gloo_available()}")
 
-    model = LM
-
     # Log model parameters
-    total_params = sum(p.numel() for p in model.parameters())
+    total_params = sum(p.numel() for p in LM.parameters())
     logger.info(f"Total parameters: {total_params}")
-    logger.info(f"Model memory usage: {sum(p.numel() * p.element_size() for p in model.parameters()) / 1024**2:.2f} MB")
+    logger.info(f"Model memory usage: {sum(p.numel() * p.element_size() for p in LM.parameters()) / 1024**2:.2f} MB")
     
     # Create distributed samplers for the dataloaders
     train_sampler = torch.utils.data.distributed.DistributedSampler(train_pyd, shuffle=True, drop_last=True)
@@ -1462,6 +1473,8 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_c
     )
     logger.info(f"All dataloaders created after {time.time() - start_time:.2f} seconds")
 
+    check_grad_requirements(LM)
+
     # Start training
     logger.info(f"Process {rank}/{world_size} about to start training")
     torch.cuda.synchronize()
@@ -1471,8 +1484,8 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_c
 
     # Evaluation
     logger.info("Training completed. Evaluating on validation and test sets.")
-    tuning_metrics = trainer.validate(model=model, dataloaders=tuning_dataloader, ckpt_path="best") if len(tuning_pyd) > 0 else None
-    held_out_metrics = trainer.test(model=model, dataloaders=held_out_dataloader, ckpt_path="best") if len(held_out_pyd) > 0 else None
+    tuning_metrics = trainer.validate(model=LM, dataloaders=tuning_dataloader, ckpt_path="best") if len(tuning_pyd) > 0 else None
+    held_out_metrics = trainer.test(model=LM, dataloaders=held_out_dataloader, ckpt_path="best") if len(held_out_pyd) > 0 else None
 
     logger.info(f"Evaluation completed after {time.time() - start_time:.2f} seconds")
 

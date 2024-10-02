@@ -362,7 +362,8 @@ class InnerSelfAttention(nn.Module):
                 qkv = torch.stack([query, key, value], dim=2)
                 qkv = qkv.permute(0, 3, 2, 1, 4).contiguous()  # [bsz, seq_len, 3, num_heads, head_dim]
                 
-                logger.debug(f"QKV shape for Flash Attention: {qkv.shape}")
+                # Ensure QKV requires gradients
+                qkv.requires_grad_(True)
                 
                 class FlashAttentionFunction(torch.autograd.Function):
                     @staticmethod
@@ -383,35 +384,18 @@ class InnerSelfAttention(nn.Module):
                     def backward(ctx, grad_output):
                         qkv, = ctx.saved_tensors
                         try:
-                            if hasattr(flash_attn_qkvpacked_func, 'backward'):
-                                grad_qkv, = flash_attn_qkvpacked_func.backward(
-                                    grad_output,
-                                    qkv,
-                                    dropout_p=ctx.dropout_p,
-                                    softmax_scale=ctx.softmax_scale,
-                                    causal=ctx.causal
-                                )
-                            else:
-                                # Fallback to autograd if backward is not available
-                                grad_qkv = torch.autograd.grad(
-                                    flash_attn_qkvpacked_func(
-                                        qkv,
-                                        dropout_p=ctx.dropout_p,
-                                        softmax_scale=ctx.softmax_scale,
-                                        causal=ctx.causal
-                                    ),
-                                    qkv,
-                                    grad_outputs=grad_output,
-                                    allow_unused=True
-                                )[0]
-                            
-                            if grad_qkv is None:
-                                raise RuntimeError("Gradient computation failed")
-                            
+                            grad_output = grad_output.contiguous()
+                            grad_qkv, = flash_attn_qkvpacked_func.backward(
+                                grad_output,
+                                qkv,
+                                dropout_p=ctx.dropout_p,
+                                softmax_scale=ctx.softmax_scale,
+                                causal=ctx.causal
+                            )
+                            return grad_qkv, None, None, None
                         except Exception as e:
-                            logger.warning(f"Flash Attention backward pass failed: {str(e)}. Falling back to standard attention.")
+                            logger.error(f"Flash Attention backward pass failed: {str(e)}")
                             return None, None, None, None
-                        return grad_qkv, None, None, None
 
                 attn_output = FlashAttentionFunction.apply(
                     qkv,
@@ -422,10 +406,9 @@ class InnerSelfAttention(nn.Module):
                 
                 # Reshape back
                 attn_output = attn_output.permute(0, 2, 1, 3).contiguous()  # [bsz, num_heads, seq_len, head_dim]
-                logger.debug(f"attn_output shape after Flash Attention: {attn_output.shape}")
                 attn_weights = None  # Flash Attention doesn't return attention weights
             except Exception as e:
-                logger.warning(f"Flash Attention failed: {str(e)}. Falling back to standard attention.")
+                logger.error(f"Flash Attention failed: {str(e)}. Falling back to standard attention.")
                 attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask)
         else:
             attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask)
