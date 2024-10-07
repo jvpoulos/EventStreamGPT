@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+from json import JSONEncoder
+from enum import Enum
 import functools
 import json
 import re
@@ -23,9 +25,11 @@ PROPORTION = float
 COUNT_OR_PROPORTION = Union[int, PROPORTION]
 WHOLE = Union[int, pl.Expr]
 
-class CustomJSONEncoder(json.JSONEncoder):
+class CustomJSONEncoder(JSONEncoder):
     def default(self, obj):
-        if isinstance(obj, torch.device):
+        if isinstance(obj, Enum):
+            return str(obj.value)
+        elif isinstance(obj, torch.device):
             return str(obj)
         return super().default(obj)
         

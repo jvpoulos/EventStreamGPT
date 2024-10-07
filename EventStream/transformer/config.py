@@ -7,6 +7,7 @@ Attributes:
 import dataclasses
 from dataclasses import dataclass, field
 import enum
+from enum import Enum
 import itertools
 import math
 import torch
@@ -352,6 +353,9 @@ ATTENTION_TYPES_LIST_T = Union[
     list[tuple[list[AttentionLayerType], int]],
 ]
 
+class AttentionMechanism(Enum):
+    ORIGINAL_IMPROVED = "original_improved"
+    STABLE_ATTENTION = "stable_attention"
 
 class StructuredTransformerConfig(PretrainedConfig):
     """The configuration class for Event Stream GPT models.
@@ -488,6 +492,8 @@ class StructuredTransformerConfig(PretrainedConfig):
         self,
         # Data configuration
         use_flash_attention: bool = True,
+        use_fake_feature: bool = True,
+        fake_feature_correlation: float = 0.8,
         do_use_sinusoidal: bool = False,  # Add this line to the configuration class
         num_labels: int | None = None,
         problem_type: str = "single_label_classification",
@@ -513,6 +519,7 @@ class StructuredTransformerConfig(PretrainedConfig):
             StructuredEventProcessingMode.CONDITIONALLY_INDEPENDENT
         ),
         hidden_size: int | None = None,
+        max_position_embeddings: int | None = None,
         head_dim: int | None = 64,
         num_hidden_layers: int = 2,
         num_attention_heads: int = 4,
@@ -596,7 +603,11 @@ class StructuredTransformerConfig(PretrainedConfig):
         # Call the parent constructor with the updated kwargs
         super().__init__(**kwargs)
 
-        self.use_flash_attention = use_flash_attention
+        self.use_flash_attention = kwargs.get("use_flash_attention", True)
+        self.attention_mechanism = AttentionMechanism(kwargs.get("attention_mechanism", "original_improved"))
+
+        self.use_fake_feature = use_fake_feature
+        self.fake_feature_correlation = fake_feature_correlation
 
         self.use_gradient_checkpointing = use_gradient_checkpointing
 
@@ -719,6 +730,8 @@ class StructuredTransformerConfig(PretrainedConfig):
         if (head_dim is None) and (hidden_size is None):
             raise ValueError("Must specify at least one of hidden size or head dim!")
 
+        self.max_position_embeddings = kwargs.get('max_position_embeddings', 512)
+        
         if hidden_size is None:
             hidden_size = head_dim * num_attention_heads
         elif head_dim is None:
@@ -984,6 +997,7 @@ class StructuredTransformerConfig(PretrainedConfig):
 
     def to_dict(self) -> dict[str, Any]:
         as_dict = super().to_dict()
+        as_dict['device'] = str(self.device)  # Convert device to string
         if as_dict.get("measurement_configs", {}):
             new_meas_configs = {}
             for k, v in as_dict["measurement_configs"].items():
@@ -999,4 +1013,13 @@ class StructuredTransformerConfig(PretrainedConfig):
             for k, v in raw_from_dict.measurement_configs.items():
                 new_meas_configs[k] = MeasurementConfig.from_dict(v)
             raw_from_dict.measurement_configs = new_meas_configs
-        return json.loads(json.dumps(raw_from_dict, cls=CustomJSONEncoder), object_hook=cls.from_dict)
+        
+        # Convert the attention_mechanism back to an enum
+        if 'attention_mechanism' in raw_from_dict:
+            raw_from_dict.attention_mechanism = AttentionMechanism(raw_from_dict.attention_mechanism)
+        
+        # Convert the device back to a torch.device object
+        if 'device' in raw_from_dict:
+            raw_from_dict.device = torch.device(raw_from_dict.device)
+        
+        return raw_from_dict

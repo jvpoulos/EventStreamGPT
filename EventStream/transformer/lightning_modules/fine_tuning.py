@@ -20,6 +20,7 @@ import wandb
 from torch.optim.lr_scheduler import LambdaLR
 import math
 import lightning as L
+from torch.nn.utils import clip_grad_norm_, clip_grad_value_
 import omegaconf
 import torch.nn.functional as F
 from omegaconf import DictConfig
@@ -90,6 +91,31 @@ class NCCLErrorHandler(Callback):
             return True
         return False
 
+class GradientCheckCallback(Callback):
+    @staticmethod
+    def check_and_log_gradients(model):
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                grad_norm = param.grad.norm()
+                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                    logger.warning(f"NaN or Inf gradient detected in {name}")
+                else:
+                    wandb.log({f"gradient_norm/{name}": grad_norm})
+
+    def on_after_backward(self, trainer, model):
+        self.check_and_log_gradients(model)
+
+class AttentionMechanismSwitch(Callback):
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        if pl_module.config.use_flash_attention and batch_idx % 100 == 0:
+            try:
+                # Try to use Flash Attention on a small batch
+                small_batch = {k: v[:4] for k, v in batch.items() if isinstance(v, torch.Tensor)}
+                _ = pl_module(small_batch, output_attentions=True)
+            except Exception as e:
+                logger.warning(f"Flash Attention failed. Switching to standard attention.")
+                pl_module.config.use_flash_attention = False
+
 class WandbLoggerHandler(logging.Handler):
     def __init__(self, wandb_logger):
         super().__init__()
@@ -125,11 +151,6 @@ class ESTForStreamClassificationLM(L.LightningModule):
         self.oov_index = oov_index
         self.save_dir = save_dir
         
-        self.gradient_norm_changes = []
-        self.max_outliers_to_log = 10
-        self.batch_indices = []  # Store batch indices instead of subject_ids
-        self._epoch_counter = 0
-        
         # Initialize metrics dictionaries
         self.train_metrics = {}
         self.val_metrics = {}
@@ -150,6 +171,8 @@ class ESTForStreamClassificationLM(L.LightningModule):
         self.end_lr = self.optimization_config.end_lr
         self.end_lr_frac_of_init_lr = self.optimization_config.end_lr_frac_of_init_lr
         self.max_grad_norm = self.config.max_grad_norm
+        self.clip_grad_value = optimization_config.get('clip_grad_value', 1.0)
+        self.use_grad_value_clipping = optimization_config.get('use_grad_value_clipping', True)
         
         self.grad_norm_before = None
         self.grad_norm_after = None
@@ -164,7 +187,7 @@ class ESTForStreamClassificationLM(L.LightningModule):
         self.use_static_features = cfg.use_static_features
 
         # Load the vocabulary_config from a file
-        vocabulary_config_path = "/home/jvp/diabetes_pred/data/labs/vocabulary_config.json"
+        vocabulary_config_path = "data/labs/vocabulary_config.json"
         with open(vocabulary_config_path, "r") as f:
             vocabulary_config_dict = json.load(f)
         vocabulary_config = VocabularyConfig.from_dict(vocabulary_config_dict)
@@ -185,10 +208,6 @@ class ESTForStreamClassificationLM(L.LightningModule):
         if self.config.use_gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
             self._set_static_graph()
-
-        for name, param in self.model.named_parameters():
-            if not param.requires_grad:
-                print(f"Parameter {name} does not require gradients")
         
         # Move the model to the correct device
         self.model = self.model.to(self.device)
@@ -509,61 +528,50 @@ class ESTForStreamClassificationLM(L.LightningModule):
 
     def log_attention_weights(self, attentions, batch_idx):
         if self.trainer.is_global_zero and wandb.run is not None:
+            if attentions is None:
+                logger.warning("No attention weights to log")
+                return
+
             num_layers = len(attentions)
-            num_heads = attentions[0].size(1)
-            
-            # Find the minimum sequence length across all layers
-            min_seq_len = min(attn.size(-1) for attn in attentions)
-            
-            # Initialize a tensor to store average attention weights across batches
-            avg_attn_weights = torch.zeros((num_layers, num_heads, min_seq_len, min_seq_len))
-            
-            for layer, attn in enumerate(attentions):
-                # Ensure attn is detached and moved to CPU
-                attn_cpu = attn.detach().cpu()
-                
-                # Resize if necessary
-                if attn_cpu.size(-1) != min_seq_len:
-                    attn_cpu = F.interpolate(attn_cpu.view(-1, 1, attn_cpu.size(-2), attn_cpu.size(-1)), 
-                                             size=(min_seq_len, min_seq_len), 
-                                             mode='bilinear', align_corners=False).squeeze(1)
-                    attn_cpu = attn_cpu.view(attn.size(0), attn.size(1), min_seq_len, min_seq_len)
-                
-                # Check if attention weights are all zeros
-                if torch.all(attn_cpu == 0):
-                    logger.warning(f"All zero attention weights detected for layer {layer}, batch {batch_idx}")
+            for layer, attn_dict in enumerate(attentions):
+                if not isinstance(attn_dict, dict) or 'attn_weights' not in attn_dict:
+                    logger.warning(f"Unexpected attention format in layer {layer}")
                     continue
+
+                attn = attn_dict['attn_weights']
+                if not isinstance(attn, torch.Tensor):
+                    logger.warning(f"Attention weights are not a tensor in layer {layer}")
+                    continue
+
+                num_heads = attn.size(1)
                 
-                # Average attention weights across batches
-                avg_attn_weights[layer] += attn_cpu.mean(dim=0)
-            
-            # Normalize by the number of batches
-            avg_attn_weights /= (batch_idx + 1)
-            
-            # Plot average attention weights for each layer and head
-            for layer in range(num_layers):
                 fig, axes = plt.subplots(1, num_heads, figsize=(20, 4))
-                fig.suptitle(f"Average Attention Weights for Layer {layer}")
+                fig.suptitle(f"Attention Weights for Layer {layer}")
                 
                 for head in range(num_heads):
-                    sns.heatmap(avg_attn_weights[layer, head].numpy(), ax=axes[head], cmap='viridis', vmin=0, vmax=1)
-                    axes[head].set_title(f"Head {head}")
-                    axes[head].set_ylabel('Query position')
-                    axes[head].set_xlabel('Key position')
+                    if num_heads > 1:
+                        ax = axes[head]
+                    else:
+                        ax = axes
+                    sns.heatmap(attn[0, head].detach().cpu().numpy(), ax=ax, cmap='viridis', vmin=0, vmax=1)
+                    ax.set_title(f"Head {head}")
+                    ax.set_ylabel('Query position')
+                    ax.set_xlabel('Key position')
                 
                 plt.tight_layout()
                 wandb.log({f"attention_weights/layer_{layer}": wandb.Image(fig)})
                 plt.close(fig)
             
-            # Plot overall average attention weights across all layers and heads
-            overall_avg_attn = avg_attn_weights.mean(dim=(0, 1)).numpy()
-            fig, ax = plt.subplots(figsize=(10, 8))
-            sns.heatmap(overall_avg_attn, ax=ax, cmap='viridis', vmin=0, vmax=1)
-            ax.set_title("Overall Average Attention Weights")
-            ax.set_ylabel('Query position')
-            ax.set_xlabel('Key position')
-            wandb.log({"attention_weights/overall_average": wandb.Image(fig)})
-            plt.close(fig)
+            # Log overall average attention
+            if attentions:
+                overall_avg_attn = torch.mean(torch.stack([attn_dict['attn_weights'] for attn_dict in attentions if isinstance(attn_dict, dict) and 'attn_weights' in attn_dict]), dim=0)
+                fig, ax = plt.subplots(figsize=(10, 8))
+                sns.heatmap(overall_avg_attn[0].mean(0).detach().cpu().numpy(), ax=ax, cmap='viridis', vmin=0, vmax=1)
+                ax.set_title("Overall Average Attention Weights")
+                ax.set_ylabel('Query position')
+                ax.set_xlabel('Key position')
+                wandb.log({"attention_weights/overall_average": wandb.Image(fig)})
+                plt.close(fig)
 
     def log_debug(self, message):
         """Log debug messages to both the standard logger and WandB."""
@@ -596,17 +604,40 @@ class ESTForStreamClassificationLM(L.LightningModule):
         # Forward pass
         outputs = self.model(batch, output_attentions=True)  # Pass the entire batch to the model
         loss = outputs.loss
-
+    
         if torch.isnan(loss) or torch.isinf(loss):
             self.log_debug(f"NaN or Inf loss detected in training step {batch_idx}")
             loss = torch.where(torch.isnan(loss) | torch.isinf(loss), torch.full_like(loss, 1e-8), loss)
 
-        # Log non-None gradients
-        if self.trainer.is_global_zero and batch_idx % 500 == 0:
-            for name, param in self.named_parameters():
+        # Add more detailed gradient logging
+        if self.trainer.is_global_zero and batch_idx % 100 == 0:
+            for name, param in self.model.named_parameters():
                 if param.grad is not None:
-                    wandb.log({f"gradients/{name}": wandb.Histogram(param.grad.cpu().numpy())}, step=self.global_step)
-                    
+                    grad_stats = f"min={param.grad.min().item()}, max={param.grad.max().item()}, mean={param.grad.mean().item()}"
+                    self.logger.experiment.log({f"gradients/{name}": grad_stats}, step=self.global_step)
+
+        # Log gradient norms
+        for name, param in self.model.named_parameters():
+            if param.grad is not None:
+                grad_norm = param.grad.norm()
+                self.log(f'grad_norm/{name}', grad_norm, on_step=True, on_epoch=False)
+            else:
+                logger.warning(f"No gradient for parameter: {name}")   
+
+        # Log attention weights statistics
+        if outputs.attentions is not None:
+            for i, layer_attention in enumerate(outputs.attentions):
+                if isinstance(layer_attention, dict) and 'attn_weights' in layer_attention:
+                    attn_weights = layer_attention['attn_weights']
+                    if attn_weights is not None:
+                        self.log(f'train_attention_layer_{i}_min', attn_weights.min().item(), on_step=True, on_epoch=False)
+                        self.log(f'train_attention_layer_{i}_max', attn_weights.max().item(), on_step=True, on_epoch=False)
+                        self.log(f'train_attention_layer_{i}_mean', attn_weights.mean().item(), on_step=True, on_epoch=False)
+                    else:
+                        logger.warning(f"Attention weights are None for layer {i}")
+                else:
+                    logger.warning(f"Unexpected attention format in layer {i}")
+
         # Log metrics
         self.log_metrics('train', outputs)
         
@@ -693,7 +724,7 @@ class ESTForStreamClassificationLM(L.LightningModule):
         # Reset the metric accumulator for the next epoch
         self.metric_accumulator = defaultdict(list)
 
-    def calculate_feature_importance(self, num_samples=1000):
+    def calculate_feature_importance(self, num_samples=2000):
         val_loader = self.val_dataloader()
         samples = []
         for i, batch in enumerate(val_loader):
@@ -735,6 +766,7 @@ class ESTForStreamClassificationLM(L.LightningModule):
                 
                 importance = permuted_loss - baseline_loss
                 feature_importance[feature] = importance
+                logger.info(f"Feature '{feature}' importance: {importance}")
 
         total_importance = sum(abs(score) for score in feature_importance.values())
         normalized_importance = {k: abs(v) / total_importance for k, v in feature_importance.items()}
@@ -781,18 +813,19 @@ class ESTForStreamClassificationLM(L.LightningModule):
         # Calculate and log feature importance at the end of each epoch
         self.calculate_feature_importance()
 
-    def forward(self, batch, **kwargs):
-        # Convert all float tensors in the batch to the specified dtype
-        for key, value in batch.items():
-            if isinstance(value, torch.Tensor) and value.dtype.is_floating_point:
-                batch[key] = value.to(self.dtype)
+    def on_after_backward(self):
+        # Log gradient norms for specific layers
+        for name, param in self.model.named_parameters():
+            if param.grad is not None:
+                self.log(f'grad_norm/{name}', param.grad.norm(), on_step=True, on_epoch=False)
 
+    def forward(self, batch, **kwargs):
         # Move batch to the correct device
         if isinstance(batch, dict):
             batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
             for key, value in batch.items():
                 if isinstance(value, torch.Tensor) and torch.isnan(value).any():
-                    self.logger.warning(f"NaNs detected in batch['{key}']")
+                    logger.warning(f"NaNs detected in batch['{key}']")
         else:
             raise TypeError("Input 'batch' should be a dictionary.")
 
@@ -803,32 +836,21 @@ class ESTForStreamClassificationLM(L.LightningModule):
             batch.pop('static_indices', None)
             batch.pop('static_measurement_indices', None)
 
-        # Create attention mask from sequence lengths
-        seq_lens = batch['seq_len']
-        max_seq_len = seq_lens.max().item()
-        seq_mask = torch.arange(max_seq_len, device=self.device)[None, :] < seq_lens[:, None]
-
-        # Add attention mask to the batch
-        batch['seq_attention_mask'] = seq_mask
-
-        # Add labels to the batch if available
-        if 'labels' in batch:
-            batch['labels'] = batch['labels']
-
-        # Merge kwargs into batch
-        batch.update(kwargs)
-
-        # Forward pass through the model
-        outputs = self.model(batch)
-
-        # Only watch the model from the main process
-        if self.trainer.is_global_zero and self.global_step == 0:
-            wandb.watch(self.model, log="gradients", log_freq=500)
+        outputs = self.model(
+            dynamic_indices=batch.get("dynamic_indices"),
+            dynamic_values=batch.get("dynamic_values"),
+            dynamic_measurement_indices=batch.get("dynamic_measurement_indices"),
+            static_indices=batch.get("static_indices"),
+            static_measurement_indices=batch.get("static_measurement_indices"),
+            time=batch.get("time"),
+            labels=batch.get("labels"),
+            **kwargs
+        )
 
         if hasattr(outputs, 'loss') and (torch.isnan(outputs.loss).any() or torch.isinf(outputs.loss).any()):
-            self.custom_logger.warning("NaN or Inf detected in model outputs")
-            self.custom_logger.info(f"Inputs: {batch}")
-            self.custom_logger.info(f"Outputs: {outputs}")
+            logger.warning("NaN or Inf detected in model outputs")
+            logger.info(f"Inputs: {batch}")
+            logger.info(f"Outputs: {outputs}")
 
         return outputs
 
@@ -860,6 +882,10 @@ class ESTForStreamClassificationLM(L.LightningModule):
             lr=self.learning_rate,
             weight_decay=self.weight_decay
         )
+
+        # Add gradient clipping
+        for group in optimizer.param_groups:
+            group.setdefault('max_grad_norm', self.config.max_grad_norm)
 
         if self.use_lr_scheduler and self.lr_scheduler_type is not None:
             if self.lr_scheduler_type == "cosine":
@@ -1268,7 +1294,7 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_c
     logger.info(f"Data config updated after {time.time() - start_time:.2f} seconds")
     
     # Load the vocabulary_config from the correct file
-    vocabulary_config_path = "/home/jvp/diabetes_pred/data/labs/vocabulary_config.json" if cfg.use_labs else "/home/jvp/diabetes_pred/data/vocabulary_config.json"
+    vocabulary_config_path = "data/labs/vocabulary_config.json" if cfg.use_labs else "data/vocabulary_config.json"
     with open(vocabulary_config_path, "r") as f:
         vocabulary_config_dict = json.load(f)
     vocabulary_config = VocabularyConfig.from_dict(vocabulary_config_dict)
@@ -1393,6 +1419,7 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_c
 
     # Add the callbacks
     callbacks.append(NCCLErrorHandler())
+    callbacks.extend([GradientCheckCallback(), AttentionMechanismSwitch()])
 
     logger.info("Setting up trainer")
     

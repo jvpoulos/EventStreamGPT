@@ -18,7 +18,7 @@ from .transformer import (
     NestedAttentionPointProcessTransformer,
     StructuredTransformerPreTrainedModel,
     ConditionallyIndependentPointProcessInputLayer,
-    CustomLayerNorm
+    StableLayerNorm
 )
 from .utils import safe_masked_max, safe_weighted_avg
 
@@ -45,17 +45,8 @@ class ESTForStreamClassification(LightningModule):
         self.dropout = torch.nn.Dropout(config.intermediate_dropout)
         
         self.static_indices_embedding = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.categorical_embeddings = nn.ModuleDict({
-            'Female': nn.Embedding(2, config.hidden_size),
-            'Married': nn.Embedding(2, config.hidden_size),
-            'GovIns': nn.Embedding(2, config.hidden_size),
-            'English': nn.Embedding(2, config.hidden_size),
-            'Veteran': nn.Embedding(2, config.hidden_size)
-        })
         
-        self.dynamic_values_encoder = nn.Linear(1, config.hidden_size)
-        
-        self.layer_norm = CustomLayerNorm(config.hidden_size) if config.use_layer_norm else nn.Identity()
+        self.layer_norm = StableLayerNorm(config.hidden_size) if config.use_layer_norm else nn.Identity()
         self.batch_norm = nn.BatchNorm1d(config.hidden_size) if config.use_batch_norm else nn.Identity()
         self.dynamic_values_norm = nn.BatchNorm1d(1)
         
@@ -82,24 +73,27 @@ class ESTForStreamClassification(LightningModule):
     # Add a method to change the dtype
     def set_dtype(self, dtype):
         self.to(dtype)
-                
-    def forward(self, batch, output_attentions=False):
-        # Extract inputs from the batch
-        dynamic_indices = batch['dynamic_indices']
-        dynamic_values = batch.get('dynamic_values')
-        dynamic_measurement_indices = batch.get('dynamic_measurement_indices')
-        static_indices = batch.get('static_indices')
-        static_measurement_indices = batch.get('static_measurement_indices')
-        time = batch.get('time')
-        labels = batch.get('labels')
-        seq_attention_mask = batch.get('attention_mask')
+        
+    def forward(self, batch=None, output_attentions=False, **kwargs):
+        if batch is not None:
+            kwargs.update(batch)
+        
+        # Extract inputs from kwargs
+        dynamic_indices = kwargs.get('dynamic_indices')
+        dynamic_values = kwargs.get('dynamic_values')
+        dynamic_measurement_indices = kwargs.get('dynamic_measurement_indices')
+        static_indices = kwargs.get('static_indices')
+        static_measurement_indices = kwargs.get('static_measurement_indices')
+        time = kwargs.get('time')
+        labels = kwargs.get('labels')
+        seq_attention_mask = kwargs.get('attention_mask')
 
         # Convert indices to long tensors
         dynamic_indices = dynamic_indices.long()
         if dynamic_measurement_indices is not None:
             dynamic_measurement_indices = dynamic_measurement_indices.long()
         if static_indices is not None:
-            static_indices = static_indices.long()  # Convert to long
+            static_indices = static_indices.long()
         if static_measurement_indices is not None:
             static_measurement_indices = static_measurement_indices.long()
 
@@ -131,20 +125,41 @@ class ESTForStreamClassification(LightningModule):
 
         # Get the batch size from dynamic_indices
         batch_size = dynamic_indices.size(0)
+        
+        # Prepare input features for the encoder
+        input_features = {
+            'dynamic_indices': dynamic_indices,
+            'dynamic_values': dynamic_values,
+            'dynamic_measurement_indices': dynamic_measurement_indices,
+            'static_indices': static_indices,
+            'static_measurement_indices': static_measurement_indices,
+            'time': time,
+            'seq_attention_mask': seq_attention_mask
+        }
+
+        # Only pass labels to encoder if use_fake_feature is True
+        if getattr(self.config, 'use_fake_feature', False):
+            input_features['labels'] = labels
+
+        # Add gradient clipping
+        if self.training:
+            torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=self.config.max_grad_norm)
 
         # Encode the input
-        encoded = self.encoder(
-            dynamic_indices=dynamic_indices,
-            dynamic_values=dynamic_values,
-            dynamic_measurement_indices=dynamic_measurement_indices,
-            static_indices=static_indices,
-            static_measurement_indices=static_measurement_indices,
-            time=time,
-            seq_attention_mask=seq_attention_mask,
-            output_attentions=output_attentions
-        )
+        encoded = self.encoder(**input_features, output_attentions=output_attentions)
         
         event_encoded = encoded.last_hidden_state
+
+        # Check for NaN values
+        if torch.isnan(event_encoded).any():
+            logger.warning("NaN values detected in encoded output. Replacing with zeros.")
+            event_encoded = torch.where(torch.isnan(event_encoded), torch.zeros_like(event_encoded), event_encoded)
+
+        # Log attention mechanism used
+        if self.config.use_flash_attention:
+            self.log("use_flash_attention", 1.0, on_step=True, on_epoch=False)
+        else:
+            self.log("use_flash_attention", 0.0, on_step=True, on_epoch=False)
 
         # Handle 4D input
         if event_encoded.dim() == 4:
@@ -165,7 +180,7 @@ class ESTForStreamClassification(LightningModule):
 
         # Process static indices only if use_static_features is True
         if self.config.use_static_features and static_indices is not None:
-            static_embed = self.static_indices_embedding(static_indices.long()).mean(dim=1)  # Convert to long here
+            static_embed = self.static_indices_embedding(static_indices.long()).mean(dim=1)
             combined_embed = self.static_weight * static_embed + self.dynamic_weight * pooled_dynamic
         else:
             combined_embed = pooled_dynamic
@@ -200,6 +215,16 @@ class ESTForStreamClassification(LightningModule):
                 f1 = self.f1_score.compute()
                 accuracy = ((probs > 0.5) == labels).float().mean()
 
+        # Process attention outputs
+        attention_outputs = None
+        if output_attentions and encoded.attentions is not None:
+            attention_outputs = []
+            for layer_attention in encoded.attentions:
+                if isinstance(layer_attention, torch.Tensor):
+                    attention_outputs.append({'attn_weights': layer_attention})
+                elif isinstance(layer_attention, dict) and 'attn_weights' in layer_attention:
+                    attention_outputs.append(layer_attention)
+
         return StreamClassificationModelOutput(
             loss=loss,
             preds=probs,
@@ -208,7 +233,7 @@ class ESTForStreamClassification(LightningModule):
             auc=auc,
             auprc=auprc,
             f1=f1,
-            attentions=encoded.attentions if output_attentions else None
+            attentions=attention_outputs
         )
 
     def on_epoch_start(self):

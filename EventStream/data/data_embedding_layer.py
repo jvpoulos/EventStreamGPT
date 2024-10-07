@@ -218,6 +218,7 @@ class DataEmbeddingLayer(torch.nn.Module):
         self.static_embedding_mode = static_embedding_mode
         self.do_normalize_by_measurement_index = do_normalize_by_measurement_index
         self.oov_index = oov_index
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         if categorical_embedding_dim is None and numerical_embedding_dim is None:
             self.embedding_mode = EmbeddingMode.JOINT
@@ -262,11 +263,28 @@ class DataEmbeddingLayer(torch.nn.Module):
     def forward(self, input_data: Union[PytorchBatch, torch.Tensor, Dict[str, torch.Tensor]]) -> torch.Tensor:
         if isinstance(input_data, dict):
             dynamic_indices = input_data.get('dynamic_indices')
+            if dynamic_indices is not None:
+                dynamic_indices = dynamic_indices.to(self.device)
+            
             dynamic_values = input_data.get('dynamic_values')
+            if dynamic_values is not None:
+                dynamic_values = dynamic_values.to(self.device)
+            
             dynamic_measurement_indices = input_data.get('dynamic_measurement_indices')
+            if dynamic_measurement_indices is not None:
+                dynamic_measurement_indices = dynamic_measurement_indices.to(self.device)
+            
             static_indices = input_data.get('static_indices')
+            if static_indices is not None:
+                static_indices = static_indices.to(self.device)
+            
             static_measurement_indices = input_data.get('static_measurement_indices')
+            if static_measurement_indices is not None:
+                static_measurement_indices = static_measurement_indices.to(self.device)
+            
             time = input_data.get('time')
+            if time is not None:
+                time = time.to(self.device)
 
             if dynamic_indices is None:
                 raise ValueError("'dynamic_indices' must be provided in the input dictionary.")
@@ -293,13 +311,13 @@ class DataEmbeddingLayer(torch.nn.Module):
             if time is not None:
                 result += self._embed_time(time)
 
-            return result
+            return result.to(self.device)
         elif isinstance(input_data, torch.Tensor):
-            return self._embed(input_data, None, None, None, None)
+            return self._embed(input_data, None, None, None, None).to(self.device)
         elif isinstance(input_data, PytorchBatch):
-            result = self._dynamic_embedding(input_data)
-            result += self._static_embedding(input_data)
-            return result
+            result = self._dynamic_embedding(input_data).to(self.device)
+            result += self._static_embedding(input_data).to(self.device)
+            return result.to(self.device)
         else:
             raise TypeError("Input 'input_data' should be a PytorchBatch object, a Tensor, or a dictionary.")
 
