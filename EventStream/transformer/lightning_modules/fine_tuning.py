@@ -44,7 +44,7 @@ from torchmetrics.classification import (
     MultilabelAUROC,
     MultilabelAveragePrecision,
 )
-from transformers import get_polynomial_decay_schedule_with_warmup
+from transformers import get_linear_schedule_with_warmup, get_polynomial_decay_schedule_with_warmup
 
 from ...data.config import (
     PytorchDatasetConfig,
@@ -487,15 +487,12 @@ class ESTForStreamClassificationLM(L.LightningModule):
         preds_np = preds.cpu().numpy()
         labels_np = labels.cpu().numpy()
 
-        # Check if the task is binary classification
-        if np.unique(labels_np).size != 2:
-            raise ValueError("This visualization is designed for binary classification tasks only.")
-
-        # Convert predictions to binary
-        preds_binary = (preds_np > 0.5).astype(float)
+        # Use the same BinaryAUROC metric as used for logging
+        auroc = BinaryAUROC()
+        auroc_value = auroc(torch.tensor(preds_np), torch.tensor(labels_np).int())
 
         # Confusion Matrix
-        cm = confusion_matrix(labels_np, preds_binary)
+        cm = confusion_matrix(labels_np, (preds_np > 0.5).astype(float))
         plt.figure(figsize=(10,7))
         sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
         plt.title(f'Confusion Matrix ({split.capitalize()} Set) - Epoch {epoch}')
@@ -505,8 +502,6 @@ class ESTForStreamClassificationLM(L.LightningModule):
         plt.close()
 
         # ROC Curve
-        auroc = BinaryAUROC()
-        auroc_value = auroc(torch.tensor(preds_np), torch.tensor(labels_np).int())
         fpr, tpr, _ = roc_curve(labels_np, preds_np)
         plt.figure()
         plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {auroc_value:.2f})')
@@ -523,7 +518,8 @@ class ESTForStreamClassificationLM(L.LightningModule):
         # Log both plots to wandb
         wandb.log({
             f"{split}_confusion_matrix": confusion_matrix_plot,
-            f"{split}_roc_curve": roc_curve_plot
+            f"{split}_roc_curve": roc_curve_plot,
+            f"{split}_auc": auroc_value
         })
 
     def log_attention_weights(self, attentions, batch_idx):
@@ -604,7 +600,7 @@ class ESTForStreamClassificationLM(L.LightningModule):
         # Forward pass
         outputs = self.model(batch, output_attentions=True)  # Pass the entire batch to the model
         loss = outputs.loss
-    
+
         if torch.isnan(loss) or torch.isinf(loss):
             self.log_debug(f"NaN or Inf loss detected in training step {batch_idx}")
             loss = torch.where(torch.isnan(loss) | torch.isinf(loss), torch.full_like(loss, 1e-8), loss)
@@ -900,6 +896,13 @@ class ESTForStreamClassificationLM(L.LightningModule):
                     start_factor=1.0,
                     end_factor=self.end_lr_frac_of_init_lr,
                     total_iters=self.num_training_steps
+                )
+            elif self.lr_scheduler_type == "linear_warmup":
+                warmup_steps = int(self.num_training_steps * 0.1)  # 10% of total steps for warmup
+                scheduler = get_linear_schedule_with_warmup(
+                    optimizer,
+                    num_warmup_steps=warmup_steps,
+                    num_training_steps=self.num_training_steps
                 )
             elif self.lr_scheduler_type == "one_cycle":
                 scheduler = torch.optim.lr_scheduler.OneCycleLR(

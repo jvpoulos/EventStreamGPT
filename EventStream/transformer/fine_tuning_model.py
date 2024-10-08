@@ -70,6 +70,10 @@ class ESTForStreamClassification(LightningModule):
         # Initialize metric accumulator
         self.metric_accumulator = defaultdict(list)
 
+        # Ensure all parameters require gradients
+        for param in self.parameters():
+            param.requires_grad = True
+            
     # Add a method to change the dtype
     def set_dtype(self, dtype):
         self.to(dtype)

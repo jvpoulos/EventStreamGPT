@@ -196,10 +196,9 @@ class InnerSelfAttention(nn.Module):
 
         self.embed_dim = config.hidden_size
         self.num_heads = config.num_attention_heads
-        self.head_dim = self.embed_dim // self.num_heads 
+        self.head_dim = config.head_dim
         assert self.head_dim * self.num_heads == self.embed_dim, f"embed_dim must be divisible by num_heads (got `embed_dim`: {self.embed_dim} and `num_heads`: {self.num_heads})."
 
-        self.attention_scale = 1.0 / math.sqrt(self.head_dim)
         self.max_position_embeddings = getattr(config, 'max_position_embeddings', 512)  # Default to 512 if not specified
         self.position_embedding = nn.Embedding(2 * config.max_position_embeddings + 1, self.num_heads)
 
@@ -210,17 +209,21 @@ class InnerSelfAttention(nn.Module):
         self.v_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=False).to(self.dtype)
         self.out_proj = nn.Linear(self.num_heads * self.head_dim, self.embed_dim, bias=True).to(self.dtype)
 
-        # Initialize with scaled Xavier uniform
-        nn.init.xavier_uniform_(self.q_proj.weight, gain=1/math.sqrt(2))
-        nn.init.xavier_uniform_(self.k_proj.weight, gain=1/math.sqrt(2))
-        nn.init.xavier_uniform_(self.v_proj.weight, gain=1/math.sqrt(2))
-        nn.init.xavier_uniform_(self.out_proj.weight, gain=1/math.sqrt(2))
+        # Initialize weights with a non-zero value
+        gain = 1.0
+        nn.init.xavier_uniform_(self.q_proj.weight, gain=gain)
+        nn.init.xavier_uniform_(self.k_proj.weight, gain=gain)
+        nn.init.xavier_uniform_(self.v_proj.weight, gain=gain)
+        nn.init.xavier_uniform_(self.out_proj.weight, gain=gain)
         
         if self.q_proj.bias is not None:
-            nn.init.zeros_(self.q_proj.bias)
-            nn.init.zeros_(self.k_proj.bias)
-            nn.init.zeros_(self.v_proj.bias)
-            nn.init.zeros_(self.out_proj.bias)
+            nn.init.constant_(self.q_proj.bias, 0.1)
+            nn.init.constant_(self.k_proj.bias, 0.1)
+            nn.init.constant_(self.v_proj.bias, 0.1)
+            nn.init.constant_(self.out_proj.bias, 0.1)
+
+        # Initialize position embedding with a smaller standard deviation
+        nn.init.normal_(self.position_embedding.weight, mean=0, std=0.02)
 
     def compute_position_bias(self, seq_len, bsz):
         position = torch.arange(seq_len, dtype=torch.long, device=self.q_proj.weight.device)
@@ -284,7 +287,7 @@ class InnerSelfAttention(nn.Module):
             nn.init.zeros_(self.v_proj.bias)
             nn.init.zeros_(self.out_proj.bias)
 
-    def _attn(self, query, key, value, attention_mask=None, head_mask=None):
+    def _attn(self, query, key, value, attention_mask=None, head_mask=None, position_bias=None):
         # Log input tensor statistics
         for name, tensor in [('query', query), ('key', key), ('value', value)]:
             if torch.isnan(tensor).any():
@@ -322,30 +325,26 @@ class InnerSelfAttention(nn.Module):
 
         # Standard attention implementation
         query = query.to(key.dtype)
-        attn_weights = torch.matmul(query, key.transpose(-1, -2)) * self.attention_scale
-        attn_weights = attn_weights / math.sqrt(self.head_dim)  # Apply scaling factor
+        attn_weights = torch.matmul(query, key.transpose(-1, -2))
+
+        # Scale attention scores
+        attn_weights = attn_weights / math.sqrt(self.head_dim)
+
+        logger.debug(f"Post-scaled attn_weights stats: min={attn_weights.min().item():.6f}, max={attn_weights.max().item():.6f}, mean={attn_weights.mean().item():.6f}")
 
         # Log gradients
         if self.training:
             attn_weights.register_hook(lambda grad: logger.debug(f"Attention weights gradient: min={grad.min().item()}, max={grad.max().item()}, mean={grad.mean().item()}"))
 
         # Add a small epsilon to avoid division by zero
-        attn_weights = attn_weights + 1e-8
+        attn_weights = attn_weights + 1e-9
+
+        # Add position bias to attention weights
+        if position_bias is not None:
+            attn_weights = attn_weights + position_bias
         
         logger.debug(f"Raw attention weights shape: {attn_weights.shape}")
         logger.debug(f"Raw attention weights stats: min={attn_weights.min().item()}, max={attn_weights.max().item()}, mean={attn_weights.mean().item()}")
-
-        # Add relative position bias
-        position_bias = self.compute_position_bias(seq_len, bsz)
-        # Log the shape of position_bias for debugging
-        logger.debug(f"Position bias shape after computation: {position_bias.shape}")
-        
-        # Ensure position_bias has the correct shape
-        if position_bias.shape != attn_weights.shape:
-            logger.warning(f"Mismatch between position_bias shape {position_bias.shape} and attn_weights shape {attn_weights.shape}")
-            position_bias = position_bias.view(attn_weights.shape)
-        
-        attn_weights = attn_weights + position_bias
 
         if self.causal:
             causal_mask = torch.triu(torch.ones(seq_len, seq_len, dtype=torch.bool, device=query.device), diagonal=1)
@@ -371,16 +370,15 @@ class InnerSelfAttention(nn.Module):
             attn_weights = attn_weights + attention_mask
             logger.debug(f"Attention mask applied: shape={attention_mask.shape}, non-zero elements: {torch.sum(attention_mask != 0).item()}")
 
-        # Apply softmax to get probabilities
-        attn_probs = F.softmax(attn_weights, dim=-1)
+        # Use log_softmax for better numerical stability
+        attn_probs = nn.functional.softmax(attn_weights, dim=-1)
+        logger.debug(f"Attention probs after softmax: min={attn_probs.min().item():.6f}, max={attn_probs.max().item():.6f}, mean={attn_probs.mean().item():.6f}")
 
         # Check for NaN values
         if torch.isnan(attn_probs).any():
             logger.warning("NaN values detected in attention probabilities. Replacing with uniform distribution.")
             nan_mask = torch.isnan(attn_probs)
             attn_probs = torch.where(nan_mask, torch.full_like(attn_probs, 1.0 / seq_len), attn_probs)
-
-        logger.debug(f"Attention probabilities after softmax: min={attn_probs.min().item()}, max={attn_probs.max().item()}, mean={attn_probs.mean().item()}")
         
         # Add gradient logging for attention probabilities
         if self.training:
@@ -446,8 +444,13 @@ class InnerSelfAttention(nn.Module):
         logger.debug(f"K proj weight stats: min={self.k_proj.weight.min().item():.6f}, max={self.k_proj.weight.max().item():.6f}, mean={self.k_proj.weight.mean().item():.6f}")
         logger.debug(f"V proj weight stats: min={self.v_proj.weight.min().item():.6f}, max={self.v_proj.weight.max().item():.6f}, mean={self.v_proj.weight.mean().item():.6f}")
 
+        # Compute position bias
+        position_bias = self.compute_position_bias(seq_len, bsz)
+        logger.debug(f"Position bias shape: {position_bias.shape}")
+
         # Ensure consistent dtype for hidden_states and projections
         hidden_states = hidden_states.to(self.dtype)
+        
         query = self.q_proj(hidden_states)
         key = self.k_proj(hidden_states)
         value = self.v_proj(hidden_states)
@@ -479,9 +482,9 @@ class InnerSelfAttention(nn.Module):
                 attn_output, attn_weights = self._flash_attention(query, key, value, attention_mask)
             except Exception as e:
                 logger.warning(f"Flash Attention failed: {str(e)}. Falling back to selected attention mechanism.")
-                attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask)
+                attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask, position_bias)
         else:
-            attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask)
+            attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask, position_bias)
 
         # Log attention weights statistics
         if self.training:
@@ -525,7 +528,7 @@ class InnerSelfAttention(nn.Module):
         attn_output = self.resid_dropout(attn_output)
 
         # Calculate attention weights manually for logging purposes
-        attn_weights = torch.matmul(q, k.transpose(-1, -2)) * self.attention_scale
+        attn_weights = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(self.head_dim)
         attn_weights = F.softmax(attn_weights, dim=-1)
         
         return attn_output, attn_weights
@@ -729,6 +732,7 @@ class InnerBlock(nn.Module):
         self.layer_norm1 = StableLayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
         self.layer_norm2 = StableLayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
         self.mlp = InnerMLP(config)
+        self.dropout = nn.Dropout(config.resid_dropout)
         self.seq_window_size = config.seq_window_size
 
         if device is not None:
@@ -792,7 +796,7 @@ class InnerBlock(nn.Module):
                 # Fallback: Repeat or truncate to match the required shape
                 attn_output = attn_output.view(-1).repeat(residual.numel() // attn_output.numel() + 1)[:residual.numel()].view(*residual.shape)
 
-        hidden_states = attn_output + residual
+        hidden_states = residual + self.dropout(attn_output)
         
         residual = hidden_states
         hidden_states = self.layer_norm2(hidden_states)
@@ -803,7 +807,7 @@ class InnerBlock(nn.Module):
             logger.warning(f"Reshaping feed_forward_hidden_states from {feed_forward_hidden_states.shape} to {residual.shape}")
             feed_forward_hidden_states = feed_forward_hidden_states.view(residual.shape)
 
-        hidden_states = residual + feed_forward_hidden_states
+        hidden_states = residual + self.dropout(feed_forward_hidden_states)
 
         outputs = {
             "hidden_states": hidden_states,
@@ -1245,6 +1249,9 @@ class ConditionallyIndependentPointProcessInputLayer(nn.Module):
         # Pass through the feature combiner
         combined_embed = self.feature_combiner(combined_features)
         combined_embed = self.input_norm(combined_embed)
+
+        # Add a small epsilon to ensure non-zero inputs
+        combined_embed = combined_embed + 1e-8
 
         logger.debug(f"Dynamic indices shape: {dynamic_indices.shape}")
         logger.debug(f"Dynamic values shape: {dynamic_values.shape if dynamic_values is not None else None}")
