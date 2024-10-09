@@ -191,8 +191,7 @@ class InnerSelfAttention(nn.Module):
         self.resid_dropout = nn.Dropout(float(config.resid_dropout))
 
         self.use_flash_attention = config.use_flash_attention
-        self.eps = 1e-8
-        self.attention_mechanism = config.attention_mechanism
+        self.eps = 1e-6
 
         self.embed_dim = config.hidden_size
         self.num_heads = config.num_attention_heads
@@ -224,6 +223,15 @@ class InnerSelfAttention(nn.Module):
 
         # Initialize position embedding with a smaller standard deviation
         nn.init.normal_(self.position_embedding.weight, mean=0, std=0.02)
+
+        # Add input normalization
+        self.input_norm = nn.LayerNorm(config.hidden_size)
+
+        self.query_norm = nn.LayerNorm(self.head_dim)
+        self.key_norm = nn.LayerNorm(self.head_dim)
+
+        # Make scaling factor learnable
+        self.attention_scale = nn.Parameter(torch.tensor(1.0 / math.sqrt(self.head_dim)))
 
     def compute_position_bias(self, seq_len, bsz):
         position = torch.arange(seq_len, dtype=torch.long, device=self.q_proj.weight.device)
@@ -288,6 +296,10 @@ class InnerSelfAttention(nn.Module):
             nn.init.zeros_(self.out_proj.bias)
 
     def _attn(self, query, key, value, attention_mask=None, head_mask=None, position_bias=None):
+
+        query = self.query_norm(query)
+        key = self.key_norm(key)
+
         # Log input tensor statistics
         for name, tensor in [('query', query), ('key', key), ('value', value)]:
             if torch.isnan(tensor).any():
@@ -325,19 +337,16 @@ class InnerSelfAttention(nn.Module):
 
         # Standard attention implementation
         query = query.to(key.dtype)
-        attn_weights = torch.matmul(query, key.transpose(-1, -2))
 
-        # Scale attention scores
-        attn_weights = attn_weights / math.sqrt(self.head_dim)
+        # Scaled dot-product attention using learnable scaling factor
+        attn_weights = torch.matmul(query, key.transpose(-1, -2)) * self.attention_scale
 
-        logger.debug(f"Post-scaled attn_weights stats: min={attn_weights.min().item():.6f}, max={attn_weights.max().item():.6f}, mean={attn_weights.mean().item():.6f}")
+        logger.debug(f"Raw attention weights (before mask): min={attn_weights.min().item():.6f}, max={attn_weights.max().item():.6f}, mean={attn_weights.mean().item():.6f}")
 
-        # Log gradients
-        if self.training:
-            attn_weights.register_hook(lambda grad: logger.debug(f"Attention weights gradient: min={grad.min().item()}, max={grad.max().item()}, mean={grad.mean().item()}"))
-
-        # Add a small epsilon to avoid division by zero
-        attn_weights = attn_weights + 1e-9
+        # Check for NaN values and replace them
+        if torch.isnan(attn_weights).any():
+            logger.warning("NaN values detected in attention weights. Replacing with uniform distribution.")
+            attn_weights = torch.full_like(attn_weights, 1.0 / attn_weights.shape[-1])
 
         # Add position bias to attention weights
         if position_bias is not None:
@@ -363,16 +372,23 @@ class InnerSelfAttention(nn.Module):
             
             # Convert boolean mask to float mask
             attention_mask = attention_mask.to(torch.float32)
-            attention_mask = (1.0 - attention_mask) * -10000.0  # Use a finite value instead of -inf
+            attention_mask = (1.0 - attention_mask) * -10000.0  # Use a large negative value instead of -inf
             
             logger.debug(f"Attention mask stats after processing: min={attention_mask.min().item():.2f}, max={attention_mask.max().item():.2f}, mean={attention_mask.mean().item():.2f}")
             
             attn_weights = attn_weights + attention_mask
             logger.debug(f"Attention mask applied: shape={attention_mask.shape}, non-zero elements: {torch.sum(attention_mask != 0).item()}")
+            logger.debug(f"Attention weights after mask: min={attn_weights.min().item():.6f}, max={attn_weights.max().item():.6f}, mean={attn_weights.mean().item():.6f}")
 
-        # Use log_softmax for better numerical stability
-        attn_probs = nn.functional.softmax(attn_weights, dim=-1)
+        # Apply softmax with increased numerical stability
+        attn_weights_float = torch.nn.functional.softmax(attn_weights - torch.max(attn_weights, dim=-1, keepdim=True)[0], dim=-1, dtype=torch.float32)
+        attn_probs = attn_weights_float / (attn_weights_float.sum(dim=-1, keepdim=True) + self.eps)
+        attn_probs = attn_weights_float.to(query.dtype)
         logger.debug(f"Attention probs after softmax: min={attn_probs.min().item():.6f}, max={attn_probs.max().item():.6f}, mean={attn_probs.mean().item():.6f}")
+
+        # Check for uniform attention weights
+        if torch.allclose(attn_probs, attn_probs.mean()):
+            logger.warning("Attention weights are uniform. This may indicate an issue with the attention mechanism.")
 
         # Check for NaN values
         if torch.isnan(attn_probs).any():
@@ -432,6 +448,9 @@ class InnerSelfAttention(nn.Module):
         return attention_mask
     
     def forward(self, hidden_states, attention_mask=None, layer_past=None, head_mask=None, use_cache=False, output_attentions=False, static_kv_first: bool = False):
+        # Normalize inputs
+        hidden_states = self.input_norm(hidden_states)
+
         self.check_projection_layers()
         if hidden_states.dim() == 2:
             hidden_states = hidden_states.unsqueeze(1)  # Add sequence dimension
@@ -444,6 +463,12 @@ class InnerSelfAttention(nn.Module):
         logger.debug(f"K proj weight stats: min={self.k_proj.weight.min().item():.6f}, max={self.k_proj.weight.max().item():.6f}, mean={self.k_proj.weight.mean().item():.6f}")
         logger.debug(f"V proj weight stats: min={self.v_proj.weight.min().item():.6f}, max={self.v_proj.weight.max().item():.6f}, mean={self.v_proj.weight.mean().item():.6f}")
 
+        # Add gradient logging for projection layers
+        if self.training:
+            self.q_proj.weight.register_hook(lambda grad: logger.debug(f"Q proj weight grad norm: {grad.norm().item()}"))
+            self.k_proj.weight.register_hook(lambda grad: logger.debug(f"K proj weight grad norm: {grad.norm().item()}"))
+            self.v_proj.weight.register_hook(lambda grad: logger.debug(f"V proj weight grad norm: {grad.norm().item()}"))
+            
         # Compute position bias
         position_bias = self.compute_position_bias(seq_len, bsz)
         logger.debug(f"Position bias shape: {position_bias.shape}")
@@ -451,16 +476,22 @@ class InnerSelfAttention(nn.Module):
         # Ensure consistent dtype for hidden_states and projections
         hidden_states = hidden_states.to(self.dtype)
         
-        query = self.q_proj(hidden_states)
-        key = self.k_proj(hidden_states)
-        value = self.v_proj(hidden_states)
-        
+        query = self.q_proj(hidden_states).to(self.dtype)
+        key = self.k_proj(hidden_states).to(self.dtype)
+        value = self.v_proj(hidden_states).to(self.dtype)
+
         # Check for NaN values and log statistics
         for tensor, name in [(query, 'query'), (key, 'key'), (value, 'value')]:
             if torch.isnan(tensor).any():
                 logger.warning(f"NaN values detected in {name}")
                 tensor = torch.where(torch.isnan(tensor), torch.zeros_like(tensor), tensor)
             logger.debug(f"{name} stats: min={tensor.min().item():.6f}, max={tensor.max().item():.6f}, mean={tensor.mean().item():.6f}")
+
+        # Clip extremely large values and replace NaNs
+        for tensor, name in [(query, 'query'), (key, 'key'), (value, 'value')]:
+            tensor.clamp_(-65504, 65504)  # clamp to float16 range
+            tensor.nan_to_num_(0.0)
+            logger.debug(f"{name} stats after clipping: min={tensor.min().item():.6f}, max={tensor.max().item():.6f}, mean={tensor.mean().item():.6f}")
 
         query = self._split_heads(query, self.num_heads, self.head_dim)
         key = self._split_heads(key, self.num_heads, self.head_dim)
@@ -598,60 +629,6 @@ class StableLayerNorm(nn.Module):
         mean = x.mean(-1, keepdim=True)
         std = torch.sqrt(x.var(-1, keepdim=True, unbiased=False) + self.eps)
         return self.weight * (x - mean) / std + self.bias
-
-class CustomLayerNorm(nn.Module):
-    def __init__(self, normalized_shape, eps=1e-5):
-        super().__init__()
-        if isinstance(normalized_shape, int):
-            normalized_shape = (normalized_shape,)
-        self.normalized_shape = tuple(normalized_shape)
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(normalized_shape))
-        self.bias = nn.Parameter(torch.zeros(normalized_shape))
-
-    def forward(self, x):
-        logger.debug(f"CustomLayerNorm input shape: {x.shape}")
-        logger.debug(f"CustomLayerNorm input dtype: {x.dtype}")
-        logger.debug(f"CustomLayerNorm input device: {x.device}")
-        logger.debug(f"CustomLayerNorm normalized_shape: {self.normalized_shape}")
-
-        original_shape = x.shape
-        original_dtype = x.dtype
-
-        # Ensure computations are done in float32 for stability
-        x = x.float()
-
-        # Compute mean and variance with better numerical stability
-        # Compute along the last dimension
-        mean = x.mean(dim=-1, keepdim=True)
-        var = x.var(dim=-1, unbiased=False, keepdim=True)
-
-        # Add a small epsilon to avoid division by zero
-        std = torch.clamp(var + self.eps, min=1e-6).sqrt()
-        
-        # Normalize
-        x = (x - mean) / torch.sqrt(var + self.eps)
-
-        # Check for NaN or Inf values after normalization
-        if torch.isnan(x).any() or torch.isinf(x).any():
-            logger.warning("NaN or Inf values detected after normalization. Clipping values.")
-            x = torch.clamp(x, min=-10, max=10)
-
-        # Apply weight and bias
-        if self.weight.dim() == 1:
-            x = x * self.weight + self.bias
-        else:
-            x = x * self.weight.unsqueeze(0) + self.bias.unsqueeze(0)
-
-        # Convert back to original dtype
-        x = x.to(original_dtype)
-
-        logger.debug(f"CustomLayerNorm output shape: {x.shape}")
-        return x
-
-    def _check_gradients(self, grad, name):
-        if torch.isnan(grad).any() or torch.isinf(grad).any():
-            logger.warning(f"NaN or Inf gradients detected in CustomLayerNorm {name}")
 
 class InnerAttention(nn.Module):
     def __init__(self, config: StructuredTransformerConfig, layer_id: int, is_seq: bool):
@@ -1098,7 +1075,7 @@ class ConditionallyIndependentPointProcessInputLayer(nn.Module):
         self.feature_combiner = nn.Linear(config.hidden_size * 3, config.hidden_size)
 
         # Add a layer normalization
-        self.input_norm = nn.LayerNorm(config.hidden_size)
+        self.input_norm = nn.LayerNorm(config.hidden_size) if config.use_layer_norm else nn.Identity()
 
         # Method to generate a fake feature correlated with the labels
         self.use_fake_feature = getattr(config, 'use_fake_feature', False)
@@ -1141,15 +1118,16 @@ class ConditionallyIndependentPointProcessInputLayer(nn.Module):
             else:
                 logger.debug(f"{key}: None")
         
-        # Normalize input features
+        # Normalize input features only if not already normalized
         for key in ['dynamic_values', 'time']:
             if key in input_features and input_features[key] is not None:
                 tensor = input_features[key]
-                mean = tensor.mean()
-                std = tensor.std()
-                if std == 0:
-                    std = 1e-6
-                input_features[key] = (tensor - mean) / (std + 1e-6)
+                if tensor.abs().mean() > 1:  # Simple check to see if it might need normalization
+                    mean = tensor.mean()
+                    std = tensor.std()
+                    if std == 0:
+                        std = 1e-6
+                    input_features[key] = (tensor - mean) / (std + 1e-6)
 
         dynamic_indices = input_features.get('dynamic_indices')
         if dynamic_indices is not None:
@@ -1298,9 +1276,8 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
             for i in range(config.num_hidden_layers)
         ])
         
-        self.ln_f = StableLayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
-        if config.use_batch_norm:
-            self.bn_f = nn.BatchNorm1d(self.embed_dim)
+        self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon) if config.use_layer_norm else nn.Identity()
+        self.bn_f = nn.BatchNorm1d(self.embed_dim) if config.use_batch_norm else nn.Identity()
 
         self.gradient_checkpointing = config.use_gradient_checkpointing
 
@@ -1329,7 +1306,14 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
     @dtype.setter
     def dtype(self, value):
         self._dtype = value
-     
+
+    def check_gradients(self):
+        for name, param in self.named_parameters():
+            if param.grad is None:
+                logger.warning(f"No gradient for parameter: {name}")
+            else:
+                grad_norm = param.grad.norm()
+                logger.debug(f"Gradient norm for {name}: {grad_norm.item()}")
     def forward(
         self,
         dynamic_indices: Union[torch.Tensor, Dict[str, torch.Tensor]] = None,
@@ -1553,8 +1537,11 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
             if output_attentions:
                 all_self_attentions = all_self_attentions + (extra_return_info.get("attn_weights"),)
 
-        hidden_states = self.ln_f(hidden_states)
-        if hasattr(self, 'bn_f'):
+        # Apply normalization based on config flags
+        if self.config.use_layer_norm:
+            hidden_states = self.ln_f(hidden_states)
+        
+        if self.config.use_batch_norm:
             logger.debug(f"Applying batch normalization. hidden_states shape: {hidden_states.shape}")
             if hidden_states.dim() == 3:
                 hidden_states = self.bn_f(hidden_states.transpose(1, 2)).transpose(1, 2)
@@ -1576,6 +1563,9 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
             return tuple(v.to(self.device) if isinstance(v, torch.Tensor) else v 
                          for v in [hidden_states, presents, all_hidden_states, all_self_attentions] 
                          if v is not None)
+
+        if self.training:
+            self.check_gradients()
 
         return TransformerOutputWithPast(
             last_hidden_state=hidden_states,
@@ -1906,15 +1896,16 @@ class NestedAttentionPointProcessTransformer(StructuredTransformerPreTrainedMode
                     extra_return_info["dep_graph_module"]["attn_weights"],
                 )
 
-        # Apply layer normalization if configured
-        if self.config.use_layer_norm:
-            hidden_states = self.ln_f(hidden_states)
-        
-        # Apply batch normalization if configured
+        # Apply normalization only if configured
+        hidden_states = self.ln_f(hidden_states)
         if self.config.use_batch_norm:
-            hidden_states = hidden_states.permute(0, 3, 1, 2)  # [bsz, hidden_size, seq_len, dep_graph_len]
-            hidden_states = self.bn_f(hidden_states)
-            hidden_states = hidden_states.permute(0, 2, 3, 1)  # [bsz, seq_len, dep_graph_len, hidden_size]
+            if hidden_states.dim() == 3:
+                hidden_states = self.bn_f(hidden_states.transpose(1, 2)).transpose(1, 2)
+            elif hidden_states.dim() == 2:
+                hidden_states = self.bn_f(hidden_states.unsqueeze(-1)).squeeze(-1)
+
+        # Print out normalized values for debugging
+        logger.debug(f"Normalized hidden states stats: min={hidden_states.min().item():.6f}, max={hidden_states.max().item():.6f}, mean={hidden_states.mean().item():.6f}")
 
         hidden_states = hidden_states.view(input_embeds.size())
         

@@ -17,8 +17,7 @@ from .transformer import (
     ConditionallyIndependentPointProcessTransformer,
     NestedAttentionPointProcessTransformer,
     StructuredTransformerPreTrainedModel,
-    ConditionallyIndependentPointProcessInputLayer,
-    StableLayerNorm
+    ConditionallyIndependentPointProcessInputLayer
 )
 from .utils import safe_masked_max, safe_weighted_avg
 
@@ -46,7 +45,7 @@ class ESTForStreamClassification(LightningModule):
         
         self.static_indices_embedding = nn.Embedding(config.vocab_size, config.hidden_size)
         
-        self.layer_norm = StableLayerNorm(config.hidden_size) if config.use_layer_norm else nn.Identity()
+        self.layer_norm = nn.LayerNorm(config.hidden_size) if config.use_layer_norm else nn.Identity()
         self.batch_norm = nn.BatchNorm1d(config.hidden_size) if config.use_batch_norm else nn.Identity()
         self.dynamic_values_norm = nn.BatchNorm1d(1)
         
@@ -71,10 +70,14 @@ class ESTForStreamClassification(LightningModule):
         self.metric_accumulator = defaultdict(list)
 
         # Ensure all parameters require gradients
-        for param in self.parameters():
-            param.requires_grad = True
+        self.ensure_all_params_require_grad()
             
-    # Add a method to change the dtype
+    def ensure_all_params_require_grad(self):
+        for name, param in self.named_parameters():
+            if not param.requires_grad:
+                logger.warning(f"Parameter {name} does not require gradients. Setting requires_grad=True.")
+                param.requires_grad = True
+
     def set_dtype(self, dtype):
         self.to(dtype)
         
@@ -150,8 +153,10 @@ class ESTForStreamClassification(LightningModule):
             torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=self.config.max_grad_norm)
 
         # Encode the input
+        logger.debug("Encoder forward pass")
         encoded = self.encoder(**input_features, output_attentions=output_attentions)
         
+        logger.debug("Processing encoder output")
         event_encoded = encoded.last_hidden_state
 
         # Check for NaN values
@@ -229,6 +234,7 @@ class ESTForStreamClassification(LightningModule):
                 elif isinstance(layer_attention, dict) and 'attn_weights' in layer_attention:
                     attention_outputs.append(layer_attention)
 
+        logger.debug("Completed forward pass in ESTForStreamClassification")
         return StreamClassificationModelOutput(
             loss=loss,
             preds=probs,

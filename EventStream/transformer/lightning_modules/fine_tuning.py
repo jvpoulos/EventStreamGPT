@@ -9,7 +9,7 @@ from torch.distributed.elastic.multiprocessing.errors import record
 import random
 import numpy as np
 import matplotlib.pyplot as plt
-from sklearn.metrics import confusion_matrix, roc_curve, auc
+from sklearn.metrics import confusion_matrix, roc_curve, auc, roc_auc_score
 import seaborn as sns
 from collections.abc import Sequence
 from collections import defaultdict
@@ -71,7 +71,6 @@ from dataclasses import dataclass, field
 
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.metrics import confusion_matrix, roc_curve, auc
 
 import logging
 from pytorch_lightning.loggers import WandbLogger
@@ -487,9 +486,7 @@ class ESTForStreamClassificationLM(L.LightningModule):
         preds_np = preds.cpu().numpy()
         labels_np = labels.cpu().numpy()
 
-        # Use the same BinaryAUROC metric as used for logging
-        auroc = BinaryAUROC()
-        auroc_value = auroc(torch.tensor(preds_np), torch.tensor(labels_np).int())
+        auc_value = roc_auc_score(labels_np, preds_np)
 
         # Confusion Matrix
         cm = confusion_matrix(labels_np, (preds_np > 0.5).astype(float))
@@ -504,7 +501,7 @@ class ESTForStreamClassificationLM(L.LightningModule):
         # ROC Curve
         fpr, tpr, _ = roc_curve(labels_np, preds_np)
         plt.figure()
-        plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {auroc_value:.2f})')
+        plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {auc_value:.2f})')
         plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
         plt.xlim([0.0, 1.0])
         plt.ylim([0.0, 1.05])
@@ -519,7 +516,7 @@ class ESTForStreamClassificationLM(L.LightningModule):
         wandb.log({
             f"{split}_confusion_matrix": confusion_matrix_plot,
             f"{split}_roc_curve": roc_curve_plot,
-            f"{split}_auc": auroc_value
+            f"{split}_auc": auc_value
         })
 
     def log_attention_weights(self, attentions, batch_idx):
@@ -876,7 +873,8 @@ class ESTForStreamClassificationLM(L.LightningModule):
         optimizer = torch.optim.AdamW(
             self.parameters(),
             lr=self.learning_rate,
-            weight_decay=self.weight_decay
+            weight_decay=self.weight_decay,
+            eps=1e-8
         )
 
         # Add gradient clipping
