@@ -27,6 +27,9 @@ from ..utils import JSONableMixin, StrEnum, hydra_dataclass, CustomJSONEncoder
 
 MEAS_INDEX_GROUP_T = Union[str, tuple[str, MeasIndexGroupOptions]]
 
+class AttentionMechanism(Enum):
+    ORIGINAL_IMPROVED = "original_improved"
+    STABLE_ATTENTION = "stable_attention"
 
 class Split(StrEnum):
     """What data split is being used."""
@@ -252,8 +255,6 @@ class OptimizationConfig(JSONableMixin):
     gradient_accumulation: int = 1
     use_lr_scheduler: bool = False
     lr_scheduler_type: str = "cosine"
-    use_grad_value_clipping: bool = True
-    clip_grad_value: float = 1.0
     lr_num_warmup_steps: int = 100
     max_grad_norm: float = 1.0
 
@@ -550,6 +551,7 @@ class StructuredTransformerConfig(PretrainedConfig):
         use_addition_for_static: bool = True,
         device=None,
         dtype: str = "float32",
+        attention_mechanism: str = "original_improved",
         **kwargs,
     ):
         self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -604,7 +606,7 @@ class StructuredTransformerConfig(PretrainedConfig):
         super().__init__(**kwargs)
 
         self.use_flash_attention = kwargs.get("use_flash_attention", True)
-        self.attention_mechanism = AttentionMechanism(kwargs.get("attention_mechanism", "original_improved"))
+        self.attention_mechanism = AttentionMechanism(attention_mechanism)
 
         self.use_fake_feature = use_fake_feature
         self.fake_feature_correlation = fake_feature_correlation
@@ -883,11 +885,6 @@ class StructuredTransformerConfig(PretrainedConfig):
 
         assert not kwargs.get("is_encoder_decoder", False), "Can't be used in encoder/decoder mode!"
         kwargs["is_encoder_decoder"] = False
-
-        self.optimization_config = {
-            'use_grad_value_clipping': True,
-            'clip_grad_value': 1.0,
-        }
 
         super().__init__(**kwargs)
 

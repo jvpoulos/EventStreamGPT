@@ -25,12 +25,14 @@ PROPORTION = float
 COUNT_OR_PROPORTION = Union[int, PROPORTION]
 WHOLE = Union[int, pl.Expr]
 
-class CustomJSONEncoder(JSONEncoder):
+class CustomJSONEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, Enum):
-            return str(obj.value)
+            return obj.value
         elif isinstance(obj, torch.device):
             return str(obj)
+        elif hasattr(obj, 'to_dict'):
+            return obj.to_dict()
         return super().default(obj)
         
 def count_or_proportion(N: WHOLE | None, cnt_or_prop: COUNT_OR_PROPORTION) -> int:

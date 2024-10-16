@@ -29,6 +29,7 @@ import logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
+
 class ESTForStreamClassification(LightningModule):
     def __init__(self, config: StructuredTransformerConfig, vocabulary_config: VocabularyConfig, optimization_config: OptimizationConfig, oov_index: int, save_dir: str = "./model_outputs"):
         super().__init__()
@@ -82,6 +83,7 @@ class ESTForStreamClassification(LightningModule):
         self.to(dtype)
         
     def forward(self, batch=None, output_attentions=False, **kwargs):
+        logger.debug("Entering forward method")
         if batch is not None:
             kwargs.update(batch)
         
@@ -148,16 +150,16 @@ class ESTForStreamClassification(LightningModule):
         if getattr(self.config, 'use_fake_feature', False):
             input_features['labels'] = labels
 
-        # Add gradient clipping
-        if self.training:
-            torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=self.config.max_grad_norm)
-
         # Encode the input
-        logger.debug("Encoder forward pass")
+        logger.debug("About to start encoder forward pass")
+        torch.cuda.synchronize()
         encoded = self.encoder(**input_features, output_attentions=output_attentions)
-        
+        torch.cuda.synchronize()
+        logger.debug("Completed encoder forward pass")
+
         logger.debug("Processing encoder output")
         event_encoded = encoded.last_hidden_state
+        logger.debug(f"event_encoded shape: {event_encoded.shape}")
 
         # Check for NaN values
         if torch.isnan(event_encoded).any():

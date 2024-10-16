@@ -190,15 +190,14 @@ class InnerSelfAttention(nn.Module):
         self.attn_dropout = nn.Dropout(float(config.attention_dropout))
         self.resid_dropout = nn.Dropout(float(config.resid_dropout))
 
-        self.use_flash_attention = config.use_flash_attention
-        self.eps = 1e-6
+        self.eps = 1e-5
 
         self.embed_dim = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = config.head_dim
         assert self.head_dim * self.num_heads == self.embed_dim, f"embed_dim must be divisible by num_heads (got `embed_dim`: {self.embed_dim} and `num_heads`: {self.num_heads})."
 
-        self.max_position_embeddings = getattr(config, 'max_position_embeddings', 512)  # Default to 512 if not specified
+        self.max_position_embeddings = config.max_position_embeddings
         self.position_embedding = nn.Embedding(2 * config.max_position_embeddings + 1, self.num_heads)
 
         # Initialize linear layers with Xavier initialization
@@ -209,11 +208,10 @@ class InnerSelfAttention(nn.Module):
         self.out_proj = nn.Linear(self.num_heads * self.head_dim, self.embed_dim, bias=True).to(self.dtype)
 
         # Initialize weights with a non-zero value
-        gain = 1.0
-        nn.init.xavier_uniform_(self.q_proj.weight, gain=gain)
-        nn.init.xavier_uniform_(self.k_proj.weight, gain=gain)
-        nn.init.xavier_uniform_(self.v_proj.weight, gain=gain)
-        nn.init.xavier_uniform_(self.out_proj.weight, gain=gain)
+        nn.init.xavier_uniform_(self.q_proj.weight, gain=1/math.sqrt(2))
+        nn.init.xavier_uniform_(self.k_proj.weight, gain=1/math.sqrt(2))
+        nn.init.xavier_uniform_(self.v_proj.weight, gain=1/math.sqrt(2))
+        nn.init.xavier_uniform_(self.out_proj.weight, gain=1/math.sqrt(2))
         
         if self.q_proj.bias is not None:
             nn.init.constant_(self.q_proj.bias, 0.1)
@@ -226,9 +224,6 @@ class InnerSelfAttention(nn.Module):
 
         # Add input normalization
         self.input_norm = nn.LayerNorm(config.hidden_size)
-
-        self.query_norm = nn.LayerNorm(self.head_dim)
-        self.key_norm = nn.LayerNorm(self.head_dim)
 
         # Make scaling factor learnable
         self.attention_scale = nn.Parameter(torch.tensor(1.0 / math.sqrt(self.head_dim)))
@@ -297,9 +292,6 @@ class InnerSelfAttention(nn.Module):
 
     def _attn(self, query, key, value, attention_mask=None, head_mask=None, position_bias=None):
 
-        query = self.query_norm(query)
-        key = self.key_norm(key)
-
         # Log input tensor statistics
         for name, tensor in [('query', query), ('key', key), ('value', value)]:
             if torch.isnan(tensor).any():
@@ -337,9 +329,12 @@ class InnerSelfAttention(nn.Module):
 
         # Standard attention implementation
         query = query.to(key.dtype)
+        key = key.to(self.dtype)
+        value = value.to(self.dtype)
 
         # Scaled dot-product attention using learnable scaling factor
         attn_weights = torch.matmul(query, key.transpose(-1, -2)) * self.attention_scale
+        attn_weights = attn_weights + self.eps  # Add epsilon before softmax
 
         logger.debug(f"Raw attention weights (before mask): min={attn_weights.min().item():.6f}, max={attn_weights.max().item():.6f}, mean={attn_weights.mean().item():.6f}")
 
@@ -1287,9 +1282,6 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
         self.forward_step = 0
         self.fp16 = torch.cuda.is_available()  # Use fp16 if CUDA is available
 
-        self.use_grad_value_clipping = config.optimization_config.get('use_grad_value_clipping', True)
-        self.clip_grad_value = config.optimization_config.get('clip_grad_value', 1.0)
-
         # Instead of setting self.dtype, use a property
         self._dtype = torch.float32
 
@@ -1510,20 +1502,6 @@ class ConditionallyIndependentPointProcessTransformer(StructuredTransformerPreTr
                     logger.warning(f"Reshaping hidden_states from {hidden_states.shape} to ({local_batch_size}, {self.config.seq_window_size}, {self.config.hidden_size})")
                     hidden_states = hidden_states.view(local_batch_size, self.config.seq_window_size, self.config.hidden_size)
                 logger.debug(f"After block {i}: hidden_states shape: {hidden_states.shape}")
-
-                # Apply gradient value clipping if enabled
-                if self.training and self.use_grad_value_clipping:
-                    # Check if any parameters have gradients
-                    params_with_grad = [p for p in self.parameters() if p.grad is not None]
-                    
-                    if params_with_grad:
-                        try:
-                            torch.nn.utils.clip_grad_value_(params_with_grad, self.clip_grad_value)
-                        except RuntimeError as e:
-                            logger.warning(f"Error during gradient clipping: {str(e)}")
-                            logger.info("Skipping gradient clipping for this step.")
-                    else:
-                        logger.warning("No gradients found. Skipping gradient clipping.")
 
                 # Ensure hidden_states has the correct batch size
                 if hidden_states.size(0) != local_batch_size:
