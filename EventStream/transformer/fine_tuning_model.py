@@ -72,6 +72,9 @@ class ESTForStreamClassification(LightningModule):
 
         # Ensure all parameters require gradients
         self.ensure_all_params_require_grad()
+
+        if getattr(config, 'use_fake_feature', True):
+            self.fake_temporal_feature = nn.Linear(1, config.hidden_size)
             
     def ensure_all_params_require_grad(self):
         for name, param in self.named_parameters():
@@ -147,7 +150,7 @@ class ESTForStreamClassification(LightningModule):
         }
 
         # Only pass labels to encoder if use_fake_feature is True
-        if getattr(self.config, 'use_fake_feature', False):
+        if getattr(self.config, 'use_fake_feature', True):
             input_features['labels'] = labels
 
         # Encode the input
@@ -273,64 +276,39 @@ class ESTForStreamClassification(LightningModule):
                 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            nn.init.xavier_uniform_(module.weight)
+            nn.init.xavier_uniform_(module.weight, gain=1/math.sqrt(2))
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.LayerNorm):
-            nn.init.ones_(module.weight)
-            nn.init.zeros_(module.bias)
+            nn.init.constant_(module.weight, 1.0)
+            nn.init.constant_(module.bias, 0.0)
         elif isinstance(module, nn.BatchNorm1d):
-            nn.init.ones_(module.weight)
-            nn.init.zeros_(module.bias)
+            nn.init.constant_(module.weight, 1.0)
+            nn.init.constant_(module.bias, 0.0)
         elif isinstance(module, nn.Embedding):
             embedding_dim = module.embedding_dim
-            std = math.sqrt(1.0 / embedding_dim)
-            nn.init.normal_(module.weight, mean=0, std=std)
-
-    def _init_input_embeddings(self):
-        if hasattr(self.encoder, 'input_layer'):
-            if hasattr(self.encoder.input_layer, 'data_embedding_layer'):
-                data_embedding_layer = self.encoder.input_layer.data_embedding_layer
-                if hasattr(data_embedding_layer, 'embedding'):
-                    embedding = data_embedding_layer.embedding
-                    embedding_dim = embedding.embedding_dim
-                    std = math.sqrt(1.0 / embedding_dim)
-                    nn.init.normal_(embedding.weight, mean=0, std=std)
-                elif hasattr(data_embedding_layer, 'categorical_embedding'):
-                    embedding = data_embedding_layer.categorical_embedding
-                    embedding_dim = embedding.embedding_dim
-                    std = math.sqrt(1.0 / embedding_dim)
-                    nn.init.normal_(embedding.weight, mean=0, std=std)
-
-            if hasattr(self.encoder.input_layer, 'time_embedding_layer'):
-                if isinstance(self.encoder.input_layer.time_embedding_layer, nn.Embedding):
-                    embedding_dim = self.encoder.input_layer.time_embedding_layer.embedding_dim
-                    std = math.sqrt(1.0 / embedding_dim)
-                    nn.init.normal_(self.encoder.input_layer.time_embedding_layer.weight, mean=0, std=std)
-                elif hasattr(self.encoder.input_layer.time_embedding_layer, 'sin_div_term') and \
-                     hasattr(self.encoder.input_layer.time_embedding_layer, 'cos_div_term'):
-                    nn.init.normal_(self.encoder.input_layer.time_embedding_layer.sin_div_term)
-                    nn.init.normal_(self.encoder.input_layer.time_embedding_layer.cos_div_term)
-
-    def initialize_weights(self):
-        # Apply Xavier initialization to all parameters except embeddings
-        self.apply(self._init_weights)
-        
-        # Apply Gaussian initialization to input embeddings
-        self._init_input_embeddings()
-
-        # Initialize other components if needed
-        if hasattr(self, 'encoder'):
-            if hasattr(self.encoder, 'initialize_weights'):
-                self.encoder.initialize_weights()
-            else:
-                self.encoder.apply(self._init_weights)
-
-        if hasattr(self, 'decoder'):
-            if hasattr(self.decoder, 'initialize_weights'):
-                self.decoder.initialize_weights()
-            else:
-                self.decoder.apply(self._init_weights)
+            std = 1.0 / math.sqrt(embedding_dim)
+            nn.init.normal_(module.weight, mean=0.0, std=std)
+        elif isinstance(module, nn.LSTM):
+            for name, param in module.named_parameters():
+                if 'weight_ih' in name:
+                    nn.init.xavier_uniform_(param, gain=1/math.sqrt(2))
+                elif 'weight_hh' in name:
+                    nn.init.orthogonal_(param)
+                elif 'bias' in name:
+                    nn.init.zeros_(param)
+        elif isinstance(module, nn.GRU):
+            for name, param in module.named_parameters():
+                if 'weight_ih' in name:
+                    nn.init.xavier_uniform_(param, gain=1/math.sqrt(2))
+                elif 'weight_hh' in name:
+                    nn.init.orthogonal_(param)
+                elif 'bias' in name:
+                    nn.init.zeros_(param)
+        elif isinstance(module, nn.Conv1d):
+            nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
 
     @classmethod
     def from_pretrained(cls, pretrained_weights_fp, config, vocabulary_config, optimization_config, oov_index):

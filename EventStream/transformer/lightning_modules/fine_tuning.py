@@ -627,6 +627,32 @@ class ESTForStreamClassificationLM(L.LightningModule):
         if wandb.run is not None:
             wandb.log({"debug": message})
 
+    def check_gradients_and_weights(self):
+        for name, param in self.named_parameters():
+            if param.grad is not None:
+                grad_norm = param.grad.norm()
+                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                    logger.warning(f"NaN or Inf gradient detected in {name}")
+                elif grad_norm == 0:
+                    logger.warning(f"Zero gradient detected in {name}")
+            else:
+                logger.warning(f"No gradient for parameter: {name}")
+
+            if torch.isnan(param).any() or torch.isinf(param).any():
+                logger.warning(f"NaN or Inf values detected in parameter: {name}")
+            elif (param == 0).all():
+                logger.warning(f"All zero values detected in parameter: {name}")
+
+        # Check attention weights
+        for module in self.modules():
+            if isinstance(module, InnerSelfAttention):
+                if hasattr(module, 'last_attn_weights'):
+                    attn_weights = module.last_attn_weights
+                    if torch.isnan(attn_weights).any() or torch.isinf(attn_weights).any():
+                        logger.warning(f"NaN or Inf values detected in attention weights")
+                    elif (attn_weights == 0).all():
+                        logger.warning(f"All zero values detected in attention weights")
+
     def training_step(self, batch, batch_idx):
         # Ensure all tensors in the batch are on the correct device
         batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
@@ -653,6 +679,8 @@ class ESTForStreamClassificationLM(L.LightningModule):
         outputs = self.model(batch, output_attentions=True)  # Pass the entire batch to the model
         loss = outputs.loss
 
+        self.check_gradients_and_weights()
+
         if torch.isnan(loss) or torch.isinf(loss):
             self.log_debug(f"NaN or Inf loss detected in training step {batch_idx}")
             loss = torch.where(torch.isnan(loss) | torch.isinf(loss), torch.full_like(loss, 1e-8), loss)
@@ -663,14 +691,6 @@ class ESTForStreamClassificationLM(L.LightningModule):
                 if param.grad is not None:
                     grad_stats = f"min={param.grad.min().item()}, max={param.grad.max().item()}, mean={param.grad.mean().item()}"
                     self.logger.experiment.log({f"gradients/{name}": grad_stats}, step=self.global_step)
-
-        # Log gradient norms
-        for name, param in self.model.named_parameters():
-            if param.grad is not None:
-                grad_norm = param.grad.norm()
-                self.log(f'grad_norm/{name}', grad_norm, on_step=True, on_epoch=False)
-            else:
-                logger.warning(f"No gradient for parameter: {name}")   
 
         # Log attention weights statistics
         if outputs.attentions is not None:
@@ -712,6 +732,8 @@ class ESTForStreamClassificationLM(L.LightningModule):
         # Forward pass
         outputs = self.model(batch, output_attentions=True)  # Pass the entire batch to the model
         
+        self.check_gradients_and_weights()
+
         if torch.isnan(outputs.loss) or torch.isinf(outputs.loss):
             self.log_debug(f"NaN or Inf loss detected in validation step {batch_idx}")
         
@@ -740,13 +762,10 @@ class ESTForStreamClassificationLM(L.LightningModule):
         # Add attention mask to the batch
         batch['attention_mask'] = attention_mask
 
-        # Log shapes for debugging
-        for k, v in batch.items():
-            if isinstance(v, torch.Tensor):
-                self.log_debug(f"Test batch {k} shape: {v.shape}")
-
         # Forward pass
         outputs = self.model(batch, output_attentions=True)  # Pass the entire batch to the model
+
+        self.check_gradients_and_weights()
 
         # Store predictions and labels
         self.test_predictions.append(outputs.preds.detach().cpu())
@@ -843,9 +862,25 @@ class ESTForStreamClassificationLM(L.LightningModule):
                                      vocab_significance_threshold, feature_importance, feature_importance_std, 
                                      feature_importance_p_value)
 
-        if getattr(self.config, 'use_fake_feature', False):
-            self.process_fake_feature(combined_batch, baseline_loss, initial_permutations,
-                                      feature_importance, feature_importance_std, feature_importance_p_value)
+        # Process fake feature only if it's not already in the batch
+        if getattr(self.config, 'use_fake_feature', True) and 'fake_temporal_feature' not in combined_batch:
+            fake_importance, fake_std, fake_p_value = self.process_fake_feature(combined_batch, baseline_loss, initial_permutations)
+            
+            if abs(fake_importance) > adaptive_threshold:
+                additional_permutations = min(max_permutations - initial_permutations, 
+                                              int((abs(fake_importance) - adaptive_threshold) / adaptive_threshold * initial_permutations))
+                
+                if additional_permutations > 0:
+                    new_importance, new_std, new_p_value = self.process_fake_feature(combined_batch, baseline_loss, additional_permutations)
+                    
+                    total_permutations = initial_permutations + additional_permutations
+                    fake_importance = (fake_importance * initial_permutations + new_importance * additional_permutations) / total_permutations
+                    fake_std = np.sqrt((fake_std**2 * initial_permutations + new_std**2 * additional_permutations) / total_permutations)
+                    fake_p_value = new_p_value  # Use the p-value from the larger sample
+
+            feature_importance['fake_temporal_feature'] = fake_importance
+            feature_importance_std['fake_temporal_feature'] = fake_std
+            feature_importance_p_value['fake_temporal_feature'] = fake_p_value
 
         total_importance = sum(abs(score) for score in feature_importance.values())
         normalized_importance = {k: abs(v) / total_importance for k, v in feature_importance.items()}
@@ -1012,15 +1047,13 @@ class ESTForStreamClassificationLM(L.LightningModule):
         fake_feature = 'fake_temporal_feature'
         permuted_losses = []
         
+        fake_temporal = self.create_correlated_fake_feature(combined_batch['time'], combined_batch['labels'])
+        logger.debug(f"Fake feature correlation: {torch.corrcoef(torch.stack([fake_temporal.flatten(), combined_batch['labels'].flatten()]))[0,1]}")
+        
         for _ in range(initial_permutations):
             permuted_batch = combined_batch.copy()
-            fake_temporal = self.create_correlated_fake_feature(permuted_batch['time'], permuted_batch['labels'])
             permuted_values = fake_temporal[torch.randperm(fake_temporal.size(0))]
-            
-            if fake_feature not in permuted_batch:
-                permuted_batch[fake_feature] = permuted_values
-            else:
-                permuted_batch[fake_feature] = permuted_values.to(permuted_batch[fake_feature].device)
+            permuted_batch[fake_feature] = permuted_values.to(permuted_batch[fake_feature].device)
             
             try:
                 with torch.no_grad():
@@ -1031,6 +1064,9 @@ class ESTForStreamClassificationLM(L.LightningModule):
                 logger.error(f"Error during permutation for fake feature: {str(e)}")
                 continue
         
+        logger.debug(f"Permuted losses: {permuted_losses}")
+        logger.debug(f"Baseline loss: {baseline_loss}")
+
         if not permuted_losses:
             logger.warning("No valid permutations for fake feature. Skipping importance calculation.")
             return
@@ -1039,10 +1075,20 @@ class ESTForStreamClassificationLM(L.LightningModule):
         importance_std = np.std(permuted_losses)
         t_statistic, p_value = stats.ttest_1samp(permuted_losses, 0)
         
+        # Calculate confidence interval
+        confidence_interval = stats.t.interval(0.95, len(permuted_losses)-1, loc=importance, scale=importance_std/np.sqrt(len(permuted_losses)))
+        
         feature_importance[fake_feature] = importance
         feature_importance_std[fake_feature] = importance_std
         feature_importance_p_value[fake_feature] = p_value
         
+        logger.info(f"Fake feature importance: {importance:.4f} ± {importance_std:.4f} (95% CI: {confidence_interval})")
+        logger.info(f"Fake feature p-value: {p_value:.4f}")
+        
+        logger.debug(f"Fake feature correlation: {fake_temporal.corrcoef(permuted_batch['labels'])}")
+        logger.debug(f"Permuted losses: {permuted_losses}")
+        logger.debug(f"Baseline loss: {baseline_loss}")
+
         logger.info(f"Fake temporal feature importance: {importance:.4f} ± {importance_std:.4f} (p-value: {p_value:.4f})")
 
     def create_correlated_fake_feature(self, time, labels):
@@ -1062,89 +1108,7 @@ class ESTForStreamClassificationLM(L.LightningModule):
         # Normalize to [0, 1] range
         fake_feature = (fake_feature - fake_feature.min()) / (fake_feature.max() - fake_feature.min())
         
-        return fake_feature.unsqueeze(-1)  # Shape: [batch_size, seq_len, 1]
-
-    @lru_cache(maxsize=128)
-    def _calculate_single_temporal_importance(self, feature, feature_data_key, start, end, baseline_loss, max_permutations):
-        feature_data = self.temporal_importance_cache.get(feature_data_key)
-        if feature_data is None:
-            logger.warning(f"Feature data for '{feature}' is None in the cache. Key: {feature_data_key}")
-            return None, None
-
-        logger.debug(f"Feature '{feature}' data shape: {feature_data.shape}, dtype: {feature_data.dtype}")
-
-        permuted_losses = []
-        for _ in range(max_permutations):
-            try:
-                permuted_data = feature_data.clone()
-                
-                # Handle NaN values
-                if feature == 'dynamic_values':
-                    nan_mask = torch.isnan(permuted_data)
-                    valid_mask = ~nan_mask
-                    valid_data = permuted_data[valid_mask]
-                    
-                    if valid_data.numel() == 0:
-                        logger.warning(f"No valid data for feature '{feature}'. Skipping permutation.")
-                        continue
-                    
-                    # Only permute non-NaN values
-                    window_permutation = torch.randperm(valid_data.size(0), device=self.device)
-                    permuted_valid_data = valid_data[window_permutation]
-                    
-                    # Put the permuted values back in their original positions
-                    permuted_data[valid_mask] = permuted_valid_data
-                else:
-                    window_permutation = torch.randperm(end - start, device=self.device)
-                    permuted_data[:, start:end] = permuted_data[:, start:end][:, window_permutation]
-                
-                permuted_batch = {k: v.clone() if isinstance(v, torch.Tensor) else v 
-                                  for k, v in self.temporal_importance_cache.items()}
-                permuted_batch[feature] = permuted_data
-
-                # Ensure all required keys are present and have correct dtypes
-                required_keys = ['dynamic_indices', 'dynamic_values', 'dynamic_measurement_indices', 'time']
-                for key in required_keys:
-                    if key not in permuted_batch or permuted_batch[key] is None:
-                        logger.warning(f"Required key '{key}' is missing or None. Using dummy data.")
-                        permuted_batch[key] = torch.zeros_like(permuted_data)
-                    if key in ['dynamic_indices', 'dynamic_measurement_indices']:
-                        permuted_batch[key] = permuted_batch[key].long()
-
-                # Log the shapes of all tensors in the batch
-                for k, v in permuted_batch.items():
-                    if isinstance(v, torch.Tensor):
-                        logger.debug(f"Permuted batch[{k}] shape: {v.shape}, dtype: {v.dtype}")
-
-                logger.debug("Calling self() with permuted batch")
-                with torch.no_grad():
-                    permuted_output = self(permuted_batch)
-                logger.debug(f"Permuted output type: {type(permuted_output)}")
-                
-                if not hasattr(permuted_output, 'loss'):
-                    logger.warning("Permuted output does not have 'loss' attribute")
-                    continue
-                if permuted_output.loss is None:
-                    logger.warning("Permuted output loss is None")
-                    continue
-                
-                permuted_loss = permuted_output.loss.item()
-                permuted_losses.append(permuted_loss - baseline_loss)
-            except Exception as e:
-                logger.error(f"Error during temporal importance calculation for feature '{feature}': {str(e)}")
-                logger.error(f"Permuted data shape: {permuted_data.shape}, dtype: {permuted_data.dtype}")
-                logger.error(f"Batch keys: {permuted_batch.keys()}")
-                for k, v in permuted_batch.items():
-                    if isinstance(v, torch.Tensor):
-                        logger.error(f"Batch[{k}] shape: {v.shape}, dtype: {v.dtype}")
-                    else:
-                        logger.error(f"Batch[{k}] type: {type(v)}")
-                continue
-
-        if not permuted_losses:
-            return None, None
-
-        return np.mean(permuted_losses), np.std(permuted_losses)
+        return fake_feature
 
     def calculate_temporal_importance(self, num_samples=1000, initial_permutations=10, max_permutations=100, adaptive_threshold=0.01, early_stop_threshold=0.001, dataloader=None):
         if dataloader is None:
@@ -1364,19 +1328,77 @@ class ESTForStreamClassificationLM(L.LightningModule):
         self.calculate_and_log_test_importances()
 
     def calculate_and_log_test_importances(self):
-        # Calculate feature importance on test set
         feature_importance, feature_importance_std, feature_importance_p_value = self.calculate_feature_importance(dataloader=self.test_dataloader())
-        
-        # Calculate temporal importance on test set
         temporal_importance, temporal_importance_std, temporal_importance_p_value = self.calculate_temporal_importance(dataloader=self.test_dataloader())
-        
-        # Log results
-        self.log("test_feature_importance", feature_importance, on_step=False, on_epoch=True, sync_dist=True)
-        self.log("test_feature_importance_std", feature_importance_std, on_step=False, on_epoch=True, sync_dist=True)
-        self.log("test_feature_importance_p_value", feature_importance_p_value, on_step=False, on_epoch=True, sync_dist=True)
-        self.log("test_temporal_importance", temporal_importance, on_step=False, on_epoch=True, sync_dist=True)
-        self.log("test_temporal_importance_std", temporal_importance_std, on_step=False, on_epoch=True, sync_dist=True)
-        self.log("test_temporal_importance_p_value", temporal_importance_p_value, on_step=False, on_epoch=True, sync_dist=True)
+
+        # Log feature importance
+        for feature, importance in feature_importance.items():
+            wandb.log({
+                f"feature_importance/{feature}/score": importance,
+                f"feature_importance/{feature}/std": feature_importance_std.get(feature, 0),
+                f"feature_importance/{feature}/p_value": feature_importance_p_value.get(feature, 1),
+            })
+            
+            # Calculate and log confidence interval
+            ci = stats.t.interval(0.95, len(self.test_dataloader.dataset)-1, 
+                                  loc=importance, 
+                                  scale=feature_importance_std.get(feature, 0))
+            wandb.log({
+                f"feature_importance/{feature}/ci_lower": ci[0],
+                f"feature_importance/{feature}/ci_upper": ci[1],
+            })
+
+        # Log temporal importance
+        for feature, importance_list in temporal_importance.items():
+            for i, importance in enumerate(importance_list):
+                wandb.log({
+                    f"temporal_importance/{feature}/window_{i}/score": importance,
+                    f"temporal_importance/{feature}/window_{i}/std": temporal_importance_std[feature][i],
+                    f"temporal_importance/{feature}/window_{i}/p_value": temporal_importance_p_value[feature][i],
+                })
+                
+                # Calculate and log confidence interval
+                ci = stats.t.interval(0.95, len(self.test_dataloader.dataset)-1, 
+                                      loc=importance, 
+                                      scale=temporal_importance_std[feature][i])
+                wandb.log({
+                    f"temporal_importance/{feature}/window_{i}/ci_lower": ci[0],
+                    f"temporal_importance/{feature}/window_{i}/ci_upper": ci[1],
+                })
+
+        # Create and log charts
+        self.log_importance_charts(feature_importance, feature_importance_std, feature_importance_p_value, 
+                                   temporal_importance, temporal_importance_std, temporal_importance_p_value)
+
+    def log_importance_charts(self, feature_importance, feature_importance_std, feature_importance_p_value,
+                              temporal_importance, temporal_importance_std, temporal_importance_p_value):
+        # Feature importance chart
+        fig, ax = plt.subplots(figsize=(12, 6))
+        features = list(feature_importance.keys())
+        y_pos = np.arange(len(features))
+        ax.barh(y_pos, list(feature_importance.values()), xerr=list(feature_importance_std.values()), align='center')
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(features)
+        ax.invert_yaxis()
+        ax.set_xlabel('Importance')
+        ax.set_title('Feature Importance')
+        wandb.log({"feature_importance_chart": wandb.Image(fig)})
+        plt.close(fig)
+
+        # Temporal importance chart
+        for feature, importance_list in temporal_importance.items():
+            fig, ax = plt.subplots(figsize=(12, 6))
+            windows = list(range(len(importance_list)))
+            ax.plot(windows, importance_list)
+            ax.fill_between(windows, 
+                            [i-s for i, s in zip(importance_list, temporal_importance_std[feature])],
+                            [i+s for i, s in zip(importance_list, temporal_importance_std[feature])],
+                            alpha=0.3)
+            ax.set_xlabel('Window')
+            ax.set_ylabel('Importance')
+            ax.set_title(f'Temporal Importance: {feature}')
+            wandb.log({f"temporal_importance_chart/{feature}": wandb.Image(fig)})
+            plt.close(fig)
 
     def on_after_backward(self):
         # Log gradient norms for specific layers
@@ -1407,6 +1429,12 @@ class ESTForStreamClassificationLM(L.LightningModule):
             else:
                 logger.warning(f"Unexpected type for key '{key}': {type(batch[key])}")
 
+        if getattr(self.config, 'use_fake_feature', True):
+            if 'fake_temporal_feature' not in batch:
+                logger.warning("Fake temporal feature is not in the batch!")
+            else:
+                logger.debug(f"Fake temporal feature shape: {batch['fake_temporal_feature'].shape}")
+    
         # Move batch to the correct device
         batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
@@ -1448,9 +1476,9 @@ class ESTForStreamClassificationLM(L.LightningModule):
             weight_decay=self.weight_decay,
             eps=1e-8
         )
-
+        
         logger.info(f"Configured optimizer: AdamW with lr={self.learning_rate}, weight_decay={self.weight_decay}")
-
+        
         if self.use_lr_scheduler and self.lr_scheduler_type is not None:
             if self.lr_scheduler_type == "cosine":
                 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -1466,7 +1494,7 @@ class ESTForStreamClassificationLM(L.LightningModule):
                     total_iters=self.num_training_steps
                 )
             elif self.lr_scheduler_type == "linear_warmup":
-                warmup_steps = int(self.num_training_steps * 0.1)  # 10% of total steps for warmup
+                warmup_steps = int(self.num_training_steps * 0.05)  # 5% of total steps for warmup
                 scheduler = get_linear_schedule_with_warmup(
                     optimizer,
                     num_warmup_steps=warmup_steps,
@@ -1477,7 +1505,7 @@ class ESTForStreamClassificationLM(L.LightningModule):
                     optimizer,
                     max_lr=self.learning_rate,
                     total_steps=self.num_training_steps,
-                    pct_start=0.3,
+                    pct_start=0.05,  # 5% of training for warmup
                     anneal_strategy='cos'
                 )
             elif self.lr_scheduler_type == "reduce_on_plateau":
@@ -1490,18 +1518,22 @@ class ESTForStreamClassificationLM(L.LightningModule):
                 )
             else:
                 raise ValueError(f"Unknown scheduler type: {self.lr_scheduler_type}")
-
+            
             scheduler_config = {
                 "scheduler": scheduler,
                 "interval": "step" if self.lr_scheduler_type != "reduce_on_plateau" else "epoch",
                 "frequency": 1,
                 "monitor": "val_loss" if self.lr_scheduler_type == "reduce_on_plateau" else None,
             }
+            
             logger.info(f"Configured learning rate scheduler: {self.lr_scheduler_type}")
             return {"optimizer": optimizer, "lr_scheduler": scheduler_config}
         else:
             logger.info("No learning rate scheduler configured")
             return optimizer
+
+        # Log the gradient clipping value
+        logger.info(f"Gradient clipping value: {self.trainer.gradient_clip_val}")
 
 @dataclass
 class FinetuneConfig:
@@ -1723,6 +1755,11 @@ class CollateFunction:
         self.logger.info(f"CollateFunction initialized with use_static_features: {self.use_static_features}")
         self.logger.info(f"CollateFunction initialized with max_seq_len: {self.max_seq_len}")
 
+        self.use_fake_feature = use_fake_feature
+        self.fake_feature_correlation = fake_feature_correlation
+        self.logger.info(f"CollateFunction initialized with use_fake_feature: {self.use_fake_feature}")
+        self.logger.info(f"CollateFunction initialized with fake_feature_correlation: {self.fake_feature_correlation}")
+
         self.dtype = model_dtype
 
     def __call__(self, batch):
@@ -1751,6 +1788,11 @@ class CollateFunction:
 
             if self.include_labels:
                 collated_batch['labels'] = torch.stack([item['labels'] for item in batch]).squeeze(1)
+
+            if self.use_fake_feature:
+                fake_feature = self.create_correlated_fake_feature(collated_batch['time'], collated_batch['labels'])
+                collated_batch['fake_temporal_feature'] = fake_feature.to(self.dtype)
+                self.logger.info(f"Added fake_temporal_feature with shape: {fake_feature.shape}")
 
             self.logger.info(f"Collated batch keys: {collated_batch.keys()}")
             self.logger.info(f"Collated batch sizes: {[(k, v.shape) for k, v in collated_batch.items()]}")
@@ -1967,7 +2009,9 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_c
         static_size=8,
         max_seq_len=cfg.config.max_seq_len,
         use_static_features=cfg.use_static_features,
-        model_dtype=LM.dtype
+        model_dtype=LM.dtype,
+        use_fake_feature=cfg.config.use_fake_feature,
+        fake_feature_correlation=cfg.config.fake_feature_correlation
     )
 
     callbacks = [
