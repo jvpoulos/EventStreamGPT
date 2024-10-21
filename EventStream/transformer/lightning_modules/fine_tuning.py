@@ -94,20 +94,6 @@ class NCCLErrorHandler(Callback):
             return True
         return False
 
-class GradientCheckCallback(Callback):
-    @staticmethod
-    def check_and_log_gradients(model):
-        for name, param in model.named_parameters():
-            if param.grad is not None:
-                grad_norm = param.grad.norm()
-                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
-                    logger.warning(f"NaN or Inf gradient detected in {name}")
-                else:
-                    wandb.log({f"gradient_norm/{name}": grad_norm})
-
-    def on_after_backward(self, trainer, model):
-        self.check_and_log_gradients(model)
-
 class AttentionMechanismSwitch(Callback):
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         if pl_module.config.use_flash_attention and batch_idx % 100 == 0:
@@ -245,9 +231,13 @@ class ESTForStreamClassificationLM(L.LightningModule):
                 logger.debug(f"Parameter {name} requires gradients")
             
     def register_gradient_hooks(self):
+        def log_grad_norm(grad, name):
+            if self.trainer.current_epoch % max(1, self.trainer.max_epochs // 10) == 0:
+                self.log(f'grad_norm/{name}', grad.norm(), on_step=False, on_epoch=True)
+
         for name, param in self.named_parameters():
             if param.requires_grad:
-                param.register_hook(lambda grad, name=name: self.log(f'grad_norm/{name}', grad.norm(), on_step=True, on_epoch=False))
+                param.register_hook(lambda grad, name=name: log_grad_norm(grad, name))
 
     def set_dtype(self, dtype):
         self.to(dtype)
@@ -369,6 +359,49 @@ class ESTForStreamClassificationLM(L.LightningModule):
         if isinstance(self.trainer.train_dataloader.sampler, DistributedSampler):
             self.trainer.train_dataloader.sampler.set_epoch(self.current_epoch)
 
+    def visualize_attention_maps(self, attentions, batch_idx):
+        if self.trainer.is_global_zero and wandb.run is not None:
+            if attentions is None:
+                logger.warning("No attention weights to visualize")
+                return
+
+            num_layers = len(attentions)
+            for layer, attn_dict in enumerate(attentions):
+                if not isinstance(attn_dict, dict) or 'attn_weights' not in attn_dict:
+                    logger.warning(f"Unexpected attention format in layer {layer}")
+                    continue
+
+                attn = attn_dict['attn_weights']
+                if not isinstance(attn, torch.Tensor):
+                    logger.warning(f"Attention weights are not a tensor in layer {layer}")
+                    continue
+
+                # Ensure the attention tensor is 4D: [batch_size, num_heads, seq_len, seq_len]
+                if attn.dim() == 3:
+                    attn = attn.unsqueeze(1)
+                elif attn.dim() != 4:
+                    logger.warning(f"Unexpected attention tensor shape in layer {layer}: {attn.shape}")
+                    continue
+
+                num_heads = attn.size(1)
+                seq_len = attn.size(-1)
+
+                # Create a figure for this layer
+                fig, axes = plt.subplots(1, num_heads, figsize=(20, 4))
+                fig.suptitle(f"Attention Weights for Layer {layer}")
+
+                for head in range(num_heads):
+                    head_attn = attn[0, head].detach().cpu().numpy()  # Use the first sample in the batch
+                    ax = axes[head] if num_heads > 1 else axes
+                    sns.heatmap(head_attn, ax=ax, cmap='viridis', vmin=0, vmax=1)
+                    ax.set_title(f"Head {head}")
+                    ax.set_ylabel('Query position')
+                    ax.set_xlabel('Key position')
+
+                plt.tight_layout()
+                wandb.log({f"attention_weights/layer_{layer}": wandb.Image(fig)})
+                plt.close(fig)
+                
     def custom_collate_fn(self, batch):
         # Filter out None items
         batch = [item for item in batch if item is not None]
@@ -553,11 +586,14 @@ class ESTForStreamClassificationLM(L.LightningModule):
         plt.close()
 
         # Log both plots to wandb
-        wandb.log({
-            f"{split}_confusion_matrix": confusion_matrix_plot,
-            f"{split}_roc_curve": roc_curve_plot,
-            f"{split}_auc": auc_value
-        })
+        if wandb.run is not None:
+            wandb.log({
+                f"{split}_confusion_matrix": confusion_matrix_plot,
+                f"{split}_roc_curve": roc_curve_plot,
+                f"{split}_auc": auc_value
+            })
+        else:
+            logger.warning("wandb run is not initialized. Skipping wandb logging.")
 
     def log_attention_weights(self, attentions, batch_idx, top_n=5):
         if self.trainer.is_global_zero and wandb.run is not None:
@@ -628,6 +664,16 @@ class ESTForStreamClassificationLM(L.LightningModule):
             wandb.log({"debug": message})
 
     def check_gradients_and_weights(self):
+        # Check if we should log this epoch
+        current_epoch = self.trainer.current_epoch
+        max_epochs = self.trainer.max_epochs
+        log_interval = max(1, max_epochs // 10)  # Log at least once, and at most 10 times
+        
+        if current_epoch % log_interval != 0:
+            return  # Skip logging if not at a 10% interval
+
+        logger.info(f"Checking gradients and weights at epoch {current_epoch}/{max_epochs}")
+
         for name, param in self.named_parameters():
             if param.grad is not None:
                 grad_norm = param.grad.norm()
@@ -635,6 +681,8 @@ class ESTForStreamClassificationLM(L.LightningModule):
                     logger.warning(f"NaN or Inf gradient detected in {name}")
                 elif grad_norm == 0:
                     logger.warning(f"Zero gradient detected in {name}")
+                else:
+                    logger.info(f"Gradient norm for {name}: {grad_norm.item()}")
             else:
                 logger.warning(f"No gradient for parameter: {name}")
 
@@ -642,6 +690,8 @@ class ESTForStreamClassificationLM(L.LightningModule):
                 logger.warning(f"NaN or Inf values detected in parameter: {name}")
             elif (param == 0).all():
                 logger.warning(f"All zero values detected in parameter: {name}")
+            else:
+                logger.info(f"Parameter stats for {name}: min={param.min().item()}, max={param.max().item()}, mean={param.mean().item()}")
 
         # Check attention weights
         for module in self.modules():
@@ -652,11 +702,15 @@ class ESTForStreamClassificationLM(L.LightningModule):
                         logger.warning(f"NaN or Inf values detected in attention weights")
                     elif (attn_weights == 0).all():
                         logger.warning(f"All zero values detected in attention weights")
+                    else:
+                        logger.info(f"Attention weights stats: min={attn_weights.min().item()}, max={attn_weights.max().item()}, mean={attn_weights.mean().item()}")
+
+        logger.info(f"Finished checking gradients and weights at epoch {current_epoch}/{max_epochs}")
 
     def training_step(self, batch, batch_idx):
         # Ensure all tensors in the batch are on the correct device
         batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-
+        
         # Create attention mask
         seq_lens = batch['seq_len']
         max_seq_len = batch['dynamic_indices'].size(1)
@@ -664,50 +718,55 @@ class ESTForStreamClassificationLM(L.LightningModule):
         
         # Add attention mask to the batch
         batch['attention_mask'] = attention_mask
-
+        
         # Ensure all tensors have the correct sequence length
         for key in ['dynamic_indices', 'dynamic_values', 'dynamic_measurement_indices', 'time']:
             if batch[key].size(1) > max_seq_len:
                 batch[key] = batch[key][:, :max_seq_len]
-
-        # Log shapes for debugging
-        for k, v in batch.items():
-            if isinstance(v, torch.Tensor):
-                self.log_debug(f"Training batch {k} shape: {v.shape}")
-
-        # Forward pass
-        outputs = self.model(batch, output_attentions=True)  # Pass the entire batch to the model
-        loss = outputs.loss
-
-        self.check_gradients_and_weights()
+        
+        # Use automatic mixed precision
+        with torch.cuda.amp.autocast():
+            # Forward pass
+            outputs = self.model(batch, output_attentions=self.global_step % 1000 == 0)  # Only output attentions every 1000 steps
+            loss = outputs.loss
 
         if torch.isnan(loss) or torch.isinf(loss):
             self.log_debug(f"NaN or Inf loss detected in training step {batch_idx}")
             loss = torch.where(torch.isnan(loss) | torch.isinf(loss), torch.full_like(loss, 1e-8), loss)
-
-        # Add more detailed gradient logging
-        if self.trainer.is_global_zero and batch_idx % 100 == 0:
-            for name, param in self.model.named_parameters():
-                if param.grad is not None:
-                    grad_stats = f"min={param.grad.min().item()}, max={param.grad.max().item()}, mean={param.grad.mean().item()}"
-                    self.logger.experiment.log({f"gradients/{name}": grad_stats}, step=self.global_step)
-
-        # Log attention weights statistics
-        if outputs.attentions is not None:
-            for i, layer_attention in enumerate(outputs.attentions):
-                if isinstance(layer_attention, dict) and 'attn_weights' in layer_attention:
-                    attn_weights = layer_attention['attn_weights']
-                    if attn_weights is not None:
-                        self.log(f'train_attention_layer_{i}_min', attn_weights.min().item(), on_step=True, on_epoch=False)
-                        self.log(f'train_attention_layer_{i}_max', attn_weights.max().item(), on_step=True, on_epoch=False)
-                        self.log(f'train_attention_layer_{i}_mean', attn_weights.mean().item(), on_step=True, on_epoch=False)
+        
+        # Determine if we should log detailed information this step
+        should_log_details = self.global_step % 1000 == 0  # Log every 1000 steps
+        
+        if should_log_details:
+            self.check_gradients_and_weights()
+            
+            # Log gradients
+            if self.trainer.is_global_zero:
+                for name, param in self.model.named_parameters():
+                    if param.grad is not None:
+                        grad_norm = param.grad.norm()
+                        self.log(f"grad_norm/{name}", grad_norm, on_step=True, on_epoch=False)
+            
+            # Log attention weights statistics
+            if outputs.attentions is not None:
+                for i, layer_attention in enumerate(outputs.attentions):
+                    if isinstance(layer_attention, dict) and 'attn_weights' in layer_attention:
+                        attn_weights = layer_attention['attn_weights']
+                        if attn_weights is not None:
+                            self.log(f'train_attention_layer_{i}_min', attn_weights.min().item(), on_step=True, on_epoch=False)
+                            self.log(f'train_attention_layer_{i}_max', attn_weights.max().item(), on_step=True, on_epoch=False)
+                            self.log(f'train_attention_layer_{i}_mean', attn_weights.mean().item(), on_step=True, on_epoch=False)
+                        else:
+                            logger.warning(f"Attention weights are None for layer {i}")
                     else:
-                        logger.warning(f"Attention weights are None for layer {i}")
-                else:
-                    logger.warning(f"Unexpected attention format in layer {i}")
-
+                        logger.warning(f"Unexpected attention format in layer {i}")
+        
         # Log metrics
         self.log_metrics('train', outputs)
+        
+        # Clear CUDA cache periodically
+        if self.global_step % 1000 == 0:
+            torch.cuda.empty_cache()
         
         # Ensure the loss is properly connected to the computational graph
         return {"loss": loss}
@@ -724,15 +783,30 @@ class ESTForStreamClassificationLM(L.LightningModule):
         # Add attention mask to the batch
         batch['attention_mask'] = attention_mask
 
-        # Log shapes for debugging
-        for k, v in batch.items():
-            if isinstance(v, torch.Tensor):
-                self.log_debug(f"Validation batch {k} shape: {v.shape}")
-
         # Forward pass
         outputs = self.model(batch, output_attentions=True)  # Pass the entire batch to the model
         
-        self.check_gradients_and_weights()
+        # Determine if we should log detailed information this epoch
+        current_epoch = self.trainer.current_epoch
+        max_epochs = self.trainer.max_epochs
+        log_interval = max(1, max_epochs // 10)  # Log at least once, and at most 10 times
+        should_log_details = current_epoch % log_interval == 0
+
+        if should_log_details:
+            self.check_gradients_and_weights()
+            
+            if outputs.attentions is not None:
+                for i, layer_attention in enumerate(outputs.attentions):
+                    if isinstance(layer_attention, dict) and 'attn_weights' in layer_attention:
+                        attn_weights = layer_attention['attn_weights']
+                        if attn_weights is not None:
+                            self.log(f'val_attention_layer_{i}_min', attn_weights.min().item(), on_step=False, on_epoch=True)
+                            self.log(f'val_attention_layer_{i}_max', attn_weights.max().item(), on_step=False, on_epoch=True)
+                            self.log(f'val_attention_layer_{i}_mean', attn_weights.mean().item(), on_step=False, on_epoch=True)
+                        else:
+                            logger.warning(f"Attention weights are None for layer {i}")
+                    else:
+                        logger.warning(f"Unexpected attention format in layer {i}")
 
         if torch.isnan(outputs.loss) or torch.isinf(outputs.loss):
             self.log_debug(f"NaN or Inf loss detected in validation step {batch_idx}")
@@ -743,11 +817,7 @@ class ESTForStreamClassificationLM(L.LightningModule):
 
         # Log metrics
         self.log_metrics('val', outputs)
-
-        # Log attention weights if available
-        if outputs.attentions is not None:
-            self.log_attention_weights(outputs.attentions, batch_idx)
-
+        
         return outputs.loss
 
     def test_step(self, batch, batch_idx):
@@ -765,7 +835,31 @@ class ESTForStreamClassificationLM(L.LightningModule):
         # Forward pass
         outputs = self.model(batch, output_attentions=True)  # Pass the entire batch to the model
 
-        self.check_gradients_and_weights()
+        # Log everything for the first batch
+        if batch_idx == 0:
+            self.check_gradients_and_weights()
+            
+            # Log detailed information about the batch
+            for k, v in batch.items():
+                if isinstance(v, torch.Tensor):
+                    self.log_debug(f"Test batch {k} shape: {v.shape}")
+            
+            # Log attention weights
+            if outputs.attentions is not None:
+                for i, layer_attention in enumerate(outputs.attentions):
+                    if isinstance(layer_attention, dict) and 'attn_weights' in layer_attention:
+                        attn_weights = layer_attention['attn_weights']
+                        if attn_weights is not None:
+                            self.log(f'test_attention_layer_{i}_min', attn_weights.min().item())
+                            self.log(f'test_attention_layer_{i}_max', attn_weights.max().item())
+                            self.log(f'test_attention_layer_{i}_mean', attn_weights.mean().item())
+                        else:
+                            logger.warning(f"Attention weights are None for layer {i}")
+                    else:
+                        logger.warning(f"Unexpected attention format in layer {i}")
+
+            # Visualize attention maps
+            self.visualize_attention_maps(outputs.attentions, batch_idx)
 
         # Store predictions and labels
         self.test_predictions.append(outputs.preds.detach().cpu())
@@ -773,10 +867,6 @@ class ESTForStreamClassificationLM(L.LightningModule):
 
         # Log metrics
         self.log_metrics('test', outputs)
-
-        # Log attention weights if available
-        if outputs.attentions is not None:
-            self.log_attention_weights(outputs.attentions, batch_idx)
 
         return outputs.loss
 
@@ -1101,14 +1191,13 @@ class ESTForStreamClassificationLM(L.LightningModule):
         noise = torch.randn_like(base_temporal) * 0.1
         
         # Combine base temporal feature with labels to create correlation
-        fake_feature_correlation = getattr(self.config, 'fake_feature_correlation', 0.8)
-        fake_feature = (1 - fake_feature_correlation) * (base_temporal + noise) + \
-                       fake_feature_correlation * labels.unsqueeze(1).repeat(1, seq_len)
+        fake_feature = (1 - self.fake_feature_correlation) * (base_temporal + noise) + \
+                       self.fake_feature_correlation * labels.unsqueeze(1).repeat(1, seq_len)
         
         # Normalize to [0, 1] range
         fake_feature = (fake_feature - fake_feature.min()) / (fake_feature.max() - fake_feature.min())
         
-        return fake_feature
+        return fake_feature.unsqueeze(-1)  # Shape: [batch_size, seq_len, 1]
 
     def calculate_temporal_importance(self, num_samples=1000, initial_permutations=10, max_permutations=100, adaptive_threshold=0.01, early_stop_threshold=0.001, dataloader=None):
         if dataloader is None:
@@ -1400,12 +1489,6 @@ class ESTForStreamClassificationLM(L.LightningModule):
             wandb.log({f"temporal_importance_chart/{feature}": wandb.Image(fig)})
             plt.close(fig)
 
-    def on_after_backward(self):
-        # Log gradient norms for specific layers
-        for name, param in self.model.named_parameters():
-            if param.grad is not None:
-                self.log(f'grad_norm/{name}', param.grad.norm(), on_step=True, on_epoch=False)
-
     def forward(self, batch, **kwargs):
         if not isinstance(batch, dict):
             raise TypeError("Input 'batch' should be a dictionary.")
@@ -1527,10 +1610,10 @@ class ESTForStreamClassificationLM(L.LightningModule):
             }
             
             logger.info(f"Configured learning rate scheduler: {self.lr_scheduler_type}")
-            return {"optimizer": optimizer, "lr_scheduler": scheduler_config}
+            return {"optimizer": optimizer, "lr_scheduler": scheduler_config, "scaler": self.scaler}
         else:
             logger.info("No learning rate scheduler configured")
-            return optimizer
+            return {"optimizer": optimizer, "scaler": self.scaler}
 
         # Log the gradient clipping value
         logger.info(f"Gradient clipping value: {self.trainer.gradient_clip_val}")
@@ -1579,7 +1662,6 @@ class FinetuneConfig:
         default_factory=lambda: {
             "name": "${task_df_name}_finetuning",
             "project": None,
-            "log_model": False,
         }
     )
 
@@ -1744,19 +1826,20 @@ class FinetuneConfig:
             self.wandb_logger_kwargs["project"] = reloaded_pretrain_config.wandb_logger_kwargs.project
 
 class CollateFunction:
-    def __init__(self, vocab_size, oov_index, include_labels=True, static_size=8, max_seq_len=168, use_static_features=True, model_dtype=torch.float32):
+    def __init__(self, vocab_size, oov_index, include_labels=True, static_size=8, max_seq_len=168, 
+                 use_static_features=True, model_dtype=torch.float32, 
+                 use_fake_feature=False, fake_feature_correlation=0.8):
         self.vocab_size = vocab_size
         self.oov_index = oov_index
         self.include_labels = include_labels
         self.static_size = static_size
         self.max_seq_len = max_seq_len
         self.use_static_features = use_static_features
+        self.use_fake_feature = use_fake_feature
+        self.fake_feature_correlation = fake_feature_correlation
         self.logger = logging.getLogger(__name__)
         self.logger.info(f"CollateFunction initialized with use_static_features: {self.use_static_features}")
         self.logger.info(f"CollateFunction initialized with max_seq_len: {self.max_seq_len}")
-
-        self.use_fake_feature = use_fake_feature
-        self.fake_feature_correlation = fake_feature_correlation
         self.logger.info(f"CollateFunction initialized with use_fake_feature: {self.use_fake_feature}")
         self.logger.info(f"CollateFunction initialized with fake_feature_correlation: {self.fake_feature_correlation}")
 
@@ -1833,18 +1916,42 @@ class CollateFunction:
         
         return out_tensor
 
+    def create_correlated_fake_feature(self, time, labels):
+        batch_size, seq_len = time.shape
+        
+        # Create a base temporal feature
+        base_temporal = torch.linspace(0, 1, seq_len).unsqueeze(0).repeat(batch_size, 1).to(time.device)
+        
+        # Add noise to create variation
+        noise = torch.randn_like(base_temporal) * 0.1
+        
+        # Combine base temporal feature with labels to create correlation
+        fake_feature = (1 - self.fake_feature_correlation) * (base_temporal + noise) + \
+                       self.fake_feature_correlation * labels.unsqueeze(1).repeat(1, seq_len)
+        
+        # Normalize to [0, 1] range
+        fake_feature = (fake_feature - fake_feature.min()) / (fake_feature.max() - fake_feature.min())
+        
+        return fake_feature.unsqueeze(-1)  # Shape: [batch_size, seq_len, 1]
+
 def setup_distributed():
     if dist.is_initialized():
         logger.info("Process group already initialized.")
         return dist.get_world_size(), dist.get_rank()
     
-    if 'WORLD_SIZE' in os.environ:
+    if 'SLURM_PROCID' in os.environ:
+        rank = int(os.environ['SLURM_PROCID'])
+        world_size = int(os.environ['SLURM_NTASKS'])
+    elif 'LOCAL_RANK' in os.environ:
+        rank = int(os.environ['LOCAL_RANK'])
         world_size = int(os.environ['WORLD_SIZE'])
-        rank = int(os.environ['RANK'])
-        dist.init_process_group(backend='nccl', init_method='env://')
     else:
         world_size = 1
         rank = 0
+    
+    if world_size > 1:
+        dist.init_process_group(backend='nccl', init_method='env://')
+    
     return world_size, rank
 
 def initialize_wandb(cfg, rank):
@@ -1864,19 +1971,14 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_c
     logger = logging.getLogger(__name__)
     logger.setLevel(logging.DEBUG)
 
+    if wandb.run is None:
+        wandb_kwargs = cfg.wandb_logger_kwargs.copy()
+        project = wandb_kwargs.pop('project', 'default_project')
+        name = wandb_kwargs.pop('name', 'default_run')
+        wandb.init(project=project, name=name, config=cfg.to_dict(), **wandb_kwargs)
+
     start_time = time.time()
     logger.info(f"Train function started at {start_time}")
-
-    # Initialize rank
-    if dist.is_initialized():
-        rank = dist.get_rank()
-    else:
-        rank = 0
-
-    # Initialize Wandb only for the main process
-    wandb_initialized = initialize_wandb(cfg, rank)
-
-    logger.info(f"Entering train function")
 
     logger.info(f"Train dataset length: {len(train_pyd)}")
     logger.info(f"Tuning dataset length: {len(tuning_pyd)}")
@@ -1889,6 +1991,10 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_c
     world_size, rank = setup_distributed()
     logger.info(f"Distributed setup complete. Rank: {rank}, World Size: {world_size} after {time.time() - start_time:.2f} seconds")
 
+    # Initialize Wandb only for the main process
+    if rank == 0:
+        wandb_initialized = initialize_wandb(cfg, rank)
+        
     # Update data config
     cfg.update_data_config()
     logger.info(f"Data config updated after {time.time() - start_time:.2f} seconds")
@@ -2037,7 +2143,7 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_c
 
     # Add the callbacks
     callbacks.append(NCCLErrorHandler())
-    callbacks.extend([GradientCheckCallback(), AttentionMechanismSwitch()])
+    callbacks.extend([AttentionMechanismSwitch()])
 
     logger.info("Setting up trainer")
     
@@ -2145,6 +2251,10 @@ def train(cfg: FinetuneConfig, train_pyd, tuning_pyd, held_out_pyd, vocabulary_c
     # Only finish the Wandb run from the main process
     if rank == 0 and wandb.run is not None:
         wandb.finish()
+
+    # Cleanup
+    if torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
 
     return None, tuning_metrics, held_out_metrics
 

@@ -278,37 +278,34 @@ class ESTForStreamClassification(LightningModule):
         if isinstance(module, nn.Linear):
             nn.init.xavier_uniform_(module.weight, gain=1/math.sqrt(2))
             if module.bias is not None:
-                nn.init.zeros_(module.bias)
+                nn.init.uniform_(module.bias, -0.1, 0.1)  # Changed from zeros to small uniform values
         elif isinstance(module, nn.LayerNorm):
             nn.init.constant_(module.weight, 1.0)
-            nn.init.constant_(module.bias, 0.0)
+            nn.init.constant_(module.bias, 0.01)  # Small positive bias
         elif isinstance(module, nn.BatchNorm1d):
             nn.init.constant_(module.weight, 1.0)
-            nn.init.constant_(module.bias, 0.0)
+            nn.init.constant_(module.bias, 0.01)  # Small positive bias
         elif isinstance(module, nn.Embedding):
             embedding_dim = module.embedding_dim
             std = 1.0 / math.sqrt(embedding_dim)
             nn.init.normal_(module.weight, mean=0.0, std=std)
-        elif isinstance(module, nn.LSTM):
+        elif isinstance(module, (nn.LSTM, nn.GRU)):
             for name, param in module.named_parameters():
                 if 'weight_ih' in name:
                     nn.init.xavier_uniform_(param, gain=1/math.sqrt(2))
                 elif 'weight_hh' in name:
                     nn.init.orthogonal_(param)
                 elif 'bias' in name:
-                    nn.init.zeros_(param)
-        elif isinstance(module, nn.GRU):
-            for name, param in module.named_parameters():
-                if 'weight_ih' in name:
-                    nn.init.xavier_uniform_(param, gain=1/math.sqrt(2))
-                elif 'weight_hh' in name:
-                    nn.init.orthogonal_(param)
-                elif 'bias' in name:
-                    nn.init.zeros_(param)
+                    nn.init.uniform_(param, -0.1, 0.1)  # Changed from zeros to small uniform values
         elif isinstance(module, nn.Conv1d):
             nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
             if module.bias is not None:
-                nn.init.zeros_(module.bias)
+                nn.init.uniform_(module.bias, -0.1, 0.1)  # Changed from zeros to small uniform values
+        
+        # Add a small epsilon to all parameters to prevent exact zero values
+        for param in module.parameters():
+            with torch.no_grad():
+                param.add_(torch.randn_like(param) * 1e-6)
 
     @classmethod
     def from_pretrained(cls, pretrained_weights_fp, config, vocabulary_config, optimization_config, oov_index):

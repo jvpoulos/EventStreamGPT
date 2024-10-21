@@ -505,7 +505,13 @@ class InnerSelfAttention(nn.Module):
 
         if self.use_flash_attention and self.training:
             try:
+                # Convert to half precision for Flash Attention
+                query = query.half()
+                key = key.half()
+                value = value.half()
                 attn_output, attn_weights = self._flash_attention(query, key, value, attention_mask)
+                # Convert back to original precision
+                attn_output = attn_output.to(hidden_states.dtype)
             except Exception as e:
                 logger.warning(f"Flash Attention failed: {str(e)}. Falling back to selected attention mechanism.")
                 attn_output, attn_weights = self._attn(query, key, value, attention_mask, head_mask, position_bias)
@@ -539,16 +545,16 @@ class InnerSelfAttention(nn.Module):
 
     def _flash_attention(self, q, k, v, attention_mask):
         qkv = torch.stack([q, k, v], dim=2)
-        qkv = qkv.permute(0, 3, 2, 1, 4).contiguous()
+        qkv = qkv.permute(0, 3, 2, 1, 4).contiguous()  # [bsz, seq_len, 3, num_heads, head_dim]
         
         attn_output = flash_attn_qkvpacked_func(
             qkv,
             dropout_p=self.attn_dropout.p if self.training else 0.0,
             softmax_scale=None,
-            causal=self.attention_type in ["local", "global"]
+            causal=self.causal
         )
         
-        attn_output = attn_output.permute(0, 2, 1, 3).contiguous()
+        attn_output = attn_output.permute(0, 2, 1, 3).contiguous()  # [bsz, num_heads, seq_len, head_dim]
         attn_output = self._merge_heads(attn_output, self.num_heads, self.head_dim)
         attn_output = self.out_proj(attn_output)
         attn_output = self.resid_dropout(attn_output)
